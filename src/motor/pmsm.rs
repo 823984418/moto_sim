@@ -27,16 +27,14 @@ impl Motor<3> for PmsmMotor {
         let last_current_dq = self.current_dq;
 
         let next_current_d = last_current_dq[0]
-            + (voltage_dq[0]
-                - last_current_dq[0] * self.rs
-                - last_current_dq[1] * self.inductance_dq[1] * electrical_speed)
+            + (voltage_dq[0] - last_current_dq[0] * self.rs
+                + last_current_dq[1] * self.inductance_dq[1] * electrical_speed)
                 / self.inductance_dq[0]
                 * delta_time;
 
         let next_current_q = last_current_dq[1]
-            + (voltage_dq[1]
-                - last_current_dq[1] * self.rs
-                - (last_current_dq[0] * self.inductance_dq[0] + self.flux) * electrical_speed)
+            + (voltage_dq[1] - last_current_dq[1] * self.rs
+                + (self.flux - last_current_dq[0] * self.inductance_dq[0]) * electrical_speed)
                 / self.inductance_dq[1]
                 * delta_time;
 
