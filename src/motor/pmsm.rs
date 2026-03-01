@@ -1,7 +1,8 @@
 use crate::motor::{Motor, MotorUpdateInput, MotorUpdateOutput};
 use crate::util::{clarke, inverse_clarke, rotate};
 
-pub struct PmsmMotor {
+#[derive(Debug, Default, Clone)]
+pub struct PermanentMagnetSynchronousMotor {
     /// 磁极对数
     pub pole_pairs: f64,
 
@@ -18,7 +19,7 @@ pub struct PmsmMotor {
     pub current_dq: [f64; 2],
 }
 
-impl Motor<3> for PmsmMotor {
+impl Motor<3> for PermanentMagnetSynchronousMotor {
     fn update(&mut self, delta_time: f64, input: &MotorUpdateInput<3>) -> MotorUpdateOutput<3> {
         let electrical_angle = input.angle * self.pole_pairs;
         let electrical_speed = input.speed * self.pole_pairs;

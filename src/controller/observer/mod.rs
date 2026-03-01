@@ -1,4 +1,5 @@
 pub mod flux_observer;
+pub mod sensor_observer;
 
 pub struct ObserverInput<const P: usize> {
     pub voltage: [f64; P],

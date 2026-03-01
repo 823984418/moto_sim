@@ -1,5 +1,6 @@
 use crate::motion::{MotionLoad, MotionLoadInput, MotionLoadOutput};
 
+#[derive(Default, Debug, Clone)]
 pub struct IdealMotionLoad {
     /// 转动惯量
     pub inertia: f64,
