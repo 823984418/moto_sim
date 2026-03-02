@@ -5,8 +5,20 @@ edition = "2024"
 
 [dependencies]
 
+[dependencies.anyhow]
+version = "1.0.102"
+
 [dependencies.rand]
 version = "0.10.0"
 
-[dev-dependencies.eframe]
+[dependencies.font-kit]
+version = "0.14.3"
+
+[dependencies.egui]
+version = "0.33.3"
+
+[dependencies.egui_plot]
+version = "0.34.0"
+
+[dependencies.eframe]
 version = "0.33.3"

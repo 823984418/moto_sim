@@ -1,4 +1,4 @@
-use crate::motor::{Motor, MotorUpdateInput, MotorUpdateOutput};
+use crate::motor::{Motor, MotorInput, MotorOutput};
 use crate::util::{clarke, inverse_clarke, rotate};
 
 #[derive(Debug, Default, Clone)]
@@ -20,7 +20,7 @@ pub struct PermanentMagnetSynchronousMotor {
 }
 
 impl Motor<3> for PermanentMagnetSynchronousMotor {
-    fn update(&mut self, delta_time: f64, input: &MotorUpdateInput<3>) -> MotorUpdateOutput<3> {
+    fn update(&mut self, delta_time: f64, input: &MotorInput<3>) -> MotorOutput<3> {
         let electrical_angle = input.angle * self.pole_pairs;
         let electrical_speed = input.speed * self.pole_pairs;
         let voltage_ab = clarke(input.voltage);
@@ -34,8 +34,9 @@ impl Motor<3> for PermanentMagnetSynchronousMotor {
                 * delta_time;
 
         let next_current_q = last_current_dq[1]
-            + (voltage_dq[1] - last_current_dq[1] * self.rs
-                + (self.flux - last_current_dq[0] * self.inductance_dq[0]) * electrical_speed)
+            + (voltage_dq[1]
+                - last_current_dq[1] * self.rs
+                - (self.flux + last_current_dq[0] * self.inductance_dq[0]) * electrical_speed)
                 / self.inductance_dq[1]
                 * delta_time;
 
@@ -47,7 +48,7 @@ impl Motor<3> for PermanentMagnetSynchronousMotor {
             * ((self.inductance_dq[0] - self.inductance_dq[1]) * self.current_dq[0] + self.flux);
 
         let current_ab = rotate(self.current_dq, electrical_angle);
-        MotorUpdateOutput {
+        MotorOutput {
             torque,
             current: inverse_clarke(current_ab),
         }

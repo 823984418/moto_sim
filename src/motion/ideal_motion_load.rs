@@ -1,4 +1,5 @@
 use crate::motion::{MotionLoad, MotionLoadInput, MotionLoadOutput};
+use crate::util::angle_normal;
 
 #[derive(Default, Debug, Clone)]
 pub struct IdealMotionLoad {
@@ -36,8 +37,9 @@ impl MotionLoad for IdealMotionLoad {
         self.speed = speed;
         self.angle += delta_time * speed;
 
+        self.angle = angle_normal(self.angle);
         MotionLoadOutput {
-            theta: self.angle,
+            angle: self.angle,
             speed: self.speed,
         }
     }
