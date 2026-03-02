@@ -2,7 +2,9 @@ use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea};
 use egui_plot::{Line, Plot, PlotPoint};
 use moto_sim::controller::observer::sensor_observer::SensorObserver;
-use moto_sim::controller::observer::{ObserverInput, ObserverOutput};
+use moto_sim::controller::observer::{Observer, ObserverInput, ObserverOutput};
+use moto_sim::controller::power_bridge::ideal_power_bridge::IdealPowerBridge;
+use moto_sim::controller::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
 use moto_sim::motion::ideal_motion_load::IdealMotionLoad;
 use moto_sim::motion::{MotionLoad, MotionLoadInput, MotionLoadOutput};
 use moto_sim::motor::pmsm::PermanentMagnetSynchronousMotor;
@@ -15,15 +17,18 @@ pub struct Simulation {
     pub delta_time: f64,
     pub timer: Timer,
 
-    motion_load_input: MotionLoadInput,
-    motion_load_output: MotionLoadOutput,
+    power_bridge_input: PowerBridgeInput<3>,
+    power_bridge_output: PowerBridgeOutput<3>,
     motor_input: MotorInput<3>,
     motor_output: MotorOutput<3>,
+    motion_load_input: MotionLoadInput,
+    motion_load_output: MotionLoadOutput,
     observer_input: ObserverInput<3>,
     observer_output: ObserverOutput,
 
-    pub motion_load: IdealMotionLoad,
+    pub power_bridge: IdealPowerBridge,
     pub motor: PermanentMagnetSynchronousMotor,
+    pub motion_load: IdealMotionLoad,
     pub observer: SensorObserver,
 }
 
@@ -47,8 +52,8 @@ impl Simulation {
             },
             observer: SensorObserver {
                 pole_pairs: 1.0,
-                pll_kp: 0.1,
-                pll_ki: 0.01,
+                pll_kp: 10.0,
+                pll_ki: 1.0,
                 ..Default::default()
             },
             ..Default::default()
@@ -61,18 +66,29 @@ impl Simulation {
             let delta_time = self.timer.event_step[i];
             match i {
                 0 => {
-                    self.motion_load_output =
-                        self.motion_load.update(delta_time, &self.motion_load_input);
-
+                    self.power_bridge_input.command = [0.0, 1.0, -1.0];
                     self.motor_input.speed = self.motion_load_output.speed;
                     self.motor_input.angle = self.motion_load_output.angle;
-                    self.motor_input.voltage = [0.0, 1.0, -1.0];
-
-                    self.motor_output = self.motor.update(delta_time, &self.motor_input);
-
+                    self.motor_input.voltage = self.power_bridge_output.voltage;
                     self.motion_load_input.torque = self.motor_output.torque;
+
+                    self.power_bridge_output = self
+                        .power_bridge
+                        .update(delta_time, &self.power_bridge_input);
+                    self.motor_output = self.motor.update(delta_time, &self.motor_input);
+                    self.motion_load_output =
+                        self.motion_load.update(delta_time, &self.motion_load_input);
                 }
-                1 => {}
+                1 => {
+                    // 仅有感
+                    self.observer.sensor_angle = self.motion_load.angle;
+
+                    self.observer_input.current = self.motor_output.current;
+                    // 实际需要重建
+                    self.observer_input.voltage = self.power_bridge_output.voltage;
+
+                    self.observer_output = self.observer.update(delta_time, &self.observer_input);
+                }
                 _ => unreachable!(),
             }
         }
@@ -82,6 +98,7 @@ impl Simulation {
 pub struct Application {
     simulation: Simulation,
     angle: Vec<PlotPoint>,
+    observer_angle: Vec<PlotPoint>,
     speed: Vec<PlotPoint>,
     id: Vec<PlotPoint>,
     iq: Vec<PlotPoint>,
@@ -93,6 +110,7 @@ impl Application {
         Ok(Self {
             simulation: Simulation::new(),
             angle: Vec::new(),
+            observer_angle: Vec::new(),
             speed: Vec::new(),
             id: Vec::new(),
             iq: Vec::new(),
@@ -109,6 +127,10 @@ impl App for Application {
         self.angle.push(PlotPoint::new(
             self.simulation.timer.time,
             self.simulation.motion_load.angle,
+        ));
+        self.observer_angle.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.pll_angle,
         ));
         self.speed.push(PlotPoint::new(
             self.simulation.timer.time,
@@ -129,7 +151,8 @@ impl App for Application {
                 CollapsingHeader::new("angle").show(ui, |ui| {
                     Plot::new("angle").height(100.0).show(ui, |ui| {
                         // ui.set_plot_bounds_x(show_window.clone());
-                        ui.line(Line::new("speed", self.angle.as_slice()));
+                        ui.line(Line::new("angle", self.angle.as_slice()));
+                        ui.line(Line::new("observer_angle", self.observer_angle.as_slice()));
                     });
                 });
                 CollapsingHeader::new("speed").show(ui, |ui| {
