@@ -6,6 +6,7 @@ use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_
 use moto_sim::simulation::controller::current_regulator::{
     CurrentRegulator, CurrentRegulatorInput, CurrentRegulatorOutput,
 };
+use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
@@ -14,7 +15,7 @@ use moto_sim::simulation::motor::pmsm::PermanentMagnetSynchronousMotor;
 use moto_sim::simulation::motor::{Motor, MotorInput, MotorOutput};
 use moto_sim::simulation::power_bridge::ideal_power_bridge::IdealPowerBridge;
 use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
-use moto_sim::simulation::{clarke, inverse_clarke, rotate};
+use moto_sim::simulation::{angle_normal, clarke, inverse_clarke, rotate};
 use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::Timer;
 
@@ -37,7 +38,7 @@ pub struct Simulation {
     pub power_bridge: IdealPowerBridge,
     pub motor: PermanentMagnetSynchronousMotor,
     pub motion_load: IdealMotionLoad,
-    pub observer: SensorObserver,
+    pub observer: FluxObserver,
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
 
@@ -45,18 +46,21 @@ impl Simulation {
     pub fn new() -> Self {
         let motor = PermanentMagnetSynchronousMotor { ..FAN_MOTOR };
         Self {
-            delta_time: 1.0 / 60.0,
-            timer: Timer::new(vec![1e-6, 1.0 / 20e3]),
+            delta_time: 0.0001,
+            timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
             motion_load: IdealMotionLoad { ..FAN_LOAD },
-            observer: SensorObserver {
-                pole_pairs: motor.pole_pairs,
-                pll_kp: 10.0,
-                pll_ki: 1.0,
+            observer: FluxObserver {
+                rs: motor.rs,
+                flux: motor.flux,
+                inductance_dq: motor.inductance_dq,
+                speed_lp_factor: 100.0,
+                position_factor: 100.0,
+                position: [0.0, 0.0],
                 ..Default::default()
             },
             current_regulator: ThreePhasePICurrentRegulator {
-                kp: [1e3 * motor.inductance_dq[0], 1e3 * motor.inductance_dq[0]],
-                ki: [1e3 * motor.rs, 1e3 * motor.rs],
+                kp: [10e3 * motor.inductance_dq[0], 10e3 * motor.inductance_dq[1]],
+                ki: [10e3 * motor.rs, 10e3 * motor.rs],
                 ..Default::default()
             },
             motor,
@@ -84,11 +88,11 @@ impl Simulation {
                 }
                 1 => {
                     // 仅有感
-                    self.observer.sensor_angle = self.motion_load.angle;
+                    // self.observer.sensor_angle = self.motion_load.angle;
 
-                    self.observer_input.current = self.motor_output.current;
-                    // 实际需要重建
+                    // 实际需要电压重建
                     self.observer_input.voltage = self.power_bridge_output.voltage;
+                    self.observer_input.current = self.motor_output.current;
 
                     self.observer_output = self.observer.update(delta_time, &self.observer_input);
 
@@ -118,10 +122,12 @@ pub struct Application {
     angle: Vec<PlotPoint>,
     observer_angle: Vec<PlotPoint>,
     speed: Vec<PlotPoint>,
+    observer_speed: Vec<PlotPoint>,
+    run: bool,
     id: Vec<PlotPoint>,
     iq: Vec<PlotPoint>,
-    ca: Vec<PlotPoint>,
-    cb: Vec<PlotPoint>,
+    fx: Vec<PlotPoint>,
+    fy: Vec<PlotPoint>,
 }
 
 impl Application {
@@ -132,80 +138,127 @@ impl Application {
             angle: Vec::new(),
             observer_angle: Vec::new(),
             speed: Vec::new(),
+            observer_speed: Vec::new(),
+            run: false,
             id: Vec::new(),
             iq: Vec::new(),
-            ca: Vec::new(),
-            cb: Vec::new(),
+            fx: Vec::new(),
+            fy: Vec::new(),
         })
+    }
+
+    fn update(&mut self) {
+        self.simulation.update();
+
+        let sample = 10000;
+
+        self.angle.drain(..self.angle.len().saturating_sub(sample));
+        self.observer_angle
+            .drain(..self.observer_angle.len().saturating_sub(sample));
+        self.speed.drain(..self.speed.len().saturating_sub(sample));
+        self.observer_speed
+            .drain(..self.observer_speed.len().saturating_sub(sample));
+        self.id.drain(..self.id.len().saturating_sub(sample));
+        self.iq.drain(..self.iq.len().saturating_sub(sample));
+        self.fx.drain(..self.fx.len().saturating_sub(sample));
+        self.fy.drain(..self.fy.len().saturating_sub(sample));
+
+        self.angle.push(PlotPoint::new(
+            self.simulation.timer.time,
+            angle_normal(self.simulation.motion_load.angle * self.simulation.motor.pole_pairs),
+        ));
+        self.observer_angle.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer_output.electrical_angle,
+        ));
+        self.speed.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.motion_load.speed * self.simulation.motor.pole_pairs,
+        ));
+        self.observer_speed.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer_output.electrical_speed,
+        ));
+
+        self.id.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.motor.current_dq[0],
+        ));
+        self.iq.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.motor.current_dq[1],
+        ));
+
+        self.fx.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.position[0],
+        ));
+        self.fy.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.position[1],
+        ));
     }
 }
 
 impl App for Application {
     fn update(&mut self, ctx: &Context, frame: &mut Frame) {
         ctx.request_repaint();
-
-        self.simulation.update();
-
-        self.angle.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.motion_load.angle,
-        ));
-        self.observer_angle.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.pll_angle,
-        ));
-        self.speed.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.motion_load.speed,
-        ));
-
-        let iab = rotate(
-            self.simulation.motor.current_dq,
-            self.simulation.observer_output.electrical_angle,
-        );
-        let iab = clarke(self.simulation.current_regulator_input.current);
-        self.id
-            .push(PlotPoint::new(self.simulation.timer.time, iab[0]));
-        self.iq
-            .push(PlotPoint::new(self.simulation.timer.time, iab[1]));
-        let cab = clarke(self.simulation.current_regulator_input.command_current);
-
-        self.ca
-            .push(PlotPoint::new(self.simulation.timer.time, cab[0]));
-        self.cb
-            .push(PlotPoint::new(self.simulation.timer.time, cab[1]));
-
+        if self.run {
+            for _ in 0..33 {
+                self.update();
+            }
+        }
+        let mut auto_bounds = false;
         CentralPanel::default().show(ctx, |ui| {
-            let auto_bounds = ui.button("auto").clicked();
+            ui.horizontal(|ui| {
+                auto_bounds = ui.button("auto").clicked();
+                ui.checkbox(&mut self.run, "Run");
+            });
             ScrollArea::vertical().show(ui, |ui| {
-                CollapsingHeader::new("angle").show(ui, |ui| {
-                    Plot::new("angle").height(100.0).show(ui, |ui| {
-                        if auto_bounds {
-                            ui.set_auto_bounds(true);
-                        }
-                        ui.line(Line::new("angle", self.angle.as_slice()));
-                        ui.line(Line::new("observer_angle", self.observer_angle.as_slice()));
+                CollapsingHeader::new("angle")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        Plot::new("angle").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("angle", self.angle.as_slice()));
+                            ui.line(Line::new("observer_angle", self.observer_angle.as_slice()));
+                        });
                     });
-                });
-                CollapsingHeader::new("speed").show(ui, |ui| {
-                    Plot::new("speed").height(100.0).show(ui, |ui| {
-                        if auto_bounds {
-                            ui.set_auto_bounds(true);
-                        }
-                        ui.line(Line::new("speed", self.speed.as_slice()));
+                CollapsingHeader::new("speed")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        Plot::new("speed").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("speed", self.speed.as_slice()));
+                            ui.line(Line::new("observer_speed", self.observer_speed.as_slice()));
+                        });
                     });
-                });
-                CollapsingHeader::new("current_dq").show(ui, |ui| {
-                    Plot::new("current_dq").height(100.0).show(ui, |ui| {
-                        if auto_bounds {
-                            ui.set_auto_bounds(true);
-                        }
-                        ui.line(Line::new("id", self.id.as_slice()));
-                        ui.line(Line::new("iq", self.iq.as_slice()));
-                        ui.line(Line::new("ca", self.ca.as_slice()));
-                        ui.line(Line::new("cb", self.cb.as_slice()));
+                CollapsingHeader::new("current_dq")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        Plot::new("current_dq").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("id", self.id.as_slice()));
+                            ui.line(Line::new("iq", self.iq.as_slice()));
+                        });
                     });
-                });
+                CollapsingHeader::new("flux_ob")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        Plot::new("flux_ob").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("fx", self.fx.as_slice()));
+                            ui.line(Line::new("fy", self.fy.as_slice()));
+                        });
+                    });
             });
         });
     }
