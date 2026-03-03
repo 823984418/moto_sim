@@ -1,6 +1,5 @@
-use crate::motor::{Motor, MotorInput, MotorOutput};
-use crate::util::{clarke, inverse_clarke, rotate};
-
+use crate::simulation::{clarke, inverse_clarke, rotate};
+use crate::simulation::motor::{Motor, MotorInput, MotorOutput};
 #[derive(Debug, Default, Clone)]
 pub struct PermanentMagnetSynchronousMotor {
     /// 磁极对数

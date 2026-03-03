@@ -1,5 +1,5 @@
 pub mod ideal_power_bridge;
-pub mod two_level_bridge;
+pub mod two_level_power_bridge;
 
 #[derive(Debug, Clone)]
 pub struct PowerBridgeInput<const P: usize> {

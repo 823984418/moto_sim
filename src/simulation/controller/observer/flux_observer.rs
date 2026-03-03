@@ -1,4 +1,4 @@
-use crate::controller::observer::{Observer, ObserverInput, ObserverOutput};
+use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 
 pub struct FluxObserver {
     pub rs: f64,

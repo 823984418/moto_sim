@@ -1,4 +1,4 @@
-use crate::controller::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
+use crate::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
 
 /// 理想的功率桥
 #[derive(Debug, Default, Clone)]

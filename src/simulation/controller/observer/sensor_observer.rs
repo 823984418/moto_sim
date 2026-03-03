@@ -1,5 +1,5 @@
-use crate::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use crate::util::angle_normal;
+use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
+use crate::simulation::angle_normal;
 
 /// 通过锁相环从外部位置传感器重建电角度和电角速度的观测器
 #[derive(Default, Debug, Clone)]

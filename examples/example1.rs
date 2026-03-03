@@ -1,14 +1,14 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea};
 use egui_plot::{Line, Plot, PlotPoint};
-use moto_sim::controller::observer::sensor_observer::SensorObserver;
-use moto_sim::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use moto_sim::controller::power_bridge::ideal_power_bridge::IdealPowerBridge;
-use moto_sim::controller::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
-use moto_sim::motion::ideal_motion_load::IdealMotionLoad;
-use moto_sim::motion::{MotionLoad, MotionLoadInput, MotionLoadOutput};
-use moto_sim::motor::pmsm::PermanentMagnetSynchronousMotor;
-use moto_sim::motor::{Motor, MotorInput, MotorOutput};
+use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
+use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
+use moto_sim::simulation::power_bridge::ideal_power_bridge::IdealPowerBridge;
+use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
+use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
+use moto_sim::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
+use moto_sim::simulation::motor::pmsm::PermanentMagnetSynchronousMotor;
+use moto_sim::simulation::motor::{Motor, MotorInput, MotorOutput};
 use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::Timer;
 
@@ -40,7 +40,7 @@ impl Simulation {
             motion_load: IdealMotionLoad {
                 inertia: 1.0,
                 static_friction_torque: 0.0,
-                kinetic_friction_factor: 1.0,
+                kinetic_friction_factor: 0.1,
                 ..Default::default()
             },
             motor: PermanentMagnetSynchronousMotor {
