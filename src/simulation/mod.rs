@@ -1,6 +1,7 @@
 pub mod controller;
 pub mod motion_load;
 pub mod motor;
+pub mod noise;
 pub mod power_bridge;
 
 /// sqrt(3)

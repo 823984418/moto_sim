@@ -11,6 +11,9 @@ version = "1.0.102"
 [dependencies.rand]
 version = "0.10.0"
 
+[dependencies.rand_distr]
+version = "0.6.0"
+
 [dependencies.font-kit]
 version = "0.14.3"
 
