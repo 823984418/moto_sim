@@ -7,7 +7,7 @@ pub struct IdealPowerBridge {}
 impl<const P: usize> PowerBridge<P> for IdealPowerBridge {
     fn update(&mut self, _delta_time: f64, input: &PowerBridgeInput<P>) -> PowerBridgeOutput<P> {
         PowerBridgeOutput {
-            voltage: input.command,
+            voltage: input.command_voltage,
         }
     }
 }

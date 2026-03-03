@@ -3,14 +3,14 @@ pub mod two_level_power_bridge;
 
 #[derive(Debug, Clone)]
 pub struct PowerBridgeInput<const P: usize> {
-    pub command: [f64; P],
+    pub command_voltage: [f64; P],
     pub current: [f64; P],
 }
 
 impl<const P: usize> Default for PowerBridgeInput<P> {
     fn default() -> Self {
         Self {
-            command: [0.0; P],
+            command_voltage: [0.0; P],
             current: [0.0; P],
         }
     }

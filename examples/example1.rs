@@ -1,14 +1,15 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea};
 use egui_plot::{Line, Plot, PlotPoint};
+use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use moto_sim::simulation::power_bridge::ideal_power_bridge::IdealPowerBridge;
-use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
 use moto_sim::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
 use moto_sim::simulation::motor::pmsm::PermanentMagnetSynchronousMotor;
 use moto_sim::simulation::motor::{Motor, MotorInput, MotorOutput};
+use moto_sim::simulation::power_bridge::ideal_power_bridge::IdealPowerBridge;
+use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
 use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::Timer;
 
@@ -37,19 +38,8 @@ impl Simulation {
         Self {
             delta_time: 1.0 / 60.0,
             timer: Timer::new(vec![1e-6, 1.0 / 20e3]),
-            motion_load: IdealMotionLoad {
-                inertia: 1.0,
-                static_friction_torque: 0.0,
-                kinetic_friction_factor: 0.1,
-                ..Default::default()
-            },
-            motor: PermanentMagnetSynchronousMotor {
-                pole_pairs: 1.0,
-                rs: 1.0,
-                inductance_dq: [0.1, 0.1],
-                flux: 1.0,
-                ..Default::default()
-            },
+            motion_load: IdealMotionLoad { ..FAN_LOAD },
+            motor: PermanentMagnetSynchronousMotor { ..FAN_MOTOR },
             observer: SensorObserver {
                 pole_pairs: 1.0,
                 pll_kp: 10.0,
@@ -66,7 +56,7 @@ impl Simulation {
             let delta_time = self.timer.event_step[i];
             match i {
                 0 => {
-                    self.power_bridge_input.command = [0.0, 1.0, -1.0];
+                    self.power_bridge_input.command_voltage = [0.0, 10.0, -10.0];
                     self.motor_input.speed = self.motion_load_output.speed;
                     self.motor_input.angle = self.motion_load_output.angle;
                     self.motor_input.voltage = self.power_bridge_output.voltage;
@@ -147,23 +137,30 @@ impl App for Application {
 
         let show_window = (self.simulation.timer.time - 2.0)..=self.simulation.timer.time;
         CentralPanel::default().show(ctx, |ui| {
+            let auto_bounds = ui.button("auto").clicked();
             ScrollArea::vertical().show(ui, |ui| {
                 CollapsingHeader::new("angle").show(ui, |ui| {
                     Plot::new("angle").height(100.0).show(ui, |ui| {
-                        // ui.set_plot_bounds_x(show_window.clone());
+                        if auto_bounds {
+                            ui.set_auto_bounds(true);
+                        }
                         ui.line(Line::new("angle", self.angle.as_slice()));
                         ui.line(Line::new("observer_angle", self.observer_angle.as_slice()));
                     });
                 });
                 CollapsingHeader::new("speed").show(ui, |ui| {
                     Plot::new("speed").height(100.0).show(ui, |ui| {
-                        // ui.set_plot_bounds_x(show_window.clone());
+                        if auto_bounds {
+                            ui.set_auto_bounds(true);
+                        }
                         ui.line(Line::new("speed", self.speed.as_slice()));
                     });
                 });
                 CollapsingHeader::new("current_dq").show(ui, |ui| {
                     Plot::new("current_dq").height(100.0).show(ui, |ui| {
-                        // ui.set_plot_bounds_x(show_window.clone());
+                        if auto_bounds {
+                            ui.set_auto_bounds(true);
+                        }
                         ui.line(Line::new("id", self.id.as_slice()));
                         ui.line(Line::new("iq", self.iq.as_slice()));
                     });
