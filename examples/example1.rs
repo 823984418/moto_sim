@@ -7,7 +7,7 @@ use moto_sim::simulation::controller::current_regulator::{
     CurrentRegulator, CurrentRegulatorInput, CurrentRegulatorOutput,
 };
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
-use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
+use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
 use moto_sim::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
@@ -15,7 +15,7 @@ use moto_sim::simulation::motor::pmsm::PermanentMagnetSynchronousMotor;
 use moto_sim::simulation::motor::{Motor, MotorInput, MotorOutput};
 use moto_sim::simulation::power_bridge::ideal_power_bridge::IdealPowerBridge;
 use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
-use moto_sim::simulation::{angle_normal, clarke, inverse_clarke, rotate};
+use moto_sim::simulation::{angle_normal, inverse_clarke, rotate};
 use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::Timer;
 
@@ -38,26 +38,48 @@ pub struct Simulation {
     pub power_bridge: IdealPowerBridge,
     pub motor: PermanentMagnetSynchronousMotor,
     pub motion_load: IdealMotionLoad,
-    pub observer: FluxObserver,
+    pub observer: GradObserver,
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
 
 impl Simulation {
     pub fn new() -> Self {
         let motor = PermanentMagnetSynchronousMotor { ..FAN_MOTOR };
+        let observer = FluxObserver {
+            rs: motor.rs,
+            flux: motor.flux,
+            inductance_dq: motor.inductance_dq,
+            speed_lp_factor: 100.0,
+            position_factor: 100.0,
+            position: [0.0, 0.0],
+            ..Default::default()
+        };
+        let observer = GradObserver {
+            rs: motor.rs,
+            l0: (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5,
+            l1: (motor.inductance_dq[0] - motor.inductance_dq[1]) * 0.5,
+            flux: motor.flux,
+            kr: 0.0,
+            kl0: 0.0001,
+            kflux: 0.0,
+            kl1_ds: 0.0,
+            kl1_de: 0.0,
+
+            kspeed_l1: 1.0,
+            kspeed_flux: 10000.0,
+            kspeed_kangle: 1.0,
+            kangle_l1_di: 1000.0,
+            kangle_l1_ds: 1000.0,
+            kangle_flux: 10.0,
+
+            angle: std::f64::consts::PI * 0.2,
+            ..Default::default()
+        };
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
             motion_load: IdealMotionLoad { ..FAN_LOAD },
-            observer: FluxObserver {
-                rs: motor.rs,
-                flux: motor.flux,
-                inductance_dq: motor.inductance_dq,
-                speed_lp_factor: 100.0,
-                position_factor: 100.0,
-                position: [0.0, 0.0],
-                ..Default::default()
-            },
+            observer,
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [10e3 * motor.inductance_dq[0], 10e3 * motor.inductance_dq[1]],
                 ki: [10e3 * motor.rs, 10e3 * motor.rs],
@@ -94,6 +116,8 @@ impl Simulation {
                     self.observer_input.voltage = self.power_bridge_output.voltage;
                     self.observer_input.current = self.motor_output.current;
 
+                    // self.observer.angle = self.motion_load_output.angle * self.motor.pole_pairs;
+                    // self.observer.speed = self.motion_load_output.speed * self.motor.pole_pairs;
                     self.observer_output = self.observer.update(delta_time, &self.observer_input);
 
                     self.current_regulator_input.current = self.motor_output.current;
@@ -110,6 +134,10 @@ impl Simulation {
 
                     self.power_bridge_input.command_voltage =
                         self.current_regulator_output.command_voltage;
+                    self.power_bridge_input.command_voltage[0] +=
+                        f64::sin(self.timer.time * std::f64::consts::TAU * 1000.0) * 10.0;
+                    self.power_bridge_input.command_voltage[1] +=
+                        f64::cos(self.timer.time * std::f64::consts::TAU * 1000.0) * 10.0;
                 }
                 _ => unreachable!(),
             }
@@ -128,6 +156,10 @@ pub struct Application {
     iq: Vec<PlotPoint>,
     fx: Vec<PlotPoint>,
     fy: Vec<PlotPoint>,
+    rs: Vec<PlotPoint>,
+    l0: Vec<PlotPoint>,
+    l1: Vec<PlotPoint>,
+    flux: Vec<PlotPoint>,
 }
 
 impl Application {
@@ -144,6 +176,10 @@ impl Application {
             iq: Vec::new(),
             fx: Vec::new(),
             fy: Vec::new(),
+            rs: Vec::new(),
+            l0: Vec::new(),
+            l1: Vec::new(),
+            flux: Vec::new(),
         })
     }
 
@@ -162,6 +198,10 @@ impl Application {
         self.iq.drain(..self.iq.len().saturating_sub(sample));
         self.fx.drain(..self.fx.len().saturating_sub(sample));
         self.fy.drain(..self.fy.len().saturating_sub(sample));
+        self.rs.drain(..self.rs.len().saturating_sub(sample));
+        self.l0.drain(..self.l0.len().saturating_sub(sample));
+        self.l1.drain(..self.l1.len().saturating_sub(sample));
+        self.flux.drain(..self.flux.len().saturating_sub(sample));
 
         self.angle.push(PlotPoint::new(
             self.simulation.timer.time,
@@ -191,11 +231,27 @@ impl Application {
 
         self.fx.push(PlotPoint::new(
             self.simulation.timer.time,
-            self.simulation.observer.position[0],
+            self.simulation.observer.error[0],
         ));
         self.fy.push(PlotPoint::new(
             self.simulation.timer.time,
-            self.simulation.observer.position[1],
+            self.simulation.observer.error[1],
+        ));
+        self.rs.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.rs,
+        ));
+        self.l0.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.l0,
+        ));
+        self.l1.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.l1,
+        ));
+        self.flux.push(PlotPoint::new(
+            self.simulation.timer.time,
+            self.simulation.observer.flux,
         ));
     }
 }
@@ -248,15 +304,34 @@ impl App for Application {
                             ui.line(Line::new("iq", self.iq.as_slice()));
                         });
                     });
-                CollapsingHeader::new("flux_ob")
+                CollapsingHeader::new("observer")
                     .default_open(true)
                     .show(ui, |ui| {
-                        Plot::new("flux_ob").height(120.0).show(ui, |ui| {
+                        Plot::new("observer").height(120.0).show(ui, |ui| {
                             if auto_bounds {
                                 ui.set_auto_bounds(true);
                             }
                             ui.line(Line::new("fx", self.fx.as_slice()));
                             ui.line(Line::new("fy", self.fy.as_slice()));
+                        });
+                        Plot::new("observer_rs").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("rs", self.rs.as_slice()));
+                        });
+                        Plot::new("observer_l").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("l0", self.l0.as_slice()));
+                            ui.line(Line::new("l1", self.l1.as_slice()));
+                        });
+                        Plot::new("observer_f").height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            ui.line(Line::new("flux", self.flux.as_slice()));
                         });
                     });
             });

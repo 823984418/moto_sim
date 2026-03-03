@@ -3,13 +3,12 @@ use crate::simulation::{angle_normal, atan2, clarke, complex_div, rotate};
 
 #[derive(Debug, Default, Clone)]
 pub struct FluxObserver {
+    pub last_current: [f64; 2],
+
     pub rs: f64,
-
     pub inductance_dq: [f64; 2],
-
     pub flux: f64,
 
-    pub last_current: [f64; 2],
     pub position: [f64; 2],
 
     pub last_angle: f64,

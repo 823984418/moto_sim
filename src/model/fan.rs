@@ -11,8 +11,8 @@ pub const FAN_MOTOR: PermanentMagnetSynchronousMotor = PermanentMagnetSynchronou
 
 pub const FAN_LOAD: IdealMotionLoad = IdealMotionLoad {
     inertia: 0.001,
-    static_friction_torque: 0.0001,
-    kinetic_friction_factor: 0.001,
+    static_friction_torque: 1.0,
+    kinetic_friction_factor: 0.01,
     angle: 0.0,
     speed: 0.0,
 };

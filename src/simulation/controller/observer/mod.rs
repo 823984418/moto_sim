@@ -1,4 +1,5 @@
 pub mod flux_observer;
+pub mod grad_observer;
 pub mod sensor_observer;
 
 #[derive(Debug, Clone)]
