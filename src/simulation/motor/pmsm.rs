@@ -23,8 +23,7 @@ impl Motor<3> for PermanentMagnetSynchronousMotor {
     fn update(&mut self, delta_time: f64, input: &MotorInput<3>) -> MotorOutput<3> {
         let electrical_angle = input.angle * self.pole_pairs;
         let electrical_speed = input.speed * self.pole_pairs;
-        let voltage_ab = clarke(input.voltage);
-        let voltage_dq = rotate(voltage_ab, -electrical_angle);
+        let voltage_dq = rotate(clarke(input.voltage), -electrical_angle);
         let last_current_dq = self.current_dq;
 
         let next_current_d = last_current_dq[0]

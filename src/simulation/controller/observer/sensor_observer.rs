@@ -1,5 +1,5 @@
-use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::angle_normal;
+use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 
 /// 通过锁相环从外部位置传感器重建电角度和电角速度的观测器
 #[derive(Default, Debug, Clone)]
@@ -20,7 +20,7 @@ impl<const P: usize> Observer<P> for SensorObserver {
     fn update(&mut self, delta_time: f64, _input: &ObserverInput<P>) -> ObserverOutput {
         let new_angle = self.pll_angle + self.pll_speed * delta_time;
         let error = angle_normal(self.sensor_angle - new_angle);
-        self.pll_angle = new_angle + self.pll_kp * error * delta_time;
+        self.pll_angle = angle_normal(new_angle + self.pll_kp * error * delta_time);
         self.pll_speed += self.pll_ki * error * delta_time;
 
         ObserverOutput {

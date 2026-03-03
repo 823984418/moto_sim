@@ -32,6 +32,7 @@ pub struct MotorOutput<const P: usize> {
     pub torque: f64,
 
     /// 电机相线电流 A
+    /// 流入电机为正
     /// 这个值提供给功率模块
     pub current: [f64; P],
 }

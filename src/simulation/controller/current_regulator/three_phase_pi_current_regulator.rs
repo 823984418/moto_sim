@@ -3,6 +3,7 @@ use crate::simulation::controller::current_regulator::{
 };
 use crate::simulation::{clarke, inverse_clarke, rotate};
 
+#[derive(Debug, Default, Clone)]
 pub struct ThreePhasePICurrentRegulator {
     pub kp: [f64; 2],
     pub ki: [f64; 2],
