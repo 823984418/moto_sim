@@ -41,38 +41,38 @@ impl Observer<3> for GradObserver {
         self.angle += self.speed * delta_time;
 
         let ezj = rotate([1.0, 0.0], self.angle);
-        let e2zjib = rotate([i[0], -i[1]], 2.0 * self.angle);
-        let e2zjdib = rotate([di[0], -di[1]], 2.0 * self.angle);
+        let e2zj_ib = rotate([i[0], -i[1]], 2.0 * self.angle);
+        let e2zj_dib = rotate([di[0], -di[1]], 2.0 * self.angle);
 
         let ex = self.rs * i[0] + self.l0 * di[0]
             - self.flux * self.speed * ezj[1]
-            - 2.0 * self.speed * self.l1 * e2zjib[1]
-            + self.l1 * e2zjdib[0]
+            - 2.0 * self.speed * self.l1 * e2zj_ib[1]
+            + self.l1 * e2zj_dib[0]
             - v[0];
         let ey = self.rs * i[1]
             + self.l0 * di[1]
             + self.flux * self.speed * ezj[0]
-            + 2.0 * self.speed * self.l1 * e2zjib[0]
-            + self.l1 * e2zjdib[1]
+            + 2.0 * self.speed * self.l1 * e2zj_ib[0]
+            + self.l1 * e2zj_dib[1]
             - v[1];
 
         let dedr = self.kr * 2.0 * (ex * i[0] + ey * i[1]);
         let dedl0 = self.kl0 * 2.0 * (ex * di[0] + ey * di[1]);
         let dedf = self.kflux * 2.0 * (ey * ezj[0] - ex * ezj[1]);
-        let dedl1 = self.kl1_ds * 4.0 * self.speed * (ey * e2zjib[0] - ex * e2zjib[1])
-            + self.kl1_de * 2.0 * (ex * e2zjdib[0] + ey * e2zjdib[1]);
-        let deds = self.kspeed_l1 * 4.0 * self.l1 * (ey * e2zjib[0] - ey * e2zjdib[1])
+        let dedl1 = self.kl1_ds * 4.0 * self.speed * (ey * e2zj_ib[0] - ex * e2zj_ib[1])
+            + self.kl1_de * 2.0 * (ex * e2zj_dib[0] + ey * e2zj_dib[1]);
+        let deds = self.kspeed_l1 * 4.0 * self.l1 * (ey * e2zj_ib[0] - ex * e2zj_dib[1])
             + self.kspeed_flux * 2.0 * self.flux * (ey * ezj[0] - ex * ezj[1]);
         let dedz =
-            -self.kangle_l1_ds * 8.0 * self.speed * self.l1 * (ex * e2zjib[0] + ey * e2zjib[0])
-                + self.kangle_l1_di * 4.0 * self.l1 * (ey * e2zjdib[0] - ey * e2zjdib[1])
+            -self.kangle_l1_ds * 8.0 * self.speed * self.l1 * (ex * e2zj_ib[0] + ey * e2zj_ib[0])
+                + self.kangle_l1_di * 4.0 * self.l1 * (ey * e2zj_dib[0] - ex * e2zj_dib[1])
                 - self.kangle_flux * 2.0 * self.flux * self.speed * (ex * ezj[0] + ey * ezj[1]);
 
         self.rs -= dedr * delta_time;
         self.l0 -= dedl0 * delta_time;
         self.flux -= dedf * delta_time;
         self.l1 -= dedl1 * delta_time;
-        self.speed -= deds * delta_time + dedz * self.kspeed_kangle * delta_time;
+        self.speed -= deds * delta_time + self.kspeed_kangle * dedz * delta_time;
         self.angle -= dedz * delta_time;
 
         self.rs = self.rs.max(0.0);

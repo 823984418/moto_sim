@@ -22,7 +22,7 @@ impl Observer<3> for FluxObserver {
     fn update(&mut self, delta_time: f64, input: &ObserverInput<3>) -> ObserverOutput {
         let current = clarke(input.current);
         let voltage = clarke(input.voltage);
-        let delta_current = [
+        let di = [
             current[0] - self.last_current[0],
             current[1] - self.last_current[1],
         ];
@@ -30,16 +30,12 @@ impl Observer<3> for FluxObserver {
 
         let l0 = (self.inductance_dq[0] + self.inductance_dq[1]) * 0.5;
         let l1 = (self.inductance_dq[0] - self.inductance_dq[1]) * 0.5;
-        let p2dib = rotate([delta_current[0], -delta_current[1]], 2.0 * self.last_angle);
-        let px = (voltage[0] - self.rs * current[0]) * delta_time
-            - l0 * delta_current[0]
-            - l1 * p2dib[0];
-        let py = (voltage[1] - self.rs * current[1]) * delta_time
-            - l0 * delta_current[1]
-            - l1 * p2dib[1];
+        let p2zj_dib = rotate([di[0], -di[1]], 2.0 * self.last_angle);
+        let px = (voltage[0] - self.rs * current[0]) * delta_time - l0 * di[0] - l1 * p2zj_dib[0];
+        let py = (voltage[1] - self.rs * current[1]) * delta_time - l0 * di[1] - l1 * p2zj_dib[1];
 
-        let pib = rotate([current[0], -current[1]], self.last_angle);
-        let s = [pib[0] * 2.0 * l1 + self.flux, pib[1] * 2.0 * l1];
+        let pzj_ib = rotate([current[0], -current[1]], self.last_angle);
+        let s = [2.0 * l1 * pzj_ib[0] + self.flux, 2.0 * l1 * pzj_ib[1]];
 
         let delta_position = complex_div([px, py], s);
 
@@ -47,7 +43,7 @@ impl Observer<3> for FluxObserver {
         self.position[1] += delta_position[1];
 
         let len2 = self.position[0] * self.position[0] + self.position[1] * self.position[1];
-        let position_factor = (0.0 - len2 * len2) * self.position_factor * delta_time;
+        let position_factor = (1.0 - len2) * self.position_factor * delta_time;
         self.position[0] += position_factor * self.position[0];
         self.position[1] += position_factor * self.position[1];
 

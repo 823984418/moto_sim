@@ -1,5 +1,5 @@
-use crate::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
 use crate::simulation::angle_normal;
+use crate::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
 
 #[derive(Default, Debug, Clone)]
 pub struct IdealMotionLoad {

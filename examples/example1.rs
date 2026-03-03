@@ -1,5 +1,5 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
-use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea};
+use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Ui};
 use egui_plot::{Line, Plot, PlotPoint};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_regulator::ThreePhasePICurrentRegulator;
@@ -8,6 +8,7 @@ use moto_sim::simulation::controller::current_regulator::{
 };
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
+use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
 use moto_sim::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
@@ -31,55 +32,70 @@ pub struct Simulation {
     motion_load_input: MotionLoadInput,
     motion_load_output: MotionLoadOutput,
     observer_input: ObserverInput<3>,
-    observer_output: ObserverOutput,
+    sensor_observer_output: ObserverOutput,
+    grad_observer_output: ObserverOutput,
+    flux_observer_output: ObserverOutput,
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
 
     pub power_bridge: IdealPowerBridge,
     pub motor: PermanentMagnetSynchronousMotor,
     pub motion_load: IdealMotionLoad,
-    pub observer: GradObserver,
+    pub sensor_observer: SensorObserver,
+    pub grad_observer: GradObserver,
+    pub flux_observer: FluxObserver,
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
 
 impl Simulation {
     pub fn new() -> Self {
         let motor = PermanentMagnetSynchronousMotor { ..FAN_MOTOR };
-        let observer = FluxObserver {
+        let sensor_observer = SensorObserver {
+            pole_pairs: motor.pole_pairs,
+            pll_kp: 1000.0,
+            pll_ki: 1000000.0,
+            ..Default::default()
+        };
+        let flux_observer = FluxObserver {
             rs: motor.rs,
             flux: motor.flux,
             inductance_dq: motor.inductance_dq,
             speed_lp_factor: 100.0,
             position_factor: 100.0,
-            position: [0.0, 0.0],
+            position: [
+                f64::cos(std::f64::consts::PI * 0.0),
+                f64::sin(std::f64::consts::PI * 0.0),
+            ],
             ..Default::default()
         };
-        let observer = GradObserver {
+        let grad_observer = GradObserver {
             rs: motor.rs,
             l0: (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5,
             l1: (motor.inductance_dq[0] - motor.inductance_dq[1]) * 0.5,
             flux: motor.flux,
             kr: 0.0,
-            kl0: 0.0001,
+            kl0: 0.0,
             kflux: 0.0,
             kl1_ds: 0.0,
             kl1_de: 0.0,
 
-            kspeed_l1: 1.0,
-            kspeed_flux: 10000.0,
-            kspeed_kangle: 1.0,
-            kangle_l1_di: 1000.0,
-            kangle_l1_ds: 1000.0,
-            kangle_flux: 10.0,
+            kspeed_l1: 100.0,
+            kspeed_flux: 100.0,
+            kspeed_kangle: 10.0,
+            kangle_l1_di: 100.0,
+            kangle_l1_ds: 100.0,
+            kangle_flux: 100.0,
 
-            angle: std::f64::consts::PI * 0.2,
+            angle: std::f64::consts::PI * 1.0,
             ..Default::default()
         };
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
             motion_load: IdealMotionLoad { ..FAN_LOAD },
-            observer,
+            sensor_observer,
+            grad_observer,
+            flux_observer,
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [10e3 * motor.inductance_dq[0], 10e3 * motor.inductance_dq[1]],
                 ki: [10e3 * motor.rs, 10e3 * motor.rs],
@@ -109,39 +125,111 @@ impl Simulation {
                         self.motion_load.update(delta_time, &self.motion_load_input);
                 }
                 1 => {
-                    // 仅有感
-                    // self.observer.sensor_angle = self.motion_load.angle;
+                    self.sensor_observer.sensor_angle = self.motion_load.angle;
 
                     // 实际需要电压重建
                     self.observer_input.voltage = self.power_bridge_output.voltage;
                     self.observer_input.current = self.motor_output.current;
 
-                    // self.observer.angle = self.motion_load_output.angle * self.motor.pole_pairs;
-                    // self.observer.speed = self.motion_load_output.speed * self.motor.pole_pairs;
-                    self.observer_output = self.observer.update(delta_time, &self.observer_input);
+                    self.sensor_observer_output = self
+                        .sensor_observer
+                        .update(delta_time, &self.observer_input);
+                    self.grad_observer_output =
+                        self.grad_observer.update(delta_time, &self.observer_input);
+                    self.flux_observer_output =
+                        self.flux_observer.update(delta_time, &self.observer_input);
 
+                    let use_observer = &self.grad_observer_output;
+                    self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
+                    self.current_regulator_input.electrical_angle = use_observer.electrical_angle;
                     self.current_regulator_input.current = self.motor_output.current;
-                    self.current_regulator_input.electrical_speed =
-                        self.observer_output.electrical_speed;
-                    self.current_regulator_input.electrical_angle =
-                        self.observer_output.electrical_angle;
 
-                    self.current_regulator_input.command_current =
-                        inverse_clarke(rotate([0.0, 1.0], self.observer_output.electrical_angle));
+                    let command_current = rotate(
+                        [0.0 * f64::cos(use_observer.electrical_angle) + 0.0, 1.0],
+                        use_observer.electrical_angle,
+                    );
+                    self.current_regulator_input.command_current = inverse_clarke(command_current);
                     self.current_regulator_output = self
                         .current_regulator
                         .update(delta_time, &self.current_regulator_input);
 
                     self.power_bridge_input.command_voltage =
                         self.current_regulator_output.command_voltage;
-                    self.power_bridge_input.command_voltage[0] +=
-                        f64::sin(self.timer.time * std::f64::consts::TAU * 1000.0) * 10.0;
-                    self.power_bridge_input.command_voltage[1] +=
-                        f64::cos(self.timer.time * std::f64::consts::TAU * 1000.0) * 10.0;
+
+                    let inject_voltage = inverse_clarke(rotate(
+                        [
+                            10.0 * f64::sin(2000.0 * std::f64::consts::TAU * self.timer.time),
+                            0.0,
+                        ],
+                        self.current_regulator_input.electrical_angle,
+                    ));
+
+                    self.power_bridge_input.command_voltage[0] += inject_voltage[0];
+                    self.power_bridge_input.command_voltage[1] += inject_voltage[1];
+                    self.power_bridge_input.command_voltage[2] += inject_voltage[2];
                 }
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+pub struct ScopeData<S> {
+    name: String,
+    data: Vec<PlotPoint>,
+    update: Box<dyn FnMut(&mut S) -> f64>,
+}
+
+impl<S> ScopeData<S> {
+    pub fn new<F: FnMut(&mut S) -> f64 + 'static>(name: &str, f: F) -> Self {
+        Self {
+            name: name.to_string(),
+            data: Vec::new(),
+            update: Box::new(f),
+        }
+    }
+}
+
+pub struct Scope<S> {
+    sample_count: usize,
+    data: Vec<(String, Vec<ScopeData<S>>)>,
+}
+
+impl<S> Scope<S> {
+    pub fn new() -> Self {
+        Self {
+            sample_count: 10000,
+            data: Vec::new(),
+        }
+    }
+    pub fn update(&mut self, time: f64, source: &mut S) {
+        for (_, datas) in &mut self.data {
+            for d in datas {
+                d.data.push(PlotPoint::new(time, (d.update)(source)));
+                d.data
+                    .drain(..d.data.len().saturating_sub(self.sample_count));
+            }
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut Ui) {
+        let auto_bounds = ui.button("auto").clicked();
+        ScrollArea::vertical().show(ui, |ui| {
+            for (group_name, datas) in &self.data {
+                CollapsingHeader::new(group_name)
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        Plot::new(group_name).height(120.0).show(ui, |ui| {
+                            if auto_bounds {
+                                ui.set_auto_bounds(true);
+                            }
+                            for d in datas {
+                                ui.line(Line::new(&d.name, d.data.as_slice()));
+                            }
+                        });
+                    });
+            }
+        });
     }
 }
 
@@ -152,19 +240,88 @@ pub struct Application {
     speed: Vec<PlotPoint>,
     observer_speed: Vec<PlotPoint>,
     run: bool,
-    id: Vec<PlotPoint>,
-    iq: Vec<PlotPoint>,
-    fx: Vec<PlotPoint>,
-    fy: Vec<PlotPoint>,
-    rs: Vec<PlotPoint>,
-    l0: Vec<PlotPoint>,
-    l1: Vec<PlotPoint>,
-    flux: Vec<PlotPoint>,
+    scope: Scope<Simulation>,
 }
 
 impl Application {
     pub fn new(cc: &CreationContext) -> anyhow::Result<Self> {
         load_chinese_font(&cc.egui_ctx);
+        let mut scope = Scope::new();
+        scope.data = vec![
+            (
+                "angle".to_string(),
+                vec![
+                    ScopeData::new("real_angle", |s: &mut Simulation| {
+                        angle_normal(s.motion_load.angle * s.motor.pole_pairs)
+                    }),
+                    ScopeData::new("sensor_angle", |s: &mut Simulation| {
+                        s.sensor_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        s.flux_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_angle
+                    }),
+                ],
+            ),
+            (
+                "speed".to_string(),
+                vec![
+                    ScopeData::new("real_speed", |s: &mut Simulation| {
+                        s.motion_load.speed * s.motor.pole_pairs
+                    }),
+                    ScopeData::new("sensor_speed", |s: &mut Simulation| {
+                        s.sensor_observer_output.electrical_speed
+                    }),
+                    ScopeData::new("flux_speed", |s: &mut Simulation| {
+                        s.flux_observer_output.electrical_speed
+                    }),
+                    ScopeData::new("grad_speed", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_speed
+                    }),
+                ],
+            ),
+            (
+                "idq".to_string(),
+                vec![
+                    ScopeData::new("id", |s: &mut Simulation| s.motor.current_dq[0]),
+                    ScopeData::new("iq", |s: &mut Simulation| s.motor.current_dq[1]),
+                ],
+            ),
+            (
+                "rs".to_string(),
+                vec![
+                    ScopeData::new("rs", |s: &mut Simulation| s.motor.rs),
+                    ScopeData::new("grad_rs", |s: &mut Simulation| s.grad_observer.rs),
+                ],
+            ),
+            (
+                "l0".to_string(),
+                vec![
+                    ScopeData::new("l0", |s: &mut Simulation| {
+                        (s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5
+                    }),
+                    ScopeData::new("grad_l0", |s: &mut Simulation| s.grad_observer.l0),
+                ],
+            ),
+            (
+                "l1".to_string(),
+                vec![
+                    ScopeData::new("l1", |s: &mut Simulation| {
+                        (s.motor.inductance_dq[0] - s.motor.inductance_dq[1]) * 0.5
+                    }),
+                    ScopeData::new("grad_l1", |s: &mut Simulation| s.grad_observer.l1),
+                ],
+            ),
+            (
+                "flux".to_string(),
+                vec![
+                    ScopeData::new("flux", |s: &mut Simulation| s.motor.flux),
+                    ScopeData::new("grad_flux", |s: &mut Simulation| s.grad_observer.flux),
+                ],
+            ),
+        ];
         Ok(Self {
             simulation: Simulation::new(),
             angle: Vec::new(),
@@ -172,87 +329,14 @@ impl Application {
             speed: Vec::new(),
             observer_speed: Vec::new(),
             run: false,
-            id: Vec::new(),
-            iq: Vec::new(),
-            fx: Vec::new(),
-            fy: Vec::new(),
-            rs: Vec::new(),
-            l0: Vec::new(),
-            l1: Vec::new(),
-            flux: Vec::new(),
+            scope,
         })
     }
 
     fn update(&mut self) {
         self.simulation.update();
-
-        let sample = 10000;
-
-        self.angle.drain(..self.angle.len().saturating_sub(sample));
-        self.observer_angle
-            .drain(..self.observer_angle.len().saturating_sub(sample));
-        self.speed.drain(..self.speed.len().saturating_sub(sample));
-        self.observer_speed
-            .drain(..self.observer_speed.len().saturating_sub(sample));
-        self.id.drain(..self.id.len().saturating_sub(sample));
-        self.iq.drain(..self.iq.len().saturating_sub(sample));
-        self.fx.drain(..self.fx.len().saturating_sub(sample));
-        self.fy.drain(..self.fy.len().saturating_sub(sample));
-        self.rs.drain(..self.rs.len().saturating_sub(sample));
-        self.l0.drain(..self.l0.len().saturating_sub(sample));
-        self.l1.drain(..self.l1.len().saturating_sub(sample));
-        self.flux.drain(..self.flux.len().saturating_sub(sample));
-
-        self.angle.push(PlotPoint::new(
-            self.simulation.timer.time,
-            angle_normal(self.simulation.motion_load.angle * self.simulation.motor.pole_pairs),
-        ));
-        self.observer_angle.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer_output.electrical_angle,
-        ));
-        self.speed.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.motion_load.speed * self.simulation.motor.pole_pairs,
-        ));
-        self.observer_speed.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer_output.electrical_speed,
-        ));
-
-        self.id.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.motor.current_dq[0],
-        ));
-        self.iq.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.motor.current_dq[1],
-        ));
-
-        self.fx.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.error[0],
-        ));
-        self.fy.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.error[1],
-        ));
-        self.rs.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.rs,
-        ));
-        self.l0.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.l0,
-        ));
-        self.l1.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.l1,
-        ));
-        self.flux.push(PlotPoint::new(
-            self.simulation.timer.time,
-            self.simulation.observer.flux,
-        ));
+        self.scope
+            .update(self.simulation.timer.time, &mut self.simulation);
     }
 }
 
@@ -264,76 +348,12 @@ impl App for Application {
                 self.update();
             }
         }
-        let mut auto_bounds = false;
         CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                auto_bounds = ui.button("auto").clicked();
                 ui.checkbox(&mut self.run, "Run");
             });
             ScrollArea::vertical().show(ui, |ui| {
-                CollapsingHeader::new("angle")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Plot::new("angle").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("angle", self.angle.as_slice()));
-                            ui.line(Line::new("observer_angle", self.observer_angle.as_slice()));
-                        });
-                    });
-                CollapsingHeader::new("speed")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Plot::new("speed").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("speed", self.speed.as_slice()));
-                            ui.line(Line::new("observer_speed", self.observer_speed.as_slice()));
-                        });
-                    });
-                CollapsingHeader::new("current_dq")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Plot::new("current_dq").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("id", self.id.as_slice()));
-                            ui.line(Line::new("iq", self.iq.as_slice()));
-                        });
-                    });
-                CollapsingHeader::new("observer")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Plot::new("observer").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("fx", self.fx.as_slice()));
-                            ui.line(Line::new("fy", self.fy.as_slice()));
-                        });
-                        Plot::new("observer_rs").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("rs", self.rs.as_slice()));
-                        });
-                        Plot::new("observer_l").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("l0", self.l0.as_slice()));
-                            ui.line(Line::new("l1", self.l1.as_slice()));
-                        });
-                        Plot::new("observer_f").height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            ui.line(Line::new("flux", self.flux.as_slice()));
-                        });
-                    });
+                self.scope.ui(ui);
             });
         });
     }
