@@ -29,7 +29,7 @@ impl Observer<3> for MixObserver {
             (current[1] - self.last_current[1]) / delta_time,
         ];
         self.last_current = current;
-        self.angle += self.speed + delta_time;
+        self.angle += self.speed * delta_time;
 
         let l0 = (self.inductance_dq[0] + self.inductance_dq[1]) * 0.5;
         let l1 = (self.inductance_dq[0] - self.inductance_dq[1]) * 0.5;
@@ -41,13 +41,7 @@ impl Observer<3> for MixObserver {
         let s = [2.0 * l1 * pzj_ib[0] + self.flux, 2.0 * l1 * pzj_ib[1]];
 
         let bemf = complex_div([px, py], s);
-        let sync_speed = rotate(
-            [
-                bemf[0] / std::f64::consts::TAU,
-                bemf[1] / std::f64::consts::TAU,
-            ],
-            -self.angle,
-        );
+        let sync_speed = rotate(bemf, -self.angle);
         self.sync_speed_lp[0] += (sync_speed[0] - self.sync_speed_lp[0]) * 10000.0 * delta_time;
         self.sync_speed_lp[1] += (sync_speed[1] - self.sync_speed_lp[1]) * 10000.0 * delta_time;
 

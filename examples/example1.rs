@@ -1,5 +1,5 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
-use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Ui};
+use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Slider, Ui, Widget};
 use egui_plot::{Line, Plot, PlotPoint};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_regulator::ThreePhasePICurrentRegulator;
@@ -26,6 +26,8 @@ use moto_sim::util::Timer;
 pub struct Simulation {
     pub delta_time: f64,
     pub timer: Timer,
+    pub target_speed: f64,
+    pub use_observer: usize,
 
     sensor_noise: Noise,
     current_noise: [Noise; 3],
@@ -65,7 +67,7 @@ impl Simulation {
         let sensor_observer = SensorObserver {
             pole_pairs: motor.pole_pairs,
             pll_kp: 100.0,
-            pll_ki: 10000.0,
+            pll_ki: 1000.0,
             ..Default::default()
         };
         let flux_observer = FluxObserver {
@@ -84,10 +86,10 @@ impl Simulation {
             rs: motor.rs,
             flux: motor.flux,
             inductance_dq: motor.inductance_dq,
-            theta_error_kp: 100.0,
+            theta_error_kp: 10.0,
             theta_error_ki: 10.0,
-            speed_error_kp: 1.0,
-            speed_error_ki: 0.1,
+            speed_error_kp: 0.0,
+            speed_error_ki: 100.0,
             ..Default::default()
         };
         let grad_observer = GradObserver {
@@ -126,7 +128,7 @@ impl Simulation {
                 Noise::new(0.01, 3),
             ],
             current_offset: [0.01, 0.02, 0.03],
-            voltage_offset: [0.2, -0.1, 0.1],
+            voltage_offset: [0.02, -0.01, 0.01],
             motion_load: IdealMotionLoad { ..FAN_LOAD },
             sensor_observer,
             grad_observer,
@@ -191,7 +193,13 @@ impl Simulation {
                     self.mix_observer_output =
                         self.mix_observer.update(delta_time, &self.observer_input);
 
-                    let use_observer = &self.sensor_observer_output;
+                    let use_observer = match self.use_observer {
+                        0 => &self.sensor_observer_output,
+                        1 => &self.grad_observer_output,
+                        2 => &self.flux_observer_output,
+                        3 => &self.mix_observer_output,
+                        _ => &self.sensor_observer_output,
+                    };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
                     self.current_regulator_input.electrical_angle = use_observer.electrical_angle;
                     for i in 0..3 {
@@ -200,8 +208,8 @@ impl Simulation {
                             + self.current_noise[i].value;
                     }
 
-                    let speed_error = 5.0 * std::f64::consts::TAU
-                        - self.current_regulator_input.electrical_speed;
+                    let speed_error =
+                        self.target_speed - self.current_regulator_input.electrical_speed;
                     self.speed_i += speed_error * 0.01 * delta_time;
                     let output_torque = self.speed_i + speed_error * 0.1;
                     let command_current = rotate(
@@ -220,7 +228,7 @@ impl Simulation {
                         self.current_regulator_output.command_voltage;
 
                     let inject_voltage = inverse_clarke(rotate(
-                        [1.0 * f64::sin(5000.0 * self.timer.time), 0.0],
+                        [0.0 * f64::sin(5000.0 * self.timer.time), 0.0],
                         self.current_regulator_input.electrical_angle,
                     ));
                     self.power_bridge_input.command_voltage[0] += inject_voltage[0];
@@ -301,8 +309,19 @@ pub struct Application {
 impl Application {
     pub fn new(cc: &CreationContext) -> anyhow::Result<Self> {
         load_chinese_font(&cc.egui_ctx);
-        let mut scope = Scope::new();
-        scope.data = vec![
+        let mut this = Self {
+            simulation: Simulation::new(),
+            run: false,
+            scope: Scope::new(),
+        };
+        this.reset();
+        Ok(this)
+    }
+
+    pub fn reset(&mut self) {
+        self.run = false;
+        self.simulation = Simulation::new();
+        self.scope.data = vec![
             (
                 "angle".to_string(),
                 vec![
@@ -324,6 +343,35 @@ impl Application {
                 ],
             ),
             (
+                "angle_error".to_string(),
+                vec![
+                    ScopeData::new("sensor_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.sensor_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.grad_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("mix_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.mix_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                ],
+            ),
+            (
                 "speed".to_string(),
                 vec![
                     ScopeData::new("real_speed", |s: &mut Simulation| {
@@ -340,6 +388,27 @@ impl Application {
                     }),
                     ScopeData::new("mix_speed", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_speed
+                    }),
+                ],
+            ),
+            (
+                "speed_error".to_string(),
+                vec![
+                    ScopeData::new("sensor_speed", |s: &mut Simulation| {
+                        s.sensor_observer_output.electrical_speed
+                            - s.motion_load.speed * s.motor.pole_pairs
+                    }),
+                    ScopeData::new("flux_speed", |s: &mut Simulation| {
+                        s.flux_observer_output.electrical_speed
+                            - s.motion_load.speed * s.motor.pole_pairs
+                    }),
+                    ScopeData::new("grad_speed", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_speed
+                            - s.motion_load.speed * s.motor.pole_pairs
+                    }),
+                    ScopeData::new("mix_speed", |s: &mut Simulation| {
+                        s.mix_observer_output.electrical_speed
+                            - s.motion_load.speed * s.motor.pole_pairs
                     }),
                 ],
             ),
@@ -424,11 +493,6 @@ impl Application {
                 ],
             ),
         ];
-        Ok(Self {
-            simulation: Simulation::new(),
-            run: false,
-            scope,
-        })
     }
 
     fn update(&mut self) {
@@ -448,7 +512,14 @@ impl App for Application {
         }
         CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
+                if ui.button("Reset").clicked() {
+                    self.reset();
+                }
                 ui.checkbox(&mut self.run, "Run");
+                ui.label("target_speed");
+                Slider::new(&mut self.simulation.target_speed, -300.0..=300.0).ui(ui);
+                ui.label("use_observer");
+                Slider::new(&mut self.simulation.use_observer, 0..=3).ui(ui);
             });
             ScrollArea::vertical().show(ui, |ui| {
                 self.scope.ui(ui);
