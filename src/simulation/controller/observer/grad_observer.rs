@@ -1,5 +1,5 @@
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use crate::simulation::{angle_normal, clarke, rotate};
+use crate::simulation::{angle_normal, clarke, nn, rotate};
 
 #[derive(Debug, Default, Clone)]
 pub struct GradObserver {
@@ -86,6 +86,7 @@ impl Observer<3> for GradObserver {
 
         self.error = [ex, ey];
         self.angle = angle_normal(self.angle);
+        self.speed = self.speed.clamp(-1e9, 1e9);
 
         self.speed_lp += (angle_normal(self.angle - last_angle) / delta_time - self.speed_lp)
             * self.speed_lp_factor

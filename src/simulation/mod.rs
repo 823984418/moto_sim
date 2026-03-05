@@ -38,14 +38,18 @@ pub fn rotate(v: [f64; 2], theta: f64) -> [f64; 2] {
     [v[0] * cos - v[1] * sin, v[0] * sin + v[1] * cos]
 }
 
+pub fn nn(x: f64) -> f64 {
+    if x.is_nan() { 0.0 } else { x }
+}
+
 pub fn complex_div(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
-    let s = b[0] * b[0] + b[1] * b[1];
+    let s = b[0] * b[0] + b[1] * b[1] + f64::EPSILON;
     [
-        (a[0] * b[0] + a[1] * b[1]) / s,
-        (a[1] * b[0] - a[0] * b[1]) / s,
+        nn((a[0] * b[0] + a[1] * b[1]) / s),
+        nn((a[1] * b[0] - a[0] * b[1]) / s),
     ]
 }
 
 pub fn atan2(a: [f64; 2]) -> f64 {
-    f64::atan2(a[1], a[0])
+    nn(f64::atan2(a[1], a[0]))
 }

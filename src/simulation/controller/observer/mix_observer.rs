@@ -3,12 +3,11 @@ use crate::simulation::{angle_normal, clarke, complex_div, rotate};
 
 #[derive(Debug, Default, Clone)]
 pub struct MixObserver {
-    pub last_current: [f64; 2],
-
     pub rs: f64,
     pub inductance_dq: [f64; 2],
     pub flux: f64,
-
+    pub last_current: [f64; 2],
+    pub static_speed_lp: [f64; 2],
     pub sync_speed_lp: [f64; 2],
 
     pub angle: f64,
@@ -44,7 +43,16 @@ impl Observer<3> for MixObserver {
         let s = [2.0 * l1 * pzj_ib[0] + self.flux, 2.0 * l1 * pzj_ib[1]];
 
         let static_speed = complex_div([px, py], s);
-        let sync_speed = rotate(static_speed, -self.angle);
+        self.static_speed_lp[0] += (static_speed[0] - self.static_speed_lp[0]) * 0.1 * delta_time;
+        self.static_speed_lp[1] += (static_speed[1] - self.static_speed_lp[1]) * 0.1 * delta_time;
+
+        let sync_speed = rotate(
+            [
+                static_speed[0] - self.static_speed_lp[0],
+                static_speed[1] - self.static_speed_lp[1],
+            ],
+            -self.angle,
+        );
         self.sync_speed_lp[0] += (sync_speed[0] - self.sync_speed_lp[0]) * 10000.0 * delta_time;
         self.sync_speed_lp[1] += (sync_speed[1] - self.sync_speed_lp[1]) * 10000.0 * delta_time;
 
