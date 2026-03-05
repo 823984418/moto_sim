@@ -34,7 +34,7 @@ impl Noise {
         }
     }
 
-    pub fn update(&mut self, delta_time: f64) {
+    pub fn update(&mut self, _delta_time: f64) {
         self.value = self.rng.sample(self.distribution);
     }
 }

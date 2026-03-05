@@ -4,6 +4,7 @@ pub mod three_phase_pi_current_regulator;
 pub struct CurrentRegulatorInput<const P: usize> {
     pub electrical_speed: f64,
     pub electrical_angle: f64,
+    pub continuous_speed: f64,
     pub current: [f64; P],
     pub command_current: [f64; P],
 }
@@ -13,6 +14,7 @@ impl<const P: usize> Default for CurrentRegulatorInput<P> {
         Self {
             electrical_speed: 0.0,
             electrical_angle: 0.0,
+            continuous_speed: 0.0,
             current: [0.0; P],
             command_current: [0.0; P],
         }

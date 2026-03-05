@@ -55,6 +55,7 @@ impl Observer<3> for FluxObserver {
         ObserverOutput {
             electrical_angle: angle,
             electrical_speed: self.speed_lp,
+            continuous_speed: self.speed_lp,
         }
     }
 }

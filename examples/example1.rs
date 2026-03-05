@@ -9,6 +9,7 @@ use moto_sim::simulation::controller::current_regulator::{
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
+use moto_sim::simulation::controller::observer::mp_observer::MpObserver;
 use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
@@ -48,6 +49,7 @@ pub struct Simulation {
     grad_observer_output: ObserverOutput,
     flux_observer_output: ObserverOutput,
     mix_observer_output: ObserverOutput,
+    mp_observer_output: ObserverOutput,
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
 
@@ -58,6 +60,7 @@ pub struct Simulation {
     pub grad_observer: GradObserver,
     pub flux_observer: FluxObserver,
     pub mix_observer: MixObserver,
+    pub mp_observer: MpObserver,
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
 
@@ -67,7 +70,7 @@ impl Simulation {
         let sensor_observer = SensorObserver {
             pole_pairs: motor.pole_pairs,
             pll_kp: 100.0,
-            pll_ki: 1000.0,
+            pll_ki: 10000.0,
             ..Default::default()
         };
         let flux_observer = FluxObserver {
@@ -86,10 +89,11 @@ impl Simulation {
             rs: motor.rs,
             flux: motor.flux,
             inductance_dq: motor.inductance_dq,
-            theta_error_kp: 10.0,
+            theta_error_kp: 1.0,
             theta_error_ki: 10.0,
             speed_error_kp: 0.0,
-            speed_error_ki: 100.0,
+            speed_error_ki: 1000.0,
+            speed_lp_factor: 100.0,
             ..Default::default()
         };
         let grad_observer = GradObserver {
@@ -103,14 +107,25 @@ impl Simulation {
             kl1_ds: 0.0,
             kl1_de: 0.0,
 
-            kspeed_l1: 100.0,
-            kspeed_flux: 100.0,
-            kspeed_kangle: 10.0,
-            kangle_l1_di: 100.0,
-            kangle_l1_ds: 100.0,
-            kangle_flux: 100.0,
+            kspeed_l1: 10000.0,
+            kspeed_flux: 10000.0,
+            kspeed_kangle: 10000.0,
+            kangle_l1_di: 1.0,
+            kangle_l1_ds: 1.0,
+            kangle_flux: 1.0,
 
+            speed_lp_factor: 100.0,
             angle: std::f64::consts::PI * 0.1,
+            ..Default::default()
+        };
+        let mp_observer = MpObserver {
+            rs: motor.rs,
+            flux: motor.flux,
+            inductance_dq: motor.inductance_dq,
+            sample: vec![1.0; 32],
+            background: 0.001,
+            error_factor: 1.0,
+            speed_lp_factor: 100.0,
             ..Default::default()
         };
         Self {
@@ -134,6 +149,7 @@ impl Simulation {
             grad_observer,
             flux_observer,
             mix_observer,
+            mp_observer,
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
                     0.8e3 * motor.inductance_dq[0],
@@ -192,16 +208,20 @@ impl Simulation {
                         self.flux_observer.update(delta_time, &self.observer_input);
                     self.mix_observer_output =
                         self.mix_observer.update(delta_time, &self.observer_input);
+                    self.mp_observer_output =
+                        self.mp_observer.update(delta_time, &self.observer_input);
 
                     let use_observer = match self.use_observer {
                         0 => &self.sensor_observer_output,
                         1 => &self.grad_observer_output,
                         2 => &self.flux_observer_output,
                         3 => &self.mix_observer_output,
+                        4 => &self.mp_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
                     self.current_regulator_input.electrical_angle = use_observer.electrical_angle;
+                    self.current_regulator_input.continuous_speed = use_observer.continuous_speed;
                     for i in 0..3 {
                         self.current_regulator_input.current[i] = self.motor_output.current[i]
                             + self.current_offset[i]
@@ -210,8 +230,10 @@ impl Simulation {
 
                     let speed_error =
                         self.target_speed - self.current_regulator_input.electrical_speed;
-                    self.speed_i += speed_error * 0.01 * delta_time;
-                    let output_torque = self.speed_i + speed_error * 0.1;
+                    let speed_p = speed_error * 0.1;
+                    self.speed_i += speed_error * 0.1 * delta_time;
+                    self.speed_i = self.speed_i.clamp(-2.0 - speed_p, 2.0 - speed_p);
+                    let output_torque = self.speed_i + speed_p;
                     let command_current = rotate(
                         [
                             0.0 * f64::cos(use_observer.electrical_angle) + 0.0,
@@ -273,28 +295,33 @@ impl<S> Scope<S> {
         for (_, datas) in &mut self.data {
             for d in datas {
                 d.data.push(PlotPoint::new(time, (d.update)(source)));
-                d.data
-                    .drain(..d.data.len().saturating_sub(self.sample_count));
             }
         }
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
+        for (_, datas) in &mut self.data {
+            for d in datas {
+                if d.data.len() > self.sample_count {
+                    let begin = d.data.len() - self.sample_count;
+                    d.data.copy_within(begin.., 0);
+                    d.data.truncate(self.sample_count);
+                }
+            }
+        }
         let auto_bounds = ui.button("auto").clicked();
         ScrollArea::vertical().show(ui, |ui| {
             for (group_name, datas) in &self.data {
-                CollapsingHeader::new(group_name)
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        Plot::new(group_name).height(120.0).show(ui, |ui| {
-                            if auto_bounds {
-                                ui.set_auto_bounds(true);
-                            }
-                            for d in datas {
-                                ui.line(Line::new(&d.name, d.data.as_slice()));
-                            }
-                        });
+                CollapsingHeader::new(group_name).show(ui, |ui| {
+                    Plot::new(group_name).height(120.0).show(ui, |ui| {
+                        if auto_bounds {
+                            ui.set_auto_bounds(true);
+                        }
+                        for d in datas {
+                            ui.line(Line::new(&d.name, d.data.as_slice()));
+                        }
                     });
+                });
             }
         });
     }
@@ -340,6 +367,9 @@ impl Application {
                     ScopeData::new("mix_angle", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_angle
                     }),
+                    ScopeData::new("mp_angle", |s: &mut Simulation| {
+                        s.mp_observer_output.electrical_angle
+                    }),
                 ],
             ),
             (
@@ -369,6 +399,12 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
+                    ScopeData::new("mp_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.mp_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                 ],
             ),
             (
@@ -389,26 +425,8 @@ impl Application {
                     ScopeData::new("mix_speed", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_speed
                     }),
-                ],
-            ),
-            (
-                "speed_error".to_string(),
-                vec![
-                    ScopeData::new("sensor_speed", |s: &mut Simulation| {
-                        s.sensor_observer_output.electrical_speed
-                            - s.motion_load.speed * s.motor.pole_pairs
-                    }),
-                    ScopeData::new("flux_speed", |s: &mut Simulation| {
-                        s.flux_observer_output.electrical_speed
-                            - s.motion_load.speed * s.motor.pole_pairs
-                    }),
-                    ScopeData::new("grad_speed", |s: &mut Simulation| {
-                        s.grad_observer_output.electrical_speed
-                            - s.motion_load.speed * s.motor.pole_pairs
-                    }),
-                    ScopeData::new("mix_speed", |s: &mut Simulation| {
-                        s.mix_observer_output.electrical_speed
-                            - s.motion_load.speed * s.motor.pole_pairs
+                    ScopeData::new("mp_speed", |s: &mut Simulation| {
+                        s.mp_observer_output.electrical_speed
                     }),
                 ],
             ),
@@ -442,13 +460,13 @@ impl Application {
                     ScopeData::new("sid", |s: &mut Simulation| {
                         rotate(
                             clarke(s.current_regulator_input.current),
-                            -s.motion_load.angle * s.motor.pole_pairs,
+                            -s.current_regulator_input.electrical_angle,
                         )[0]
                     }),
                     ScopeData::new("siq", |s: &mut Simulation| {
                         rotate(
                             clarke(s.current_regulator_input.current),
-                            -s.motion_load.angle * s.motor.pole_pairs,
+                            -s.current_regulator_input.electrical_angle,
                         )[1]
                     }),
                 ],
@@ -503,7 +521,7 @@ impl Application {
 }
 
 impl App for Application {
-    fn update(&mut self, ctx: &Context, frame: &mut Frame) {
+    fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
         ctx.request_repaint();
         if self.run {
             for _ in 0..33 {
@@ -517,9 +535,17 @@ impl App for Application {
                 }
                 ui.checkbox(&mut self.run, "Run");
                 ui.label("target_speed");
-                Slider::new(&mut self.simulation.target_speed, -300.0..=300.0).ui(ui);
+                Slider::new(&mut self.simulation.target_speed, -2000.0..=2000.0).ui(ui);
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=3).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=4).ui(ui);
+                ui.label(match self.simulation.use_observer {
+                    0 => "sensor_observer",
+                    1 => "flux_observer",
+                    2 => "grad_observer",
+                    3 => "mix_observer",
+                    4 => "mp_observer",
+                    _ => "sensor_observer",
+                });
             });
             ScrollArea::vertical().show(ui, |ui| {
                 self.scope.ui(ui);

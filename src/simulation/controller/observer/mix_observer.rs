@@ -13,6 +13,8 @@ pub struct MixObserver {
 
     pub angle: f64,
     pub speed: f64,
+    pub speed_lp: f64,
+    pub speed_lp_factor: f64,
 
     pub speed_error_kp: f64,
     pub speed_error_ki: f64,
@@ -29,6 +31,7 @@ impl Observer<3> for MixObserver {
             (current[1] - self.last_current[1]) / delta_time,
         ];
         self.last_current = current;
+        let last_angle = self.angle;
         self.angle += self.speed * delta_time;
 
         let l0 = (self.inductance_dq[0] + self.inductance_dq[1]) * 0.5;
@@ -40,8 +43,8 @@ impl Observer<3> for MixObserver {
         let pzj_ib = rotate([current[0], -current[1]], self.angle);
         let s = [2.0 * l1 * pzj_ib[0] + self.flux, 2.0 * l1 * pzj_ib[1]];
 
-        let bemf = complex_div([px, py], s);
-        let sync_speed = rotate(bemf, -self.angle);
+        let static_speed = complex_div([px, py], s);
+        let sync_speed = rotate(static_speed, -self.angle);
         self.sync_speed_lp[0] += (sync_speed[0] - self.sync_speed_lp[0]) * 10000.0 * delta_time;
         self.sync_speed_lp[1] += (sync_speed[1] - self.sync_speed_lp[1]) * 10000.0 * delta_time;
 
@@ -57,9 +60,14 @@ impl Observer<3> for MixObserver {
             (speed_error * self.speed_error_ki + theta_error * self.theta_error_ki) * delta_time;
         self.angle = angle_normal(self.angle);
 
+        self.speed_lp += (angle_normal(self.angle - last_angle) / delta_time - self.speed_lp)
+            * delta_time
+            * self.speed_lp_factor;
+
         ObserverOutput {
             electrical_angle: self.angle,
-            electrical_speed: self.speed,
+            electrical_speed: self.speed_lp,
+            continuous_speed: sync_speed[1],
         }
     }
 }

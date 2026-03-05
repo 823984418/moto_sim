@@ -13,6 +13,9 @@ pub struct GradObserver {
     pub speed: f64,
     pub angle: f64,
 
+    pub speed_lp: f64,
+    pub speed_lp_factor: f64,
+
     pub kr: f64,
     pub kl0: f64,
     pub kflux: f64,
@@ -38,6 +41,7 @@ impl Observer<3> for GradObserver {
         self.last_current = i;
         let v = clarke(input.voltage);
 
+        let last_angle = self.angle;
         self.angle += self.speed * delta_time;
 
         let ezj = rotate([1.0, 0.0], self.angle);
@@ -83,9 +87,14 @@ impl Observer<3> for GradObserver {
         self.error = [ex, ey];
         self.angle = angle_normal(self.angle);
 
+        self.speed_lp += (angle_normal(self.angle - last_angle) / delta_time - self.speed_lp)
+            * self.speed_lp_factor
+            * delta_time;
+
         ObserverOutput {
             electrical_angle: self.angle,
-            electrical_speed: self.speed,
+            electrical_speed: self.speed_lp,
+            continuous_speed: self.speed,
         }
     }
 }

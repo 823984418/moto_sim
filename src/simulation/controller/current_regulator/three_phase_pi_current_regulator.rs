@@ -16,7 +16,7 @@ impl CurrentRegulator<3> for ThreePhasePICurrentRegulator {
         delta_time: f64,
         input: &CurrentRegulatorInput<3>,
     ) -> CurrentRegulatorOutput<3> {
-        self.integrator = rotate(self.integrator, input.electrical_speed * delta_time);
+        self.integrator = rotate(self.integrator, input.continuous_speed * delta_time);
 
         let error_current = rotate(
             clarke([
