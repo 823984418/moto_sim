@@ -108,7 +108,7 @@ impl Simulation {
             rs: motor.rs,
             flux: motor.flux,
             inductance_dq: motor.inductance_dq,
-            speed_lp_factor: 100.0,
+            speed_lp_factor: 10.0,
             position_factor: 100.0,
             position: [
                 f64::cos(std::f64::consts::PI * 0.0),
@@ -124,7 +124,7 @@ impl Simulation {
             theta_error_ki: 10.0,
             speed_error_kp: 0.0,
             speed_error_ki: 1000.0,
-            speed_lp_factor: 100.0,
+            speed_lp_factor: 10.0,
             ..Default::default()
         };
         let grad_observer = GradObserver {
@@ -145,7 +145,7 @@ impl Simulation {
             kangle_l1_ds: 1.0,
             kangle_flux: 1.0,
 
-            speed_lp_factor: 100.0,
+            speed_lp_factor: 10.0,
             angle: std::f64::consts::PI * 0.1,
             ..Default::default()
         };
@@ -156,7 +156,7 @@ impl Simulation {
             sample: vec![1.0; 32],
             background: 0.0001,
             error_factor: 0.001,
-            speed_lp_factor: 100.0,
+            speed_lp_factor: 10.0,
             ..Default::default()
         };
         let ds_observer = DsObserver {
@@ -167,7 +167,7 @@ impl Simulation {
             pll_angle_ki: 100.0,
             pll_speed_ki: 0.0,
             sync_angle_lp_factor: 100.0,
-            speed_lp_factor: 100.0,
+            speed_lp_factor: 10.0,
             ..Default::default()
         };
         Self {
@@ -189,7 +189,7 @@ impl Simulation {
             output_voltage_offset: [0.02, -0.01, 0.01],
             motion_load: IdealMotionLoad { ..FAN_LOAD },
             power_bridge: TwoLevelPowerBridge {
-                bus_capacitance: 470e-6,
+                bus_capacitance: 390e-6,
                 dead_mapping: zq10y_dead_mapping(),
                 carry_freq: 16e3,
                 ..Default::default()
@@ -310,8 +310,8 @@ impl Simulation {
 
                     let speed_error =
                         self.target_speed - self.current_regulator_input.electrical_speed;
-                    let speed_p = speed_error * 0.01;
-                    self.speed_i += speed_error * 0.01 * delta_time;
+                    let speed_p = speed_error * 0.1;
+                    self.speed_i += speed_error * 0.1 * delta_time;
                     self.speed_i = self.speed_i.clamp(-2.0 - speed_p, 2.0 - speed_p);
                     let output_torque = self.speed_i + speed_p;
                     let command_current = rotate(
