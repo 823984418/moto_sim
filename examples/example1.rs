@@ -307,12 +307,13 @@ impl Simulation {
                     self.current_regulator_input.continuous_speed = use_observer.continuous_speed;
                     self.current_regulator_input.current = sample_current;
 
+                    let max_current = 2.0;
                     let speed_error =
                         self.target_speed - self.current_regulator_input.electrical_speed;
                     let speed_p = speed_error * 0.1;
                     self.speed_i += speed_error * 0.1 * delta_time;
-                    self.speed_i = self.speed_i.clamp(-2.0 - speed_p, 2.0 - speed_p);
-                    let output_torque = self.speed_i + speed_p;
+                    self.speed_i = self.speed_i.clamp(-max_current, max_current);
+                    let output_torque = (self.speed_i + speed_p).clamp(-max_current, max_current);
                     let id = if self.set_id {
                         self.id
                     } else {
@@ -322,7 +323,8 @@ impl Simulation {
                             self.motor.inductance_dq[0],
                             self.motor.inductance_dq[1],
                         )
-                    };
+                    }
+                    .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
                             id + 0.0 * f64::cos(use_observer.electrical_angle) + 0.0,
