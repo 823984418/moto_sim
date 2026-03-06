@@ -100,8 +100,8 @@ impl Simulation {
         let motor = PermanentMagnetSynchronousMotor { ..FAN_MOTOR };
         let sensor_observer = SensorObserver {
             pole_pairs: motor.pole_pairs,
-            pll_kp: 100.0,
-            pll_ki: 10000.0,
+            pll_kp: 10.0,
+            pll_ki: 1000.0,
             ..Default::default()
         };
         let flux_observer = FluxObserver {
