@@ -259,7 +259,7 @@ impl Simulation {
                         self.power_bridge.braking_current = 0.01;
                     }
 
-                    /// 电流重建
+                    // 电流重建
                     let mut sample_current = self.motor_output.current;
                     for i in 0..3 {
                         sample_current[i] +=

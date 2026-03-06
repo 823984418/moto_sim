@@ -1,7 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
 
-use crate::model::zq10y_dead_mapping;
 use crate::simulation::nn;
 
 #[derive(Debug, Default, Clone)]

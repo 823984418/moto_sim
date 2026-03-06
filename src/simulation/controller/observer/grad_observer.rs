@@ -1,5 +1,5 @@
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use crate::simulation::{angle_normal, clarke, nn, rotate};
+use crate::simulation::{angle_normal, clarke, rotate};
 
 #[derive(Debug, Default, Clone)]
 pub struct GradObserver {

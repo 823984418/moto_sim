@@ -1,5 +1,3 @@
-use rand_distr::num_traits::real::Real;
-
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::{angle_normal, clarke, complex_div, rotate};
 

@@ -1,7 +1,8 @@
-use std::fmt::{Debug, Formatter};
+use std::fmt::Debug;
+
 use crate::simulation::nn;
 use crate::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
-use crate::util::{BoxedFunction, Function};
+use crate::util::BoxedFunction;
 
 /// 模拟真实的两电平功率桥
 /// 具有一个整流桥对输入电压进行全波整流
