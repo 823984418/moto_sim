@@ -21,7 +21,7 @@ use moto_sim::simulation::motor::{Motor, MotorInput, MotorOutput};
 use moto_sim::simulation::noise::Noise;
 use moto_sim::simulation::power_bridge::two_level_power_bridge::TwoLevelPowerBridge;
 use moto_sim::simulation::power_bridge::{PowerBridge, PowerBridgeInput, PowerBridgeOutput};
-use moto_sim::simulation::{angle_normal, clarke, inverse_clarke, nn, rotate};
+use moto_sim::simulation::{angle_normal, clarke, inverse_clarke, mtpa_id, nn, rotate};
 use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::{BoxedFunction, LinearInterpolation, Timer};
 
@@ -64,6 +64,7 @@ pub struct Simulation {
     output_voltage_offset: [f64; 3],
 
     speed_i: f64,
+    set_id: bool,
     id: f64,
 
     power_bridge_input: PowerBridgeInput<3>,
@@ -137,14 +138,12 @@ impl Simulation {
             kflux: 0.0,
             kl1_ds: 0.0,
             kl1_de: 0.0,
-
             kspeed_l1: 1000.0,
             kspeed_flux: 1000.0,
             kspeed_kangle: 1000.0,
             kangle_l1_di: 1.0,
             kangle_l1_ds: 1.0,
             kangle_flux: 1.0,
-
             speed_lp_factor: 10.0,
             angle: std::f64::consts::PI * 0.1,
             ..Default::default()
@@ -314,9 +313,19 @@ impl Simulation {
                     self.speed_i += speed_error * 0.1 * delta_time;
                     self.speed_i = self.speed_i.clamp(-2.0 - speed_p, 2.0 - speed_p);
                     let output_torque = self.speed_i + speed_p;
+                    let id = if self.set_id {
+                        self.id
+                    } else {
+                        mtpa_id(
+                            output_torque,
+                            self.motor.flux,
+                            self.motor.inductance_dq[0],
+                            self.motor.inductance_dq[1],
+                        )
+                    };
                     let command_current = rotate(
                         [
-                            self.id + 0.0 * f64::cos(use_observer.electrical_angle) + 0.0,
+                            id + 0.0 * f64::cos(use_observer.electrical_angle) + 0.0,
                             output_torque,
                         ],
                         use_observer.electrical_angle,
@@ -457,15 +466,15 @@ impl Application {
                     ScopeData::new("flux_angle", |s: &mut Simulation| {
                         s.flux_observer_output.electrical_angle
                     }),
-                    ScopeData::new("grad_angle", |s: &mut Simulation| {
-                        s.grad_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
+                    //     s.grad_observer_output.electrical_angle
+                    // }),
                     ScopeData::new("mix_angle", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_angle
                     }),
-                    ScopeData::new("mp_angle", |s: &mut Simulation| {
-                        s.mp_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("mp_angle", |s: &mut Simulation| {
+                    //     s.mp_observer_output.electrical_angle
+                    // }),
                     // ScopeData::new("ds_angle", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_angle
                     // }),
@@ -486,24 +495,24 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    ScopeData::new("grad_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.grad_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.grad_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                     ScopeData::new("mix_angle", |s: &mut Simulation| {
                         angle_normal(
                             s.mix_observer_output.electrical_angle
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    ScopeData::new("mp_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.mp_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("mp_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.mp_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                     // ScopeData::new("ds_angle", |s: &mut Simulation| {
                     //     angle_normal(
                     //         s.ds_observer_output.electrical_angle
@@ -524,15 +533,15 @@ impl Application {
                     ScopeData::new("flux_speed", |s: &mut Simulation| {
                         s.flux_observer_output.electrical_speed
                     }),
-                    ScopeData::new("grad_speed", |s: &mut Simulation| {
-                        s.grad_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("grad_speed", |s: &mut Simulation| {
+                    //     s.grad_observer_output.electrical_speed
+                    // }),
                     ScopeData::new("mix_speed", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_speed
                     }),
-                    ScopeData::new("mp_speed", |s: &mut Simulation| {
-                        s.mp_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("mp_speed", |s: &mut Simulation| {
+                    //     s.mp_observer_output.electrical_speed
+                    // }),
                     // ScopeData::new("ds_speed", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_speed
                     // }),
@@ -670,8 +679,8 @@ impl App for Application {
                 .logarithmic(true)
                 .ui(ui);
                 ui.label("target_speed");
-                Slider::new(&mut self.simulation.target_speed, -2000.0..=2000.0).ui(ui);
-                ui.label("id");
+                Slider::new(&mut self.simulation.target_speed, -5000.0..=5000.0).ui(ui);
+                ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
                 ui.label("use_observer");
                 Slider::new(&mut self.simulation.use_observer, 0..=5).ui(ui);
