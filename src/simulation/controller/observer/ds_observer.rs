@@ -1,5 +1,3 @@
-use std::ops::BitXor;
-
 use rand_distr::num_traits::real::Real;
 
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
