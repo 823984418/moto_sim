@@ -7,6 +7,7 @@ use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_
 use moto_sim::simulation::controller::current_regulator::{
     CurrentRegulator, CurrentRegulatorInput, CurrentRegulatorOutput,
 };
+use moto_sim::simulation::controller::inline_tune::{InductanceTune, ResTune};
 use moto_sim::simulation::controller::observer::ds_observer::DsObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
@@ -84,6 +85,9 @@ pub struct Simulation {
     current_regulator_output: CurrentRegulatorOutput<3>,
 
     dead_fix: BoxedFunction,
+    res_tune: ResTune,
+    inductance_tune: InductanceTune,
+
     pub power_bridge: TwoLevelPowerBridge<3>,
     pub motor: PermanentMagnetSynchronousMotor,
     pub motion_load: IdealMotionLoad,
@@ -184,13 +188,25 @@ impl Simulation {
                 Noise::new(0.01, 6),
             ],
             bus_voltage_sample_noise: Noise::new(1.0, 7),
-            sample_current_offset: [0.01, 0.02, 0.03],
-            output_voltage_offset: [0.02, -0.01, 0.01],
+            // sample_current_offset: [0.01, 0.02, 0.03],
+            // output_voltage_offset: [0.02, -0.01, 0.01],
             motion_load: IdealMotionLoad { ..FAN_LOAD },
             power_bridge: TwoLevelPowerBridge {
                 bus_capacitance: 390e-6,
                 dead_mapping: zq10y_dead_mapping(),
                 carry_freq: 16e3,
+                ..Default::default()
+            },
+            res_tune: ResTune {
+                output_res: motor.rs,
+                input_lp_factor: 0.1,
+                output_lp_factor: 0.1,
+                ..Default::default()
+            },
+            inductance_tune: InductanceTune {
+                sample_lp_factor: 5000.0,
+                input_lp_factor: 500.0,
+                output_lp_factor: 0.001,
                 ..Default::default()
             },
             sensor_observer,
@@ -199,7 +215,7 @@ impl Simulation {
             mix_observer,
             mp_observer,
             ds_observer,
-            dead_fix: zq10y_dead_mapping_with_error(),
+            dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
                     0.8e4 * motor.inductance_dq[0],
@@ -279,6 +295,10 @@ impl Simulation {
                     self.observer_input.voltage = sample_voltage;
                     self.observer_input.current = sample_current;
 
+                    self.res_tune.update(delta_time, &self.observer_input);
+                    self.inductance_tune
+                        .update(delta_time, &self.observer_input);
+
                     self.sensor_observer_output = self
                         .sensor_observer
                         .update(delta_time, &self.observer_input);
@@ -327,7 +347,10 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 0.0 * f64::cos(use_observer.electrical_angle) + 0.0,
+                            id + 1.0
+                                * f64::cos(
+                                    use_observer.electrical_angle - self.res_tune.tune_angle,
+                                ),
                             output_torque,
                         ],
                         use_observer.electrical_angle,
@@ -622,7 +645,20 @@ impl Application {
                 vec![
                     ScopeData::new("rs", |s: &mut Simulation| s.motor.rs),
                     ScopeData::new("grad_rs", |s: &mut Simulation| s.grad_observer.rs),
+                    ScopeData::new("tune_rs", |s: &mut Simulation| s.res_tune.output_res),
                 ],
+            ),
+            (
+                "irs".to_string(),
+                vec![ScopeData::new("tune_c", |s: &mut Simulation| {
+                    s.res_tune.current_lp[0]
+                })],
+            ),
+            (
+                "vrs".to_string(),
+                vec![ScopeData::new("tune_v", |s: &mut Simulation| {
+                    s.res_tune.voltage_lp[0]
+                })],
             ),
             (
                 "l0".to_string(),
@@ -631,6 +667,7 @@ impl Application {
                         (s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5
                     }),
                     ScopeData::new("grad_l0", |s: &mut Simulation| s.grad_observer.l0),
+                    ScopeData::new("tune_l0", |s: &mut Simulation| s.inductance_tune.output_l0),
                 ],
             ),
             (

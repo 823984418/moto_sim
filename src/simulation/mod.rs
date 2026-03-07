@@ -58,3 +58,7 @@ pub fn mtpa_id(iq: f64, flux: f64, ld: f64, lq: f64) -> f64 {
     let flux_div_2_lq_sub_ld = 0.5 * flux / (lq - ld);
     flux_div_2_lq_sub_ld - f64::sqrt(flux_div_2_lq_sub_ld * flux_div_2_lq_sub_ld + iq * iq)
 }
+
+pub fn complex_mode(a: [f64; 2]) -> f64 {
+    f64::sqrt(a[0] * a[0] + a[1] * a[1])
+}
