@@ -9,6 +9,7 @@ pub mod sensor_observer;
 pub struct ObserverInput<const P: usize> {
     pub voltage: [f64; P],
     pub current: [f64; P],
+    pub target_speed: f64,
 }
 
 impl<const P: usize> Default for ObserverInput<P> {
@@ -16,6 +17,7 @@ impl<const P: usize> Default for ObserverInput<P> {
         Self {
             voltage: [0.0; P],
             current: [0.0; P],
+            target_speed: 0.0,
         }
     }
 }

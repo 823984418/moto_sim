@@ -294,6 +294,7 @@ impl Simulation {
 
                     self.observer_input.voltage = sample_voltage;
                     self.observer_input.current = sample_current;
+                    self.observer_input.target_speed = self.target_speed;
 
                     self.res_tune.update(delta_time, &self.observer_input);
                     self.inductance_tune
