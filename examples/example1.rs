@@ -196,10 +196,12 @@ impl Simulation {
         };
         let base_flux_observer = BaseFluxObserver {
             rs: motor.rs,
+            flux: motor.flux,
             inductance: motor.inductance_dq[1],
             lambda: rotate([motor.flux, 0.0], std::f64::consts::TAU / 360.0 * 45.0),
             alpha: 10.0,
-            gamma: 100.0,
+            gamma: 10.0,
+            epsilon: 0.00000001,
             speed_lp_factor: 10.0,
             ..Default::default()
         };
@@ -718,12 +720,12 @@ impl Application {
                     ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.x[1]),
                 ],
             ),
-            (
-                "ex_fluxx".to_string(),
-                vec![ScopeData::new("x", |s: &mut Simulation| {
-                    s.base_flux_observer.flux_power / s.base_flux_observer.power
-                })],
-            ),
+            // (
+            //     "ex_fluxx".to_string(),
+            //     vec![ScopeData::new("x", |s: &mut Simulation| {
+            //         s.base_flux_observer.flux_power / s.base_flux_observer.power
+            //     })],
+            // ),
             (
                 "rs".to_string(),
                 vec![
