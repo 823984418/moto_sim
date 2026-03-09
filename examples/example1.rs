@@ -8,7 +8,9 @@ use moto_sim::simulation::controller::current_regulator::{
     CurrentRegulator, CurrentRegulatorInput, CurrentRegulatorOutput,
 };
 use moto_sim::simulation::controller::inline_tune::{InductanceTune, ResTune};
+use moto_sim::simulation::controller::observer::base_flux_observer::BaseFluxObserver;
 use moto_sim::simulation::controller::observer::ds_observer::DsObserver;
+use moto_sim::simulation::controller::observer::ex_flux_observer::ExFluxObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
@@ -81,6 +83,9 @@ pub struct Simulation {
     mix_observer_output: ObserverOutput,
     mp_observer_output: ObserverOutput,
     ds_observer_output: ObserverOutput,
+    ex_flux_observer_output: ObserverOutput,
+    base_flux_observer_output: ObserverOutput,
+
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
 
@@ -97,12 +102,17 @@ pub struct Simulation {
     pub mix_observer: MixObserver,
     pub mp_observer: MpObserver,
     pub ds_observer: DsObserver,
+    pub ex_flux_observer: ExFluxObserver,
+    pub base_flux_observer: BaseFluxObserver,
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
 
 impl Simulation {
     pub fn new() -> Self {
-        let motor = PermanentMagnetSynchronousMotor { ..FAN_MOTOR };
+        let motor = PermanentMagnetSynchronousMotor {
+            inductance_dq: [9.9e-3, 9.9e-3],
+            ..FAN_MOTOR
+        };
         let sensor_observer = SensorObserver {
             pole_pairs: motor.pole_pairs,
             pll_kp: 10.0,
@@ -114,7 +124,7 @@ impl Simulation {
             flux: motor.flux,
             inductance_dq: motor.inductance_dq,
             speed_lp_factor: 10.0,
-            position_factor: 100.0,
+            position_factor: 10.0,
             position: [
                 f64::cos(std::f64::consts::PI * 0.0),
                 f64::sin(std::f64::consts::PI * 0.0),
@@ -173,6 +183,26 @@ impl Simulation {
             speed_lp_factor: 10.0,
             ..Default::default()
         };
+        let ex_flux_observer = ExFluxObserver {
+            rs: motor.rs,
+            flux: motor.flux,
+            inductance_dq: motor.inductance_dq,
+            lambda: rotate([motor.flux, 0.0], std::f64::consts::TAU / 360.0 * 45.0),
+            alpha: 10.0,
+            gamma: 10.0,
+            epsilon: 0.00000001,
+            speed_lp_factor: 10.0,
+            ..Default::default()
+        };
+        let base_flux_observer = BaseFluxObserver {
+            rs: motor.rs,
+            inductance: motor.inductance_dq[1],
+            lambda: rotate([motor.flux, 0.0], std::f64::consts::TAU / 360.0 * 45.0),
+            alpha: 10.0,
+            gamma: 100.0,
+            speed_lp_factor: 10.0,
+            ..Default::default()
+        };
         Self {
             delta_time: 0.001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
@@ -188,8 +218,8 @@ impl Simulation {
                 Noise::new(0.01, 6),
             ],
             bus_voltage_sample_noise: Noise::new(1.0, 7),
-            // sample_current_offset: [0.01, 0.02, 0.03],
-            // output_voltage_offset: [0.02, -0.01, 0.01],
+            sample_current_offset: [0.001, 0.002, 0.003],
+            output_voltage_offset: [0.02, -0.01, 0.01],
             motion_load: IdealMotionLoad { ..FAN_LOAD },
             power_bridge: TwoLevelPowerBridge {
                 bus_capacitance: 390e-6,
@@ -215,6 +245,8 @@ impl Simulation {
             mix_observer,
             mp_observer,
             ds_observer,
+            ex_flux_observer,
+            base_flux_observer,
             dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
@@ -313,6 +345,12 @@ impl Simulation {
                         self.mp_observer.update(delta_time, &self.observer_input);
                     self.ds_observer_output =
                         self.ds_observer.update(delta_time, &self.observer_input);
+                    self.ex_flux_observer_output = self
+                        .ex_flux_observer
+                        .update(delta_time, &self.observer_input);
+                    self.base_flux_observer_output = self
+                        .base_flux_observer
+                        .update(delta_time, &self.observer_input);
 
                     let use_observer = match self.use_observer {
                         0 => &self.sensor_observer_output,
@@ -321,6 +359,8 @@ impl Simulation {
                         3 => &self.mix_observer_output,
                         4 => &self.mp_observer_output,
                         5 => &self.ds_observer_output,
+                        6 => &self.ex_flux_observer_output,
+                        7 => &self.base_flux_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
@@ -348,7 +388,7 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 1.0
+                            id + 0.0
                                 * f64::cos(
                                     use_observer.electrical_angle - self.res_tune.tune_angle,
                                 ),
@@ -364,9 +404,14 @@ impl Simulation {
                     let mut command_voltage = self.current_regulator_output.command_voltage;
 
                     let inject_voltage = inverse_clarke(rotate(
-                        [0.0 * f64::sin(5000.0 * self.timer.time), 0.0],
+                        [
+                            10.0 * f64::sin(5000.0 * self.timer.time),
+                            0.0 * f64::sin(5000.0 * self.timer.time),
+                        ],
                         self.current_regulator_input.electrical_angle,
                     ));
+                    let inject_voltage =
+                        inverse_clarke(rotate([0.0, 0.0], 5000.0 * self.timer.time));
                     command_voltage[0] += inject_voltage[0];
                     command_voltage[1] += inject_voltage[1];
                     command_voltage[2] += inject_voltage[2];
@@ -408,6 +453,7 @@ impl<S> Scope<S> {
             data: Vec::new(),
         }
     }
+
     pub fn update(&mut self, time: f64, source: &mut S) {
         for (_, datas) in &mut self.data {
             for d in datas {
@@ -504,6 +550,12 @@ impl Application {
                     // ScopeData::new("ds_angle", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_angle
                     // }),
+                    ScopeData::new("ex_flux_angle", |s: &mut Simulation| {
+                        s.ex_flux_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("base_flux_angle", |s: &mut Simulation| {
+                        s.base_flux_observer_output.electrical_angle
+                    }),
                 ],
             ),
             (
@@ -545,6 +597,18 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
+                    ScopeData::new("ex_flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.ex_flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("base_flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.base_flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                 ],
             ),
             (
@@ -571,6 +635,12 @@ impl Application {
                     // ScopeData::new("ds_speed", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_speed
                     // }),
+                    ScopeData::new("ex_flux_speed", |s: &mut Simulation| {
+                        s.ex_flux_observer_output.electrical_speed
+                    }),
+                    ScopeData::new("base_flux_speed", |s: &mut Simulation| {
+                        s.base_flux_observer_output.electrical_speed
+                    }),
                 ],
             ),
             (
@@ -640,6 +710,19 @@ impl Application {
                     ScopeData::new("sd", |s: &mut Simulation| s.mix_observer.sync_speed_lp[0]),
                     ScopeData::new("sq", |s: &mut Simulation| s.mix_observer.sync_speed_lp[1]),
                 ],
+            ),
+            (
+                "ex_flux".to_string(),
+                vec![
+                    ScopeData::new("x", |s: &mut Simulation| s.base_flux_observer.x[0]),
+                    ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.x[1]),
+                ],
+            ),
+            (
+                "ex_fluxx".to_string(),
+                vec![ScopeData::new("x", |s: &mut Simulation| {
+                    s.base_flux_observer.flux_power / s.base_flux_observer.power
+                })],
             ),
             (
                 "rs".to_string(),
@@ -723,7 +806,7 @@ impl App for Application {
                 ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=5).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=7).ui(ui);
                 ui.label(match self.simulation.use_observer {
                     0 => "sensor_observer",
                     1 => "grad_observer",
@@ -731,6 +814,8 @@ impl App for Application {
                     3 => "mix_observer",
                     4 => "mp_observer",
                     5 => "ds_observer",
+                    6 => "ex_flux_observer",
+                    7 => "base_flux_observer",
                     _ => "sensor_observer",
                 });
             });

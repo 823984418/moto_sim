@@ -1,4 +1,6 @@
+pub mod base_flux_observer;
 pub mod ds_observer;
+pub mod ex_flux_observer;
 pub mod flux_observer;
 pub mod grad_observer;
 pub mod mix_observer;
