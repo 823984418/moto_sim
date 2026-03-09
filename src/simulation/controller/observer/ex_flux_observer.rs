@@ -58,7 +58,7 @@ impl Observer<3> for ExFluxObserver {
             self.omega1[1] - l0 * self.pi_lp[1],
         ];
 
-        self.omega_l = (self.omega1[0] * omega2[0] + self.omega1[1] * omega2[1]
+        self.omega_l += (self.omega1[0] * omega2[0] + self.omega1[1] * omega2[1]
             - self.omega_l * self.alpha)
             * delta_time;
         let y = l0 * (self.i_lp[0] * self.omega1[0] + self.i_lp[1] * self.omega1[1])
