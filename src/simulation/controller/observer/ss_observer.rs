@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use rand::distr::StandardUniform;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+use rand_distr::StandardNormal;
 
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
-use crate::simulation::{angle_normal, atan2, clarke, complex_div, rotate};
+use crate::simulation::{angle_normal, atan2, clarke, complex_div, nn, rotate};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(C)]
@@ -47,10 +48,11 @@ pub struct SSObserver {
     pub error_factor: f64,
 
     pub rng: StdRng,
-    pub max_rs: f64,
-    pub max_l0: f64,
-    pub min_l1: f64,
-    pub max_flux: f64,
+    pub gen_rs: f64,
+    pub gen_l0: f64,
+    pub gen_l1: f64,
+    pub gen_flux: f64,
+    pub gen_angle: f64,
 
     pub rs_cell_inv: f64,
     pub l0_cell_inv: f64,
@@ -80,10 +82,11 @@ impl Default for SSObserver {
             last_current: [0.0; 2],
             error_factor: 0.0,
             rng: StdRng::seed_from_u64(0),
-            max_rs: 0.0,
-            max_l0: 0.0,
-            min_l1: 0.0,
-            max_flux: 0.0,
+            gen_rs: 0.0,
+            gen_l0: 0.0,
+            gen_l1: 0.0,
+            gen_flux: 0.0,
+            gen_angle: 0.0,
             rs_cell_inv: 0.0,
             l0_cell_inv: 0.0,
             l1_cell_inv: 0.0,
@@ -111,10 +114,11 @@ impl Clone for SSObserver {
             last_current: self.last_current,
             error_factor: self.error_factor,
             rng: unsafe { std::ptr::read(&self.rng) },
-            max_rs: self.max_rs,
-            max_l0: self.max_l0,
-            min_l1: self.min_l1,
-            max_flux: self.max_flux,
+            gen_rs: self.gen_rs,
+            gen_l0: self.gen_l0,
+            gen_l1: self.gen_l1,
+            gen_flux: self.gen_flux,
+            gen_angle: self.gen_angle,
             rs_cell_inv: self.rs_cell_inv,
             l0_cell_inv: self.l0_cell_inv,
             l1_cell_inv: self.l1_cell_inv,
@@ -194,7 +198,7 @@ impl Observer<3> for SSObserver {
             let sync_speed = rotate(static_speed, -angle);
 
             let mut sample = sample.clone();
-            sample.power *= (-sync_speed[0].powi(2) * self.error_factor * delta_time).exp();
+            sample.power *= ((-sync_speed[0].powi(2)) * self.error_factor * delta_time).exp();
 
             if sample.power < min_power {
                 continue;
@@ -216,7 +220,7 @@ impl Observer<3> for SSObserver {
         drop(samples);
         let last_angle = self.angle_est;
 
-        let inv_power = 1.0 / all_power;
+        let inv_power = nn(1.0 / all_power);
         self.rs_est = all_rs_power * inv_power;
         self.l0_est = all_l0_power * inv_power;
         self.l1_est = all_l1_power * inv_power;
@@ -233,15 +237,20 @@ impl Observer<3> for SSObserver {
         while self.samples.len() < self.target_sample_count {
             let sample = SSample {
                 power,
-                rs: self.rng.sample::<f64, _>(StandardUniform) * self.max_rs,
-                l0: self.rng.sample::<f64, _>(StandardUniform) * self.max_l0,
-                l1: self.rng.sample::<f64, _>(StandardUniform) * self.min_l1,
-                flux: self.rng.sample::<f64, _>(StandardUniform) * self.max_flux,
+                rs: self.rs_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_rs,
+                l0: self.l0_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l0,
+                l1: self.l1_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l1,
+                flux: self.flux_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_flux,
                 angle: angle_normal(
-                    self.rng.sample::<f64, _>(StandardUniform) * std::f64::consts::TAU,
+                    self.angle_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_angle,
                 ),
             };
-            self.add_sample(sample);
+            if sample.rs > 10.0 || sample.l0 > 0.1 || sample.flux > 0.1 {
+                continue;
+            }
+            if sample.rs > 0.0 && sample.l0 > 0.0 && sample.l1 < 0.0 && sample.flux > 0.0 {
+                self.add_sample(sample);
+            }
         }
 
         self.speed_lp += (angle_normal(self.angle_est - last_angle) / delta_time - self.speed_lp)

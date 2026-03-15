@@ -149,13 +149,13 @@ impl Simulation {
             ..Default::default()
         };
         let grad_observer = GradObserver {
-            rs: motor.rs,
-            l0: (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5,
+            rs: 0.5 * motor.rs,
+            l0: 0.5 * (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5,
             l1: (motor.inductance_dq[0] - motor.inductance_dq[1]) * 0.5,
-            flux: motor.flux,
-            kr: 0.0,
-            kl0: 0.0,
-            kflux: 0.0,
+            flux: 0.5 * motor.flux,
+            kr: 0.1,
+            kl0: 0.0001,
+            kflux: 0.001,
             kl1_ds: 0.0,
             kl1_de: 0.0,
             kspeed_l1: 1000.0,
@@ -213,20 +213,21 @@ impl Simulation {
         let mut ss_observer = SSObserver {
             error_factor: 1.0,
             rng: StdRng::seed_from_u64(10),
-            max_rs: 10.0,
-            max_l0: 0.1,
-            min_l1: -0.01,
-            max_flux: 0.1,
+            gen_rs: 1.0 * motor.rs,
+            gen_l0: 1.0 * (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5,
+            gen_l1: 1.0 * (motor.inductance_dq[1] - motor.inductance_dq[0]) * 0.5,
+            gen_flux: 1.0 * motor.flux,
+            gen_angle: 1.0,
             target_sample_count: 1024,
-            min_power: 0.0001,
-            gen_power: 0.001,
+            min_power: 0.001,
+            gen_power: 0.01,
             speed_lp_factor: 10.0,
             ..Default::default()
         };
-        ss_observer.rs_cell_inv = 1e4 / ss_observer.max_rs;
-        ss_observer.l0_cell_inv = 1e4 / ss_observer.max_l0;
-        ss_observer.l1_cell_inv = 1e4 / ss_observer.min_l1;
-        ss_observer.flux_cell_inv = 1e4 / ss_observer.max_flux;
+        ss_observer.rs_cell_inv = 1e4 / motor.rs;
+        ss_observer.l0_cell_inv = 1e4 / motor.inductance_dq[1];
+        ss_observer.l1_cell_inv = 1e4 / motor.inductance_dq[1];
+        ss_observer.flux_cell_inv = 1e4 / motor.flux;
         ss_observer.angle_cell_inv = std::f64::consts::TAU * 1e4;
         Self {
             delta_time: 0.0001,
@@ -420,7 +421,7 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 0.0
+                            id + 1.0
                                 * f64::cos(
                                     use_observer.electrical_angle - self.res_tune.tune_angle,
                                 ),
@@ -443,7 +444,7 @@ impl Simulation {
                         self.current_regulator_input.electrical_angle,
                     ));
                     let inject_voltage =
-                        inverse_clarke(rotate([0.0, 0.0], 5000.0 * self.timer.time));
+                        inverse_clarke(rotate([10.0, 0.0], 5000.0 * self.timer.time));
                     command_voltage[0] += inject_voltage[0];
                     command_voltage[1] += inject_voltage[1];
                     command_voltage[2] += inject_voltage[2];
@@ -570,9 +571,9 @@ impl Application {
                     ScopeData::new("flux_angle", |s: &mut Simulation| {
                         s.flux_observer_output.electrical_angle
                     }),
-                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
-                    //     s.grad_observer_output.electrical_angle
-                    // }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_angle
+                    }),
                     ScopeData::new("mix_angle", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_angle
                     }),
@@ -588,9 +589,9 @@ impl Application {
                     ScopeData::new("base_flux_angle", |s: &mut Simulation| {
                         s.base_flux_observer_output.electrical_angle
                     }),
-                    ScopeData::new("ss_angle", |s: &mut Simulation| {
-                        s.ss_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("ss_angle", |s: &mut Simulation| {
+                    //     s.ss_observer_output.electrical_angle
+                    // }),
                 ],
             ),
             (
@@ -608,12 +609,12 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.grad_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.grad_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                     ScopeData::new("mix_angle", |s: &mut Simulation| {
                         angle_normal(
                             s.mix_observer_output.electrical_angle
@@ -644,12 +645,12 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    ScopeData::new("ss_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.ss_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("ss_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.ss_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                 ],
             ),
             (
@@ -664,9 +665,9 @@ impl Application {
                     ScopeData::new("flux_speed", |s: &mut Simulation| {
                         s.flux_observer_output.electrical_speed
                     }),
-                    // ScopeData::new("grad_speed", |s: &mut Simulation| {
-                    //     s.grad_observer_output.electrical_speed
-                    // }),
+                    ScopeData::new("grad_speed", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_speed
+                    }),
                     ScopeData::new("mix_speed", |s: &mut Simulation| {
                         s.mix_observer_output.electrical_speed
                     }),
@@ -682,9 +683,9 @@ impl Application {
                     ScopeData::new("base_flux_speed", |s: &mut Simulation| {
                         s.base_flux_observer_output.electrical_speed
                     }),
-                    ScopeData::new("ss_speed", |s: &mut Simulation| {
-                        s.ss_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("ss_speed", |s: &mut Simulation| {
+                    //     s.ss_observer_output.electrical_speed
+                    // }),
                 ],
             ),
             (
@@ -693,12 +694,6 @@ impl Application {
                     ScopeData::new("id", |s: &mut Simulation| s.motor.current_dq[0]),
                     ScopeData::new("iq", |s: &mut Simulation| s.motor.current_dq[1]),
                 ],
-            ),
-            (
-                "sss".to_string(),
-                vec![ScopeData::new("sss", |s: &mut Simulation| {
-                    s.ss_observer.angle_est
-                })],
             ),
             (
                 "udq".to_string(),
@@ -781,7 +776,7 @@ impl Application {
                     ScopeData::new("rs", |s: &mut Simulation| s.motor.rs),
                     ScopeData::new("grad_rs", |s: &mut Simulation| s.grad_observer.rs),
                     ScopeData::new("tune_rs", |s: &mut Simulation| s.res_tune.output_res),
-                    ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.rs_est),
+                    // ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.rs_est),
                 ],
             ),
             (
@@ -804,7 +799,7 @@ impl Application {
                     }),
                     ScopeData::new("grad_l0", |s: &mut Simulation| s.grad_observer.l0),
                     ScopeData::new("tune_l0", |s: &mut Simulation| s.inductance_tune.output_l0),
-                    ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.l0_est),
+                    // ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.l0_est),
                 ],
             ),
             (
@@ -814,7 +809,7 @@ impl Application {
                         (s.motor.inductance_dq[0] - s.motor.inductance_dq[1]) * 0.5
                     }),
                     ScopeData::new("grad_l1", |s: &mut Simulation| s.grad_observer.l1),
-                    ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.l1_est),
+                    // ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.l1_est),
                 ],
             ),
             (
@@ -822,7 +817,7 @@ impl Application {
                 vec![
                     ScopeData::new("flux", |s: &mut Simulation| s.motor.flux),
                     ScopeData::new("grad_flux", |s: &mut Simulation| s.grad_observer.flux),
-                    ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.flux_est),
+                    // ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.flux_est),
                 ],
             ),
         ];

@@ -39,7 +39,7 @@ pub fn rotate(v: [f64; 2], theta: f64) -> [f64; 2] {
 }
 
 pub fn nn(x: f64) -> f64 {
-    if x.is_nan() { 0.0 } else { x }
+    if x.is_nan() || x.is_infinite() { 0.0 } else { x }
 }
 
 pub fn complex_div(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
