@@ -44,8 +44,8 @@ impl Observer<3> for MpObserver {
             let p2zj_dib = rotate([di[0], -di[1]], 2.0 * angle);
             let pzj_ib = rotate([current[0], -current[1]], angle);
             let s = [2.0 * l1 * pzj_ib[0] + self.flux, 2.0 * l1 * pzj_ib[1]];
-            let static_angle = complex_div([px - l1 * p2zj_dib[0], py - l1 * p2zj_dib[1]], s);
-            let sync_speed = rotate(static_angle, -angle);
+            let static_speed = complex_div([px - l1 * p2zj_dib[0], py - l1 * p2zj_dib[1]], s);
+            let sync_speed = rotate(static_speed, -angle);
             let move_sample = sync_speed[1] * delta_time / step_angle;
             let sample = self.sample[i]
                 * (-sync_speed[0].powi(2) * self.error_factor * delta_time).exp()

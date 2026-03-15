@@ -6,6 +6,7 @@ pub mod grad_observer;
 pub mod mix_observer;
 pub mod mp_observer;
 pub mod sensor_observer;
+pub mod ss_observer;
 
 #[derive(Debug, Clone)]
 pub struct ObserverInput<const P: usize> {
