@@ -18,7 +18,7 @@ pub struct SSampleCell {
     pub angle: i32,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 #[repr(C)]
 pub struct SSample {
     pub power: f64,
@@ -229,20 +229,31 @@ impl Observer<3> for SSObserver {
         for i in self.samples.values_mut() {
             i.power *= inv_power;
         }
+        let max_sample = self
+            .samples
+            .values()
+            .max_by(|a, b| f64::total_cmp(&a.power, &b.power))
+            .cloned()
+            .unwrap_or_default();
 
         if self.samples.len() < self.target_sample_count {
-            // println!("add {}", self.target_sample_count - self.samples.len());
+            println!("add {}", self.target_sample_count - self.samples.len());
         }
-        let power = self.gen_power / self.target_sample_count as f64;
+        let pp = 1.0;
+        let power = self.gen_power
+            / self.target_sample_count as f64
+            / (self.target_sample_count - self.samples.len()) as f64;
         while self.samples.len() < self.target_sample_count {
             let sample = SSample {
                 power,
-                rs: self.rs_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_rs,
-                l0: self.l0_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l0,
-                l1: self.l1_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l1,
-                flux: self.flux_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_flux,
+                rs: max_sample.rs + self.rng.sample::<f64, _>(StandardNormal) * self.gen_rs * pp,
+                l0: max_sample.l0 + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l0 * pp,
+                l1: max_sample.l1 + self.rng.sample::<f64, _>(StandardNormal) * self.gen_l1 * pp,
+                flux: max_sample.flux
+                    + self.rng.sample::<f64, _>(StandardNormal) * self.gen_flux * pp,
                 angle: angle_normal(
-                    self.angle_est + self.rng.sample::<f64, _>(StandardNormal) * self.gen_angle,
+                    max_sample.angle
+                        + self.rng.sample::<f64, _>(StandardNormal) * self.gen_angle * pp,
                 ),
             };
             if sample.rs > 10.0 || sample.l0 > 0.1 || sample.flux > 0.1 {
