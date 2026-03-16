@@ -204,7 +204,12 @@ impl Observer<3> for SSObserver {
                 continue;
             }
 
-            sample.angle = angle_normal(angle + sync_speed[1] * delta_time);
+            let ref_speed = if sync_speed[1] >= 0.0 {
+                -sync_speed[0]
+            } else {
+                sync_speed[0]
+            };
+            sample.angle = angle_normal(angle + (sync_speed[1] + ref_speed * 0.01) * delta_time);
 
             let power = sample.power;
             all_power += power;

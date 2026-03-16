@@ -219,7 +219,7 @@ impl Simulation {
             gen_flux: 1.0 * motor.flux,
             gen_angle: 1.0,
             target_sample_count: 1024,
-            min_power: 0.000001,
+            min_power: 0.00001,
             gen_power: 0.1,
             speed_lp_factor: 10.0,
             ..Default::default()
@@ -232,10 +232,10 @@ impl Simulation {
         //     flux: motor.flux,
         //     angle: 0.0,
         // });
-        ss_observer.rs_cell_inv = 1e4 / motor.rs;
-        ss_observer.l0_cell_inv = 1e4 / motor.inductance_dq[1];
-        ss_observer.l1_cell_inv = 1e4 / motor.inductance_dq[1];
-        ss_observer.flux_cell_inv = 1e4 / motor.flux;
+        ss_observer.rs_cell_inv = 1e2 / motor.rs;
+        ss_observer.l0_cell_inv = 1e2 / motor.inductance_dq[1];
+        ss_observer.l1_cell_inv = 1e2 / motor.inductance_dq[1];
+        ss_observer.flux_cell_inv = 1e2 / motor.flux;
         ss_observer.angle_cell_inv = std::f64::consts::TAU * 1e4;
         Self {
             delta_time: 0.0001,
