@@ -63,5 +63,5 @@ pub fn mtpa_id(iq: f64, flux: f64, ld: f64, lq: f64) -> f64 {
 }
 
 pub fn complex_mode(a: [f64; 2]) -> f64 {
-    f64::sqrt(a[0] * a[0] + a[1] * a[1])
+    nn(f64::sqrt(a[0] * a[0] + a[1] * a[1]))
 }

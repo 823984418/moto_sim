@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use rand::distr::StandardUniform;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::StandardNormal;
@@ -242,7 +241,7 @@ impl Observer<3> for SSObserver {
             .unwrap_or_default();
 
         if self.samples.len() < self.target_sample_count {
-            println!("add {}", self.target_sample_count - self.samples.len());
+            // println!("add {}", self.target_sample_count - self.samples.len());
         }
         let pp = 1.0;
         let power = self.gen_power

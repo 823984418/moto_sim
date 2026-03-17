@@ -7,7 +7,6 @@ pub struct BaseFluxObserver {
 
     pub rs: f64,
     pub inductance: f64,
-    pub flux: f64,
 
     pub alpha: f64,
     pub gamma: f64,
@@ -20,7 +19,7 @@ pub struct BaseFluxObserver {
     pub x: [f64; 2],
     pub lambda: [f64; 2],
 
-    pub last_theta: f64,
+    pub theta: f64,
     pub speed_lp: f64,
     pub speed_lp_factor: f64,
 }
@@ -54,9 +53,9 @@ impl Observer<3> for BaseFluxObserver {
         self.lambda[1] += (vi[1] + omega1[1] * error) * delta_time;
 
         let theta = atan2(x);
-        self.speed_lp += (angle_normal(theta - self.last_theta) - self.speed_lp * delta_time)
+        self.speed_lp += (angle_normal(theta - self.theta) - self.speed_lp * delta_time)
             * self.speed_lp_factor;
-        self.last_theta = theta;
+        self.theta = theta;
         ObserverOutput {
             electrical_angle: theta,
             electrical_speed: self.speed_lp,
