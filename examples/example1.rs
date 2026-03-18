@@ -622,9 +622,9 @@ impl Application {
                     // ScopeData::new("ss_angle", |s: &mut Simulation| {
                     //     s.ss_observer_output.electrical_angle
                     // }),
-                    ScopeData::new("super_flux_angle", |s: &mut Simulation| {
-                        s.super_flux_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("super_flux_angle", |s: &mut Simulation| {
+                    //     s.super_flux_observer_output.electrical_angle
+                    // }),
                 ],
             ),
             (
@@ -684,12 +684,12 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
-                    ScopeData::new("super_flux_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.super_flux_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("super_flux_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.super_flux_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                 ],
             ),
             (
@@ -725,9 +725,9 @@ impl Application {
                     // ScopeData::new("ss_speed", |s: &mut Simulation| {
                     //     s.ss_observer_output.electrical_speed
                     // }),
-                    ScopeData::new("super_flux_speed", |s: &mut Simulation| {
-                        s.super_flux_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("super_flux_speed", |s: &mut Simulation| {
+                    //     s.super_flux_observer_output.electrical_speed
+                    // }),
                 ],
             ),
             (
