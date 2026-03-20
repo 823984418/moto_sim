@@ -33,6 +33,7 @@ impl Observer<3> for BaseFluxObserver {
         let alpha_delta_time = self.alpha * delta_time;
 
         let vi = [v[0] - self.rs * i[0], v[1] - self.rs * i[1]];
+        // py = (vi - y) * alpha - lq * pi * alpha
         self.omega1[0] +=
             (vi[0] - self.omega1[0]) * alpha_delta_time - lq * (i[0] - self.last_i[0]) * self.alpha;
         self.omega1[1] +=

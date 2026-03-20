@@ -30,9 +30,9 @@ pub struct SSample {
 
 impl SSample {
     pub fn mix_with(&mut self, rhs: &Self) {
-        self.power += rhs.power;
         // s = (a * pa + b * pb) / (pa + pb) = a + (b - a) * pb / (pa + pb)
         let pd = rhs.power / (self.power + rhs.power);
+        self.power += rhs.power;
         self.rs += (rhs.rs - self.rs) * pd;
         self.l0 += (rhs.l0 - self.l0) * pd;
         self.l1 += (rhs.l1 - self.l1) * pd;
