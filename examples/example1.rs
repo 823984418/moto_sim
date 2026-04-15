@@ -642,18 +642,18 @@ impl Application {
                     // ScopeData::new("ex_flux_angle", |s: &mut Simulation| {
                     //     s.ex_flux_observer_output.electrical_angle
                     // }),
-                    // ScopeData::new("base_flux_angle", |s: &mut Simulation| {
-                    //     s.base_flux_observer_output.electrical_angle
-                    // }),
+                    ScopeData::new("base_flux_angle", |s: &mut Simulation| {
+                        s.base_flux_observer_output.electrical_angle
+                    }),
                     // ScopeData::new("ss_angle", |s: &mut Simulation| {
                     //     s.ss_observer_output.electrical_angle
                     // }),
                     // ScopeData::new("super_flux_angle", |s: &mut Simulation| {
                     //     s.super_flux_observer_output.electrical_angle
                     // }),
-                    ScopeData::new("ss2_angle", |s: &mut Simulation| {
-                        s.ss2_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("ss2_angle", |s: &mut Simulation| {
+                    //     s.ss2_observer_output.electrical_angle
+                    // }),
                 ],
             ),
             (
@@ -701,12 +701,12 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
-                    // ScopeData::new("base_flux_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.base_flux_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
+                    ScopeData::new("base_flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.base_flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                     // ScopeData::new("ss_angle", |s: &mut Simulation| {
                     //     angle_normal(
                     //         s.ss_observer_output.electrical_angle
@@ -719,12 +719,12 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
-                    ScopeData::new("ss2_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.ss2_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("ss2_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.ss2_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                 ],
             ),
             (
@@ -754,18 +754,18 @@ impl Application {
                     // ScopeData::new("ex_flux_speed", |s: &mut Simulation| {
                     //     s.ex_flux_observer_output.electrical_speed
                     // }),
-                    // ScopeData::new("base_flux_speed", |s: &mut Simulation| {
-                    //     s.base_flux_observer_output.electrical_speed
-                    // }),
+                    ScopeData::new("base_flux_speed", |s: &mut Simulation| {
+                        s.base_flux_observer_output.electrical_speed
+                    }),
                     // ScopeData::new("ss_speed", |s: &mut Simulation| {
                     //     s.ss_observer_output.electrical_speed
                     // }),
                     // ScopeData::new("super_flux_speed", |s: &mut Simulation| {
                     //     s.super_flux_observer_output.electrical_speed
                     // }),
-                    ScopeData::new("ss2_speed", |s: &mut Simulation| {
-                        s.ss2_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("ss2_speed", |s: &mut Simulation| {
+                    //     s.ss2_observer_output.electrical_speed
+                    // }),
                 ],
             ),
             (
@@ -839,8 +839,8 @@ impl Application {
             (
                 "ex_flux".to_string(),
                 vec![
-                    ScopeData::new("x", |s: &mut Simulation| s.base_flux_observer.x[0]),
-                    ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.x[1]),
+                    ScopeData::new("x", |s: &mut Simulation| s.base_flux_observer.lambda[0]),
+                    ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.lambda[1]),
                 ],
             ),
             (

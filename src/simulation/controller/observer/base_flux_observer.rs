@@ -16,7 +16,6 @@ pub struct BaseFluxObserver {
     pub omega_l: f64,
     pub y: f64,
 
-    pub x: [f64; 2],
     pub lambda: [f64; 2],
 
     pub theta: f64,
@@ -32,12 +31,12 @@ impl Observer<3> for BaseFluxObserver {
         let lq = self.inductance;
         let alpha_delta_time = self.alpha * delta_time;
 
-        let vi = [v[0] - self.rs * i[0], v[1] - self.rs * i[1]];
-        // py = (vi - y) * alpha - lq * pi * alpha
-        self.omega1[0] +=
-            (vi[0] - self.omega1[0]) * alpha_delta_time - lq * (i[0] - self.last_i[0]) * self.alpha;
-        self.omega1[1] +=
-            (vi[1] - self.omega1[1]) * alpha_delta_time - lq * (i[1] - self.last_i[1]) * self.alpha;
+        let vi = [
+            v[0] - self.rs * i[0] - lq * (i[0] - self.last_i[0]) / delta_time,
+            v[1] - self.rs * i[1] - lq * (i[1] - self.last_i[1]) / delta_time,
+        ];
+        self.omega1[0] += (vi[0] - self.omega1[0]) * alpha_delta_time;
+        self.omega1[1] += (vi[1] - self.omega1[1]) * alpha_delta_time;
         self.last_i = i;
 
         let omega1 = self.omega1;
@@ -46,16 +45,15 @@ impl Observer<3> for BaseFluxObserver {
         self.y = y;
         self.omega_l += (y - self.omega_l) * alpha_delta_time;
 
-        let x = [self.lambda[0] - lq * i[0], self.lambda[1] - lq * i[1]];
-        self.x = x;
+        let x = self.lambda;
         let error =
             self.gamma * 2.0 * (y + self.omega_l - 2.0 * (omega1[0] * x[0] + omega1[1] * x[1]));
         self.lambda[0] += (vi[0] + omega1[0] * error) * delta_time;
         self.lambda[1] += (vi[1] + omega1[1] * error) * delta_time;
 
         let theta = atan2(x);
-        self.speed_lp += (angle_normal(theta - self.theta) - self.speed_lp * delta_time)
-            * self.speed_lp_factor;
+        self.speed_lp +=
+            (angle_normal(theta - self.theta) - self.speed_lp * delta_time) * self.speed_lp_factor;
         self.theta = theta;
         ObserverOutput {
             electrical_angle: theta,
