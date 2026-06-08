@@ -19,6 +19,8 @@ pub struct MixObserver {
     pub speed_error_ki: f64,
     pub theta_error_kp: f64,
     pub theta_error_ki: f64,
+    pub target_speed_kp: f64,
+    pub target_speed_ki: f64,
 }
 
 impl Observer<3> for MixObserver {
@@ -60,12 +62,18 @@ impl Observer<3> for MixObserver {
         if self.speed >= 0.0 {
             theta_error = -theta_error;
         }
+        let target_speed_error = 50.0 * (input.target_speed - self.speed).clamp(-1.0, 1.0);
+
         let speed_error = self.sync_speed_lp[1] - self.speed;
 
-        self.angle +=
-            (speed_error * self.speed_error_kp + theta_error * self.theta_error_kp) * delta_time;
-        self.speed +=
-            (speed_error * self.speed_error_ki + theta_error * self.theta_error_ki) * delta_time;
+        self.angle += (speed_error * self.speed_error_kp
+            + theta_error * self.theta_error_kp
+            + target_speed_error * self.target_speed_kp)
+            * delta_time;
+        self.speed += (speed_error * self.speed_error_ki
+            + theta_error * self.theta_error_ki
+            + target_speed_error * self.target_speed_ki)
+            * delta_time;
         self.angle = angle_normal(self.angle);
 
         self.speed_lp += (angle_normal(self.angle - last_angle) / delta_time - self.speed_lp)
