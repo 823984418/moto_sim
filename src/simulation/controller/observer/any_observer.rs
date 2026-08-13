@@ -11,8 +11,6 @@ pub struct Val {
     pub value: f64,
     // 电阻梯度
     pub grad_resistor: f64,
-    // 电感梯度
-    pub grad_inductor: f64,
 }
 
 const fn epsilon(x: f64) -> f64 {
@@ -27,14 +25,12 @@ impl Val {
     pub const ZERO: Self = Val {
         value: 0.0,
         grad_resistor: 0.0,
-        grad_inductor: 0.0,
     };
 
     pub const fn new(value: f64) -> Self {
         Self {
             value,
             grad_resistor: 0.0,
-            grad_inductor: 0.0,
         }
     }
 
@@ -42,15 +38,6 @@ impl Val {
         Self {
             value: resistor,
             grad_resistor: 1.0,
-            grad_inductor: 0.0,
-        }
-    }
-
-    pub const fn inductor(inductor: f64) -> Self {
-        Self {
-            value: inductor,
-            grad_resistor: 0.0,
-            grad_inductor: 1.0,
         }
     }
 
@@ -59,7 +46,6 @@ impl Val {
         Self {
             value: self.value * self.value,
             grad_resistor: self.grad_resistor * a,
-            grad_inductor: self.grad_inductor * a,
         }
     }
 
@@ -69,7 +55,6 @@ impl Val {
         Self {
             value,
             grad_resistor: self.grad_resistor * a,
-            grad_inductor: self.grad_inductor * a,
         }
     }
 
@@ -79,7 +64,6 @@ impl Val {
         Self {
             value,
             grad_resistor: self.grad_resistor * a,
-            grad_inductor: self.grad_inductor * a,
         }
     }
 }
@@ -91,7 +75,6 @@ impl Add<Val> for Val {
         Val {
             value: self.value + rhs.value,
             grad_resistor: self.grad_resistor + rhs.grad_resistor,
-            grad_inductor: self.grad_inductor + rhs.grad_inductor,
         }
     }
 }
@@ -103,7 +86,6 @@ impl Sub<Val> for Val {
         Val {
             value: self.value - rhs.value,
             grad_resistor: self.grad_resistor - rhs.grad_resistor,
-            grad_inductor: self.grad_inductor - rhs.grad_inductor,
         }
     }
 }
@@ -117,7 +99,6 @@ impl Mul<Val> for Val {
         Val {
             value: self.value * rhs.value,
             grad_resistor: self.grad_resistor * a + rhs.grad_resistor * b,
-            grad_inductor: self.grad_inductor * a + rhs.grad_inductor * b,
         }
     }
 }
@@ -132,7 +113,6 @@ impl Div<Val> for Val {
         Val {
             value,
             grad_resistor: self.grad_resistor * a - rhs.grad_resistor * b,
-            grad_inductor: self.grad_inductor * a - rhs.grad_inductor * b,
         }
     }
 }
@@ -144,7 +124,6 @@ impl Neg for Val {
         Val {
             value: -self.value,
             grad_resistor: -self.grad_resistor,
-            grad_inductor: -self.grad_inductor,
         }
     }
 }
@@ -166,15 +145,15 @@ pub struct AnyObserver {
     /// 保留的历史记录数
     pub history: usize,
 
+    /// 估计电感
+    pub inductor: f64,
+
     /// 估计电阻
     pub resistor: f64,
     pub resistor_rate: f64,
     pub resistor_range: (f64, f64),
 
-    /// 估计电感
-    pub inductor: f64,
-    pub inductor_rate: f64,
-    pub inductor_range: (f64, f64),
+    pub max_flux: f64,
 
     /// 估计磁链
     pub flux: f64,
@@ -193,8 +172,7 @@ impl AnyObserver {
             resistor_rate: 1.0,
             resistor_range: (0.0, 100.0),
             inductor: 0.0,
-            inductor_rate: 0.1,
-            inductor_range: (0.0, 0.1),
+            max_flux: 1.0,
             flux: 0.0,
             sample_point: Vec::new(),
             sample_point_center: [0.0; 2],
@@ -203,13 +181,13 @@ impl AnyObserver {
 
     /// sample 中的 is 与 us 是自上次 update 后重新开始的的积分值
     pub fn update(&mut self, sample: AnyObserverSample) {
+        self.sample.truncate(self.history);
         for s in &mut self.sample {
             s.is[0] -= sample.is[0];
             s.is[1] -= sample.is[1];
             s.us[0] -= sample.us[0];
             s.us[1] -= sample.us[1];
         }
-        self.sample.truncate(self.history);
         self.sample.push_front(AnyObserverSample {
             i: sample.i,
             is: [0.0; 2],
@@ -220,17 +198,29 @@ impl AnyObserver {
             return;
         }
 
+        let inv_n = 1.0 / (self.sample.len() as f64);
+
+        let inductor = self.inductor;
         let resistor = Val::resistor(self.resistor);
-        let inductor = Val::inductor(self.inductor);
 
         let sample_point_buffer = &mut self.sample_point;
         sample_point_buffer.clear();
         sample_point_buffer.extend(self.sample.iter().map(move |x: &AnyObserverSample| {
             [
-                Val::new(x.us[0]) - Val::new(x.is[0]) * resistor - Val::new(x.i[0]) * inductor,
-                Val::new(x.us[1]) - Val::new(x.is[1]) * resistor - Val::new(x.i[1]) * inductor,
+                Val::new(x.us[0] - x.i[0] * inductor) - Val::new(x.is[0]) * resistor,
+                Val::new(x.us[1] - x.i[1] * inductor) - Val::new(x.is[1]) * resistor,
             ]
         }));
+
+        let (sum_x, sum_y) = sample_point_buffer
+            .iter()
+            .fold((Val::ZERO, Val::ZERO), move |(sum_x, sum_y), &[sx, sy]| {
+                (sum_x + sx, sum_y + sy)
+            });
+        let avg_x = sum_x * Val::new(inv_n);
+        let avg_y = sum_y * Val::new(inv_n);
+
+        let max_flux2 = self.max_flux * self.max_flux;
 
         // 每相邻三个采样点的权重和圆心
         let d_cxy =
@@ -248,8 +238,16 @@ impl AnyObserver {
                     let dx3 = x2 - x1;
                     let d = Val::new(2.0) * (x1 * dy1 + x2 * dy2 + x3 * dy3);
                     let inv_d = d.inv();
-                    let cx = (p1 * dy1 + p2 * dy2 + p3 * dy3) * inv_d;
-                    let cy = (p1 * dx1 + p2 * dx2 + p3 * dx3) * inv_d;
+                    let mut cx = (p1 * dy1 + p2 * dy2 + p3 * dy3) * inv_d;
+                    let mut cy = (p1 * dx1 + p2 * dx2 + p3 * dx3) * inv_d;
+
+                    let acx = cx.value - avg_x.value;
+                    let acy = cy.value - avg_y.value;
+                    if (acx * acx + acy * acy) > max_flux2 {
+                        cx = avg_x;
+                        cy = avg_y;
+                    }
+
                     (d.pow2(), [cx, cy])
                 });
 
@@ -276,19 +274,15 @@ impl AnyObserver {
             move |(sum_cr, sum_cr2): (Val, Val), cr: Val| (sum_cr + cr, sum_cr2 + cr.pow2()),
         );
 
-        let inv_n = 1.0 / (self.sample.len() as f64);
         let cr_avg = sum_cr * Val::new(inv_n);
         let cr2_avg = sum_cr2 * Val::new(inv_n);
         let cr_var = cr2_avg - cr_avg.pow2();
 
         let resistor = (self.resistor - cr_var.grad_resistor * self.resistor_rate)
             .clamp(self.resistor_range.0, self.resistor_range.1);
-        let inductor = (self.inductor - cr_var.grad_inductor * self.inductor_rate)
-            .clamp(self.inductor_range.0, self.inductor_range.1);
 
         self.sample_point_center = [cx.value, cy.value];
         self.resistor = resistor;
-        self.inductor = inductor;
         self.flux = cr_avg.value;
     }
 }

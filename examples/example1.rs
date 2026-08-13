@@ -260,10 +260,7 @@ impl Simulation {
         };
         for r in 0..10 {
             let rs = r as f64 * 1.0;
-            for l in 0..10 {
-                let inductance = l as f64 * 1.0 * 1e-3;
-                super_flux_observer.add_sample(rs, inductance);
-            }
+            super_flux_observer.add_sample(rs, 9.9e-3);
         }
 
         let mut ss2_observer = SS2Observer {
@@ -288,15 +285,17 @@ impl Simulation {
 
         let mut all_observer = AllObserver {
             time: 0.0,
-            delta_time: 0.1,
+            delta_time: 0.001,
             is: [0.0; 2],
             us: [0.0; 2],
             any_observer: AnyObserver::new(),
             angle: 0.0,
             speed_lp: 0.0,
-            speed_lp_factor: 0.0,
+            speed_lp_factor: 10.0,
         };
-        all_observer.any_observer.history = 10;
+        all_observer.any_observer.history = 5000;
+        all_observer.any_observer.resistor_rate = 1.0;
+        all_observer.any_observer.inductor = 9.9e-3;
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
@@ -512,7 +511,7 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 1.0
+                            id + 0.0
                                 * f64::cos(
                                     use_observer.electrical_angle - self.res_tune.tune_angle,
                                 ),
@@ -534,8 +533,8 @@ impl Simulation {
                         ],
                         self.current_regulator_input.electrical_angle,
                     ));
-                    // let inject_voltage =
-                    //     inverse_clarke(rotate([10.0, 0.0], 5000.0 * self.timer.time));
+                    let inject_voltage =
+                        inverse_clarke(rotate([00.0, 0.0], 5000.0 * self.timer.time));
                     command_voltage[0] += inject_voltage[0];
                     command_voltage[1] += inject_voltage[1];
                     command_voltage[2] += inject_voltage[2];
@@ -1006,15 +1005,16 @@ impl App for Application {
                     self.reset();
                 }
                 if ui.button("Dump").clicked() {
-                    let max_sample = self
-                        .simulation
-                        .ss_observer
-                        .samples
-                        .values()
-                        .max_by(|a, b| f64::total_cmp(&a.power, &b.power));
-                    println!("{:#?}", max_sample);
+                    // let max_sample = self
+                    //     .simulation
+                    //     .ss_observer
+                    //     .samples
+                    //     .values()
+                    //     .max_by(|a, b| f64::total_cmp(&a.power, &b.power));
+                    // println!("{:#?}", max_sample);
 
                     // println!("{:#?}", self.simulation.super_flux_observer);
+                    println!("{:#?}", self.simulation.all_observer);
                 }
                 ui.checkbox(&mut self.run, "Run");
                 ui.label("static_friction_torque");
