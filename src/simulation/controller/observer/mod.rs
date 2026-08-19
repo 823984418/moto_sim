@@ -1,3 +1,4 @@
+pub mod any_observer;
 pub mod base_flux_observer;
 pub mod ds_observer;
 pub mod ex_flux_observer;
@@ -9,7 +10,6 @@ pub mod sensor_observer;
 pub mod ss2_observer;
 pub mod ss_observer;
 pub mod super_flux_observer;
-pub mod any_observer;
 
 #[derive(Debug, Clone)]
 pub struct ObserverInput<const P: usize> {

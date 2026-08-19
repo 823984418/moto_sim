@@ -1,6 +1,6 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Slider, Ui, Widget};
-use egui_plot::{Line, Plot, PlotPoint};
+use egui_plot::{default_label_formatter, Legend, Line, Plot, PlotPoint};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::model::zq10y_dead_mapping;
 use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_regulator::ThreePhasePICurrentRegulator;
@@ -612,15 +612,19 @@ impl<S> Scope<S> {
         ScrollArea::vertical().show(ui, |ui| {
             for (group_name, datas) in &self.data {
                 CollapsingHeader::new(group_name).show(ui, |ui| {
-                    Plot::new(group_name).height(120.0).show(ui, |ui| {
-                        let mut auto_bounds = ui.auto_bounds();
-                        auto_bounds.x |= auto_x;
-                        auto_bounds.y |= auto_y;
-                        ui.set_auto_bounds(auto_bounds);
-                        for d in datas {
-                            ui.line(Line::new(&d.name, d.data.as_slice()));
-                        }
-                    });
+                    Plot::new(group_name)
+                        .height(120.0)
+                        .legend(Legend::default())
+                        .label_formatter(default_label_formatter)
+                        .show(ui, |ui| {
+                            let mut auto_bounds = ui.auto_bounds();
+                            auto_bounds.x |= auto_x;
+                            auto_bounds.y |= auto_y;
+                            ui.set_auto_bounds(auto_bounds);
+                            for d in datas {
+                                ui.line(Line::new(&d.name, d.data.as_slice()));
+                            }
+                        });
                 });
             }
         });
@@ -991,15 +995,15 @@ impl Application {
 }
 
 impl App for Application {
-    fn update(&mut self, ctx: &Context, _frame: &mut Frame) {
-        ctx.request_repaint();
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut Frame) {
+        ui.request_repaint();
         if self.run {
             for _ in 0..33 {
                 self.update();
             }
         }
 
-        CentralPanel::default().show(ctx, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Reset").clicked() {
                     self.reset();

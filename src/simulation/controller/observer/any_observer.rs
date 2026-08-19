@@ -4,8 +4,8 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::{angle_normal, atan2, clarke};
 
-// 前向传播其关于电阻的梯度与关于电感的梯度
-#[derive(Debug, Copy, Clone)]
+// 前向传播其关于电阻的梯度
+#[derive(Debug, Copy, Clone, Default)]
 pub struct Val {
     // 值
     pub value: f64,
@@ -31,6 +31,13 @@ impl Val {
         Self {
             value,
             grad_resistor: 0.0,
+        }
+    }
+
+    pub const fn raw(v: f64, g: f64) -> Self {
+        Self {
+            value: v,
+            grad_resistor: g,
         }
     }
 
@@ -155,6 +162,7 @@ pub struct AnyObserver {
 
     pub max_flux: f64,
 
+    pub sum_power: f64,
     /// 估计磁链
     pub flux: f64,
     /// 呈现的采样点
@@ -173,6 +181,7 @@ impl AnyObserver {
             resistor_range: (0.0, 100.0),
             inductor: 0.0,
             max_flux: 1.0,
+            sum_power: 0.0,
             flux: 0.0,
             sample_point: Vec::new(),
             sample_point_center: [0.0; 2],
@@ -258,20 +267,21 @@ impl AnyObserver {
                 (sum_d + d, [sum_dcx + cx * d, sum_dcy + cy * d])
             },
         );
+        self.sum_power = sum_d.value;
         let inv_sum_d = sum_d.inv();
         let cx = sum_dcx * inv_sum_d;
         let cy = sum_dcy * inv_sum_d;
 
         // 计算距离圆心的距离
-        let cr = <[_]>::iter(sample_point_buffer).map(move |&[x, y]: &[Val; 2]| {
+        let cr2 = <[_]>::iter(sample_point_buffer).map(move |&[x, y]: &[Val; 2]| {
             let dx = x - cx;
             let dy = y - cy;
-            (dx.pow2() + dy.pow2()).sqrt()
+            dx.pow2() + dy.pow2()
         });
 
-        let (sum_cr, sum_cr2) = cr.fold(
+        let (sum_cr, sum_cr2) = cr2.fold(
             (Val::ZERO, Val::ZERO),
-            move |(sum_cr, sum_cr2): (Val, Val), cr: Val| (sum_cr + cr, sum_cr2 + cr.pow2()),
+            move |(sum_cr, sum_cr2): (Val, Val), cr2: Val| (sum_cr + cr2.sqrt(), sum_cr2 + cr2),
         );
 
         let cr_avg = sum_cr * Val::new(inv_n);

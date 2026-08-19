@@ -9,10 +9,10 @@ debug = true
 [dependencies]
 
 [dependencies.anyhow]
-version = "1.0.102"
+version = "1.0.104"
 
 [dependencies.rand]
-version = "0.10.0"
+version = "0.10.2"
 
 [dependencies.rand_distr]
 version = "0.6.0"
@@ -21,10 +21,10 @@ version = "0.6.0"
 version = "0.14.3"
 
 [dependencies.egui]
-version = "0.33.3"
+version = "0.36.1"
 
 [dependencies.egui_plot]
-version = "0.34.0"
+version = "0.37.0"
 
 [dependencies.eframe]
-version = "0.33.3"
+version = "0.36.1"
