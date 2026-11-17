@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Slider, Ui, Widget};
 use egui_plot::{Legend, Line, Plot, PlotPoint, default_label_formatter};
@@ -12,6 +14,7 @@ use moto_sim::simulation::controller::observer::any_observer::{AllObserver, AnyO
 use moto_sim::simulation::controller::observer::base_flux_observer::BaseFluxObserver;
 use moto_sim::simulation::controller::observer::ds_observer::DsObserver;
 use moto_sim::simulation::controller::observer::ex_flux_observer::ExFluxObserver;
+use moto_sim::simulation::controller::observer::flux_circle_observer::FluxCircleObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
@@ -69,12 +72,35 @@ pub struct Simulation {
 
     angle_sensor_noise: Noise,
     current_sample_noise: [Noise; 3],
+    slope_sample_noise: [Noise; 3],
     output_voltage_noise: [Noise; 3],
     bus_voltage_sample_noise: Noise,
     sample_current_offset: [f64; 3],
     output_voltage_offset: [f64; 3],
 
+    /// 零矢量斜率噪声倍率（0 = 理想斜率，1 = 与电流采样噪声一致）。
+    pub slope_noise_scale: f64,
+    /// 是否把功率桥死区电压注入零矢量斜率。
+    pub slope_dead_voltage: bool,
+    /// 注入斜率的死区电压倍率（便于做 1 V / 5 V 的敏感性对比）。
+    pub slope_dead_scale: f64,
+    /// 电流采样噪声的标准差（A），用于由 Δt 反推斜率噪声。
+    pub current_noise_std: f64,
+    /// 最近一次传给观测器的零矢量采样间隔（秒），0 表示无有效零矢量。
+    pub last_slope_dt: f64,
+    /// GUI 演示用：把电流采样噪声切到 1 mA（PAPER.md 的假设值）。
+    pub flux_circle_low_noise: bool,
+    /// GUI 演示用：闭环磁链观测器时把速度环降慢，避免与 PLL 相位滞后耦合。
+    pub flux_circle_slow_speed_loop: bool,
+
     pub target_speed: f64,
+    /// 速度 PI 的比例/积分增益（A/(rad/s)）。原值 0.1；闭环磁链观测器
+    /// 需要更慢的速度环，避免与 PLL 相位滞后耦合。
+    pub speed_kp: f64,
+    pub speed_ki: f64,
+    /// 速度指令斜坡速率（电角速度 rad/s²）。1000 是原 GUI 行为；
+    /// 低速无传感器实验可取 5–20，模拟 PAPER.md §7 的慢速启动。
+    pub speed_ramp_rate: f64,
     speed_i: f64,
     set_id: bool,
     id: f64,
@@ -98,6 +124,7 @@ pub struct Simulation {
     super_flux_observer_output: ObserverOutput,
     ss2_observer_output: ObserverOutput,
     all_observer_output: ObserverOutput,
+    pub flux_circle_observer_output: ObserverOutput,
 
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
@@ -121,6 +148,7 @@ pub struct Simulation {
     pub super_flux_observer: SuperFluxObserver,
     pub ss2_observer: SS2Observer,
     pub all_observer: AllObserver,
+    pub flux_circle_observer: FluxCircleObserver,
 
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
@@ -298,15 +326,44 @@ impl Simulation {
         all_observer.any_observer.resistor_rate = 0.0;
         all_observer.any_observer.inductor = 9.9e-3;
         all_observer.any_observer.inductor_rate = 0.0;
+
+        // 磁链圆观测器：PAPER.md 的算法。初始角度取本仿真已知的转子位置
+        // （等价于启动前的 ALIGN），R 与半径取电机铭牌值。
+        let mean_inductance = (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5;
+        let nominal_r = motor.rs / mean_inductance;
+        let nominal_radius = motor.flux / mean_inductance;
+        let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
+        let mut flux_circle_observer = FluxCircleObserver::new();
+        flux_circle_observer.set_initial(initial_electrical_angle, 0.0, nominal_r, nominal_radius);
+        flux_circle_observer.pll_wn_min = 50.0;
+
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
+            target_speed: 0.0,
+            speed_kp: 0.1,
+            speed_ki: 0.1,
+            speed_ramp_rate: 1000.0,
             angle_sensor_noise: Noise::new(0.01, 0),
             current_sample_noise: [
                 Noise::new(0.01, 1),
                 Noise::new(0.01, 2),
                 Noise::new(0.01, 3),
             ],
+            slope_sample_noise: [
+                Noise::new(1.0, 11),
+                Noise::new(1.0, 12),
+                Noise::new(1.0, 13),
+            ],
+            slope_noise_scale: 1.0,
+            // 零矢量斜率是 v=0 时的 di/dt，死区/器件压降不进入这一测量，
+            // 因此默认不注入。保留开关仅用于对照“平均模型误解”的敏感性。
+            slope_dead_voltage: false,
+            slope_dead_scale: 1.0,
+            current_noise_std: 0.01,
+            last_slope_dt: 0.0,
+            flux_circle_low_noise: false,
+            flux_circle_slow_speed_loop: false,
             output_voltage_noise: [
                 Noise::new(0.01, 4),
                 Noise::new(0.01, 5),
@@ -349,6 +406,7 @@ impl Simulation {
             super_flux_observer,
             ss2_observer,
             all_observer,
+            flux_circle_observer,
             dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
@@ -361,6 +419,12 @@ impl Simulation {
             motor,
             ..Default::default()
         }
+    }
+
+    /// 重建电流采样噪声。`current_noise_std` 同时决定零矢量斜率噪声的尺度。
+    pub fn set_current_noise(&mut self, std: f64) {
+        self.current_sample_noise = [Noise::new(std, 1), Noise::new(std, 2), Noise::new(std, 3)];
+        self.current_noise_std = std;
     }
 
     pub fn update(&mut self) {
@@ -397,13 +461,13 @@ impl Simulation {
                 }
                 1 => {
                     if self.cmd_speed > self.target_speed {
-                        self.target_speed += 1000.0 * delta_time;
+                        self.target_speed += self.speed_ramp_rate * delta_time;
                         if self.target_speed > self.cmd_speed {
                             self.target_speed = self.cmd_speed;
                         }
                     }
                     if self.cmd_speed < self.target_speed {
-                        self.target_speed -= 1000.0 * delta_time;
+                        self.target_speed -= self.speed_ramp_rate * delta_time;
                         if self.target_speed < self.cmd_speed {
                             self.target_speed = self.cmd_speed;
                         }
@@ -436,12 +500,73 @@ impl Simulation {
                     for i in 0..3 {
                         sample_voltage[i] += self.dead_fix.eval(sample_current[i])
                             * sample_bus_voltage
-                            * self.power_bridge.carry_freq;
+                            * self.power_bridge.carry_freq
+                            * self.power_bridge.dead_scale;
                     }
 
                     self.observer_input.voltage = sample_voltage;
                     self.observer_input.current = sample_current;
                     self.observer_input.target_speed = self.target_speed;
+
+                    // ---- 零矢量电流斜率传感器模型 ----
+                    // 本仿真的功率桥是平均模型，没有真实载波/开关状态，所以这里
+                    // 用电机 dq ODE 在 v=0 时的导数合成“双采样斜率”，再按零矢量
+                    // 时长注入噪声。它不是从真实 PWM 波形里测出来的。
+                    let duty = self.power_bridge_input.output_duty;
+                    let duty_max = duty.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let duty_min = duty.iter().copied().fold(f64::INFINITY, f64::min);
+                    let zero_vector_fraction = (1.0 - 0.5 * (duty_max - duty_min)).clamp(0.0, 1.0);
+                    let carrier_period = if self.power_bridge.carry_freq > 0.0 {
+                        1.0 / self.power_bridge.carry_freq
+                    } else {
+                        delta_time
+                    };
+                    let slope_dt = zero_vector_fraction * carrier_period - 3.0e-6;
+                    if slope_dt >= 1.0e-6 {
+                        let theta_e = self.motion_load.angle * self.motor.pole_pairs;
+                        let omega_e = self.motion_load.speed * self.motor.pole_pairs;
+                        let [id, iq] = self.motor.current_dq;
+                        let ld = self.motor.inductance_dq[0];
+                        let lq = self.motor.inductance_dq[1];
+                        let l = 0.5 * (ld + lq);
+
+                        // vd = vq = 0 时的 dq 电流导数
+                        let did = (-self.motor.rs * id + omega_e * lq * iq) / ld;
+                        let diq =
+                            (-self.motor.rs * iq - omega_e * (self.motor.flux + ld * id)) / lq;
+                        let i_ab = rotate([id, iq], theta_e);
+                        let di_ab = rotate([did, diq], theta_e);
+                        // αβ 系里还要加上坐标系旋转项 ωJ·i
+                        let mut slope_ab =
+                            [di_ab[0] - omega_e * i_ab[1], di_ab[1] + omega_e * i_ab[0]];
+
+                        // 零矢量斜率是端电压为零时的 di/dt，死区/器件压降不进入
+                        // 这一测量。下面的注入仅作为“错误理解”的对照实验，
+                        // 默认关闭（--inject-dead 才打开）。
+                        if self.slope_dead_voltage {
+                            let dead_ab = clarke(self.power_bridge.dead_voltage);
+                            slope_ab[0] += self.slope_dead_scale * dead_ab[0] / l;
+                            slope_ab[1] += self.slope_dead_scale * dead_ab[1] / l;
+                        }
+
+                        let mut slope_3ph = inverse_clarke(slope_ab);
+                        let sigma_s = std::f64::consts::SQRT_2
+                            * self.current_noise_std
+                            * self.slope_noise_scale
+                            / slope_dt;
+                        for i in 0..3 {
+                            self.slope_sample_noise[i].update(delta_time);
+                            slope_3ph[i] += self.slope_sample_noise[i].value * sigma_s;
+                        }
+                        self.observer_input.current_slope = slope_3ph;
+                        self.observer_input.current_slope_dt = slope_dt;
+                        self.last_slope_dt = slope_dt;
+                    } else {
+                        // 调制度太高，零矢量不足以做双采样。
+                        self.observer_input.current_slope = [0.0; 3];
+                        self.observer_input.current_slope_dt = 0.0;
+                        self.last_slope_dt = 0.0;
+                    }
 
                     self.res_tune.update(delta_time, &self.observer_input);
                     self.inductance_tune
@@ -475,6 +600,9 @@ impl Simulation {
                         self.ss2_observer.update(delta_time, &self.observer_input);
                     self.all_observer_output =
                         self.all_observer.update(delta_time, &self.observer_input);
+                    self.flux_circle_observer_output = self
+                        .flux_circle_observer
+                        .update(delta_time, &self.observer_input);
 
                     let use_observer = match self.use_observer {
                         0 => &self.sensor_observer_output,
@@ -489,6 +617,7 @@ impl Simulation {
                         9 => &self.super_flux_observer_output,
                         10 => &self.ss2_observer_output,
                         11 => &self.all_observer_output,
+                        12 => &self.flux_circle_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
@@ -499,8 +628,8 @@ impl Simulation {
                     let max_current = 2.0;
                     let speed_error =
                         self.target_speed - self.current_regulator_input.electrical_speed;
-                    let speed_p = speed_error * 0.1;
-                    self.speed_i += speed_error * 0.1 * delta_time;
+                    let speed_p = speed_error * self.speed_kp;
+                    self.speed_i += speed_error * self.speed_ki * delta_time;
                     self.speed_i = self.speed_i.clamp(-max_current, max_current);
                     let output_torque = (self.speed_i + speed_p).clamp(-max_current, max_current);
                     let id = if self.set_id {
@@ -700,6 +829,9 @@ impl Application {
                     ScopeData::new("all_angle", |s: &mut Simulation| {
                         s.all_observer_output.electrical_angle
                     }),
+                    ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
+                        s.flux_circle_observer_output.electrical_angle
+                    }),
                 ],
             ),
             (
@@ -777,6 +909,12 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
+                    ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.flux_circle_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                 ],
             ),
             (
@@ -820,6 +958,9 @@ impl Application {
                     // }),
                     ScopeData::new("all_speed", |s: &mut Simulation| {
                         s.all_observer_output.electrical_speed
+                    }),
+                    ScopeData::new("flux_circle_speed", |s: &mut Simulation| {
+                        s.flux_circle_observer_output.electrical_speed
                     }),
                 ],
             ),
@@ -989,6 +1130,51 @@ impl Application {
                     }),
                 ],
             ),
+            (
+                "flux_circle_r".to_string(),
+                vec![
+                    ScopeData::new("true_R", |s: &mut Simulation| {
+                        s.motor.rs / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
+                    }),
+                    ScopeData::new("estimated_R", |s: &mut Simulation| s.flux_circle_observer.r),
+                ],
+            ),
+            (
+                "flux_circle_radius".to_string(),
+                vec![
+                    ScopeData::new("true_radius", |s: &mut Simulation| {
+                        s.motor.flux / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
+                    }),
+                    ScopeData::new("estimated_radius", |s: &mut Simulation| {
+                        s.flux_circle_observer.radius
+                    }),
+                ],
+            ),
+            (
+                "flux_circle_observability".to_string(),
+                vec![
+                    ScopeData::new("gamma", |s: &mut Simulation| s.flux_circle_observer.gamma),
+                    ScopeData::new("fit_count", |s: &mut Simulation| {
+                        s.flux_circle_observer.fit_count as f64
+                    }),
+                    ScopeData::new("fit_fail", |s: &mut Simulation| {
+                        s.flux_circle_observer.fit_fail as f64
+                    }),
+                ],
+            ),
+            (
+                "flux_circle_valid".to_string(),
+                vec![
+                    ScopeData::new("valid", |s: &mut Simulation| {
+                        if s.flux_circle_observer.valid {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }),
+                    ScopeData::new("slope_dt_us", |s: &mut Simulation| s.last_slope_dt * 1.0e6),
+                ],
+            ),
         ];
     }
 
@@ -1038,7 +1224,7 @@ impl App for Application {
                 ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=11).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=12).ui(ui);
                 ui.label(match self.simulation.use_observer {
                     0 => "sensor_observer",
                     1 => "grad_observer",
@@ -1052,8 +1238,35 @@ impl App for Application {
                     9 => "super_flux_observer",
                     10 => "ss2_observer",
                     11 => "all_observer",
+                    12 => "flux_circle_observer",
                     _ => "sensor_observer",
                 });
+                if ui
+                    .checkbox(&mut self.simulation.flux_circle_low_noise, "flux 1mA")
+                    .changed()
+                {
+                    let std = if self.simulation.flux_circle_low_noise {
+                        0.001
+                    } else {
+                        0.01
+                    };
+                    self.simulation.set_current_noise(std);
+                }
+                if ui
+                    .checkbox(
+                        &mut self.simulation.flux_circle_slow_speed_loop,
+                        "flux slow loop",
+                    )
+                    .changed()
+                {
+                    let (kp, ki) = if self.simulation.flux_circle_slow_speed_loop {
+                        (0.02, 0.02)
+                    } else {
+                        (0.1, 0.1)
+                    };
+                    self.simulation.speed_kp = kp;
+                    self.simulation.speed_ki = ki;
+                }
             });
             ScrollArea::vertical().show(ui, |ui| {
                 self.scope.ui(ui);
@@ -1062,7 +1275,291 @@ impl App for Application {
     }
 }
 
+#[derive(Default)]
+struct Metrics {
+    n: usize,
+    valid: usize,
+    sum_err: f64,
+    sum_err2: f64,
+    max_err: f64,
+    sum_speed_err2: f64,
+}
+
+impl Metrics {
+    fn push(&mut self, err: f64, speed_err: f64, valid: bool) {
+        self.n += 1;
+        if valid {
+            self.valid += 1;
+        }
+        self.sum_err += err;
+        self.sum_err2 += err * err;
+        self.max_err = self.max_err.max(err.abs());
+        self.sum_speed_err2 += speed_err * speed_err;
+    }
+
+    fn rms(&self) -> f64 {
+        if self.n == 0 {
+            return f64::NAN;
+        }
+        (self.sum_err2 / self.n as f64).sqrt()
+    }
+
+    fn bias(&self) -> f64 {
+        if self.n == 0 {
+            return f64::NAN;
+        }
+        self.sum_err / self.n as f64
+    }
+
+    fn speed_rms(&self) -> f64 {
+        if self.n == 0 {
+            return f64::NAN;
+        }
+        (self.sum_speed_err2 / self.n as f64).sqrt()
+    }
+
+    fn valid_percent(&self) -> f64 {
+        if self.n == 0 {
+            return f64::NAN;
+        }
+        100.0 * self.valid as f64 / self.n as f64
+    }
+}
+
+fn arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+}
+
+fn arg_f64(args: &[String], key: &str, default: f64) -> f64 {
+    arg_value(args, key)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 无界面批处理：用与 GUI 完全相同的 `Simulation` 跑一段，打印磁链圆观测器指标。
+fn run_headless(args: &[String]) {
+    let seconds = arg_f64(args, "--seconds", 10.0);
+    let speed = arg_f64(args, "--speed", 20.0);
+    let r_scale = arg_f64(args, "--r-scale", 1.0);
+    let plant_step = arg_f64(args, "--plant-step", 5.0e-6);
+    let noise_scale = arg_f64(args, "--slope-noise", 1.0);
+    // 按用户说明：零矢量斜率对应 v=0，不受死区电压影响，默认不注入。
+    let dead = args.iter().any(|a| a == "--inject-dead");
+    let dead_scale = arg_f64(args, "--dead-scale", 1.0);
+    let current_noise = arg_value(args, "--current-noise").and_then(|s| s.parse::<f64>().ok());
+    let speed_ramp = arg_f64(args, "--speed-ramp", 1000.0);
+    let speed_kp = arg_f64(args, "--speed-kp", 0.1);
+    let speed_ki = arg_f64(args, "--speed-ki", 0.1);
+    let load = arg_value(args, "--load").and_then(|s| s.parse::<f64>().ok());
+    let use_flux_circle = args.iter().any(|a| a == "--use-flux-circle");
+    let handover = arg_f64(args, "--handover", 0.0);
+    let no_fit = args.iter().any(|a| a == "--no-fit");
+    let wn_min = arg_f64(args, "--wn-min", 50.0);
+    let wn_min_run = arg_f64(args, "--wn-min-run", 1.0);
+    let narrow_time = arg_f64(args, "--narrow-time", 2.0);
+    let gamma_min = arg_f64(args, "--gamma-min", 0.05);
+    let max_sigma_rel = arg_f64(args, "--max-sigma-rel", 0.02);
+    let window = arg_f64(args, "--window", 1.0);
+    let no_drift = args.iter().any(|a| a == "--no-drift");
+    let warmup_fraction = arg_f64(args, "--warmup", 0.5).clamp(0.0, 0.99);
+    let csv = arg_value(args, "--csv").map(|s| s.to_string());
+    let verbose = args.iter().any(|a| a == "--verbose");
+
+    let dt = 1.0 / 20e3;
+    let mut sim = Simulation::new();
+    sim.delta_time = dt;
+    sim.timer = Timer::new(vec![plant_step, dt]);
+    sim.cmd_speed = speed;
+    sim.target_speed = speed;
+    sim.set_id = true;
+    sim.id = 0.0;
+    sim.slope_noise_scale = noise_scale;
+    sim.slope_dead_voltage = dead;
+    sim.slope_dead_scale = dead_scale;
+    sim.power_bridge.dead_scale = dead_scale;
+    sim.speed_ramp_rate = speed_ramp;
+    sim.speed_kp = speed_kp;
+    sim.speed_ki = speed_ki;
+    if let Some(std) = current_noise {
+        sim.current_sample_noise = [Noise::new(std, 1), Noise::new(std, 2), Noise::new(std, 3)];
+        sim.current_noise_std = std;
+    }
+    if let Some(torque) = load {
+        sim.motion_load.static_friction_torque = torque;
+    }
+    if use_flux_circle {
+        // 默认从 0 秒就闭环；--handover 可先让传感器闭环把转子带到低速，
+        // 再交班给磁链圆观测器（对应 PAPER.md §7 的 RUN 阶段）。
+        sim.use_observer = if handover > 0.0 { 0 } else { 12 };
+    }
+
+    let mean_l = (sim.motor.inductance_dq[0] + sim.motor.inductance_dq[1]) * 0.5;
+    let nominal_r = sim.motor.rs / mean_l;
+    let nominal_radius = sim.motor.flux / mean_l;
+    let theta0 = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
+    sim.flux_circle_observer
+        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
+    sim.flux_circle_observer.pll_wn_min = wn_min;
+    sim.flux_circle_observer.pll_wn_min_run = wn_min_run;
+    sim.flux_circle_observer.pll_narrow_time = narrow_time;
+    sim.flux_circle_observer.gamma_min = gamma_min;
+    sim.flux_circle_observer.max_sigma_rel = max_sigma_rel;
+    sim.flux_circle_observer.min_window = window;
+    sim.flux_circle_observer.fit_cfg.fit_drift = !no_drift;
+    sim.flux_circle_observer.fit_enabled = !no_fit;
+
+    let steps = (seconds / dt).round() as usize;
+    let warmup_steps = (steps as f64 * warmup_fraction) as usize;
+
+    let mut csv_writer = csv.as_ref().map(|path| {
+        let file = std::fs::File::create(path).expect("create csv");
+        let mut writer = std::io::BufWriter::new(file);
+        writeln!(
+            writer,
+            "t,true_angle,est_angle,err,theta_meas,err_meas,true_speed,est_speed,id,iq,r,radius,gamma,valid,slope_dt_us,u_x,u_y,c_x,c_y,fit_count,fit_fail,fit_gamma,fit_arc,fit_sigma"
+        )
+        .unwrap();
+        writer
+    });
+
+    let mut startup = Metrics::default();
+    let mut steady = Metrics::default();
+    let mut r_min = f64::INFINITY;
+    let mut r_max = f64::NEG_INFINITY;
+    let mut last_print = 0.0;
+
+    for k in 0..steps {
+        if use_flux_circle && handover > 0.0 {
+            sim.use_observer = if (k as f64) * dt >= handover { 12 } else { 0 };
+        }
+        sim.update();
+        let t = (k + 1) as f64 * dt;
+        let true_angle = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
+        let out = sim.flux_circle_observer_output.clone();
+        let err = angle_normal(out.electrical_angle - true_angle);
+        let true_speed = sim.motion_load.speed * sim.motor.pole_pairs;
+        let speed_err = out.electrical_speed - true_speed;
+        let valid = sim.flux_circle_observer.valid;
+
+        if k >= warmup_steps {
+            steady.push(err, speed_err, valid);
+        } else {
+            startup.push(err, speed_err, valid);
+        }
+        if valid {
+            r_min = r_min.min(sim.flux_circle_observer.r);
+            r_max = r_max.max(sim.flux_circle_observer.r);
+        }
+
+        if let Some(writer) = csv_writer.as_mut() {
+            if k % 10 == 0 {
+                let fit = sim.flux_circle_observer.fit;
+                let (fg, fa, fs) = fit.map(|f| (f.gamma, f.arc, f.sigma)).unwrap_or((
+                    f64::NAN,
+                    f64::NAN,
+                    f64::NAN,
+                ));
+                let theta_meas = sim.flux_circle_observer.theta_meas;
+                let err_meas = angle_normal(theta_meas - true_angle);
+                let (_, _, u, c) = sim.flux_circle_observer.debug_state();
+                writeln!(
+                    writer,
+                    "{t:.6},{true_angle:.6},{est:.6},{err:.6},{theta_meas:.6},{err_meas:.6},{true_speed:.6},{est_speed:.6},{id:.6},{iq:.6},{r:.6},{radius:.6},{gamma:.3e},{valid},{slope_dt_us:.3e},{u_x:.6},{u_y:.6},{c_x:.6},{c_y:.6},{fit_count},{fit_fail},{fg:.3e},{fa:.3e},{fs:.3e}",
+                    est = out.electrical_angle,
+                    est_speed = out.electrical_speed,
+                    id = sim.motor.current_dq[0],
+                    iq = sim.motor.current_dq[1],
+                    r = sim.flux_circle_observer.r,
+                    radius = sim.flux_circle_observer.radius,
+                    gamma = sim.flux_circle_observer.gamma,
+                    valid = if valid { 1 } else { 0 },
+                    slope_dt_us = sim.last_slope_dt * 1.0e6,
+                    u_x = u.x,
+                    u_y = u.y,
+                    c_x = c.x,
+                    c_y = c.y,
+                    fit_count = sim.flux_circle_observer.fit_count,
+                    fit_fail = sim.flux_circle_observer.fit_fail,
+                )
+                .unwrap();
+            }
+        }
+
+        if verbose && t - last_print >= seconds / 20.0 {
+            last_print = t;
+            println!(
+                "t={t:6.3}s err={:8.3}deg r={:8.2} radius={:7.3} gamma={:.2e} valid={} fits={}/{}",
+                err.to_degrees(),
+                sim.flux_circle_observer.r,
+                sim.flux_circle_observer.radius,
+                sim.flux_circle_observer.gamma,
+                valid,
+                sim.flux_circle_observer.fit_count,
+                sim.flux_circle_observer.fit_fail,
+            );
+        }
+    }
+
+    println!("=== flux circle observer (headless) ===");
+    println!(
+        "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
+         slope_noise={noise_scale} dead_injection={dead} dead_scale={dead_scale} \
+         current_noise={:.4} speed_ramp={speed_ramp} wn_min={wn_min}->{wn_min_run} \
+         gamma_min={gamma_min} window={window} drift={} narrow_time={narrow_time} \
+         speed_kp={speed_kp} speed_ki={speed_ki} closed_loop={use_flux_circle} handover={handover}",
+        current_noise.unwrap_or(0.01),
+        !no_drift
+    );
+    println!("true R={nominal_r:.3} s^-1, true radius={nominal_radius:.4} A");
+    println!(
+        "startup: n={} valid={:.1}% rms={:.3}deg max={:.3}deg bias={:.3}deg",
+        startup.n,
+        startup.valid_percent(),
+        startup.rms().to_degrees(),
+        startup.max_err.to_degrees(),
+        startup.bias().to_degrees()
+    );
+    println!(
+        "steady : n={} valid={:.1}% rms={:.3}deg max={:.3}deg bias={:.3}deg speed_rms={:.3}rad/s",
+        steady.n,
+        steady.valid_percent(),
+        steady.rms().to_degrees(),
+        steady.max_err.to_degrees(),
+        steady.bias().to_degrees(),
+        steady.speed_rms()
+    );
+    println!(
+        "observer: r={:.3} ({:+.2}%) radius={:.4} ({:+.2}%) gamma={:.3e} fits={} fail={} slope_dt={:.2}us",
+        sim.flux_circle_observer.r,
+        100.0 * (sim.flux_circle_observer.r - nominal_r) / nominal_r,
+        sim.flux_circle_observer.radius,
+        100.0 * (sim.flux_circle_observer.radius - nominal_radius) / nominal_radius,
+        sim.flux_circle_observer.gamma,
+        sim.flux_circle_observer.fit_count,
+        sim.flux_circle_observer.fit_fail,
+        sim.last_slope_dt * 1.0e6,
+    );
+    println!("R range over valid samples: {r_min:.3} .. {r_max:.3}");
+    if let Some(f) = sim.flux_circle_observer.fit {
+        println!(
+            "last fit: r={:.3} radius={:.3} gamma={:.3e} arc={:.2}rad sigma={:.3e} inlier={:.3} n={}",
+            f.r, f.radius, f.gamma, f.arc, f.sigma, f.inlier_frac, f.n_obs
+        );
+    }
+    if let Some(path) = csv {
+        println!("csv: {path}");
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--headless") {
+        run_headless(&args);
+        return;
+    }
     let options = NativeOptions {
         ..Default::default()
     };

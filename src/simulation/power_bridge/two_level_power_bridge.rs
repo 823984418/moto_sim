@@ -35,6 +35,9 @@ pub struct TwoLevelPowerBridge<const P: usize> {
     pub dead_mapping: BoxedFunction,
 
     pub dead_voltage: [f64; P],
+
+    /// 死区电压倍率。1.0 为标称死区；做“1 V 器件压降”敏感性实验时可调小。
+    pub dead_scale: f64,
 }
 
 impl<const P: usize> Default for TwoLevelPowerBridge<P> {
@@ -48,6 +51,7 @@ impl<const P: usize> Default for TwoLevelPowerBridge<P> {
             bus_current: 0.0,
             dead_mapping: Default::default(),
             dead_voltage: [0.0; P],
+            dead_scale: 1.0,
         }
     }
 }
@@ -65,7 +69,8 @@ impl<const P: usize> PowerBridge<P> for TwoLevelPowerBridge<P> {
         for i in 0..P {
             self.dead_voltage[i] = self.dead_mapping.eval(input.output_current[i])
                 * self.bus_voltage
-                * self.carry_freq;
+                * self.carry_freq
+                * self.dead_scale;
             output_voltage[i] =
                 (input.output_duty[i] * half_bus + self.dead_voltage[i]).clamp(-half_bus, half_bus);
             bus_current += input.output_current[i] * output_voltage[i];
