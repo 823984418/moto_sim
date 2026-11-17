@@ -1,6 +1,6 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Slider, Ui, Widget};
-use egui_plot::{default_label_formatter, Legend, Line, Plot, PlotPoint};
+use egui_plot::{Legend, Line, Plot, PlotPoint, default_label_formatter};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::model::zq10y_dead_mapping;
 use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_regulator::ThreePhasePICurrentRegulator;
@@ -294,8 +294,10 @@ impl Simulation {
             speed_lp_factor: 10.0,
         };
         all_observer.any_observer.history = 5000;
-        all_observer.any_observer.resistor_rate = 1.0;
+        all_observer.any_observer.resistor = 3.8;
+        all_observer.any_observer.resistor_rate = 0.0;
         all_observer.any_observer.inductor = 9.9e-3;
+        all_observer.any_observer.inductor_rate = 0.0;
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
@@ -313,7 +315,10 @@ impl Simulation {
             bus_voltage_sample_noise: Noise::new(1.0, 7),
             // sample_current_offset: [0.001, 0.002, 0.003],
             // output_voltage_offset: [0.02, -0.01, 0.01],
-            motion_load: IdealMotionLoad { ..FAN_LOAD },
+            motion_load: IdealMotionLoad {
+                angle: std::f64::consts::PI * 0.5,
+                ..FAN_LOAD
+            },
             power_bridge: TwoLevelPowerBridge {
                 bus_capacitance: 390e-6,
                 dead_mapping: zq10y_dead_mapping(),
@@ -662,18 +667,18 @@ impl Application {
                     // ScopeData::new("sensor_angle", |s: &mut Simulation| {
                     //     s.sensor_observer_output.electrical_angle
                     // }),
-                    // ScopeData::new("flux_angle", |s: &mut Simulation| {
-                    //     s.flux_observer_output.electrical_angle
-                    // }),
-                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
-                    //     s.grad_observer_output.electrical_angle
-                    // }),
-                    // ScopeData::new("mix_angle", |s: &mut Simulation| {
-                    //     s.mix_observer_output.electrical_angle
-                    // }),
-                    // ScopeData::new("mp_angle", |s: &mut Simulation| {
-                    //     s.mp_observer_output.electrical_angle
-                    // }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        s.flux_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        s.grad_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("mix_angle", |s: &mut Simulation| {
+                        s.mix_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("mp_angle", |s: &mut Simulation| {
+                        s.mp_observer_output.electrical_angle
+                    }),
                     // ScopeData::new("ds_angle", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_angle
                     // }),
