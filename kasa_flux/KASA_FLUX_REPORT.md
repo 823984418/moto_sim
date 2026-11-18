@@ -25,6 +25,12 @@
   不会出现 `R` 冻结但几何还是自由拟合那一套的不一致；
 - 数值上沿用论文的三招：内部单位、浮动原点、以当前 `k` 为参考的剪切；
   增量输入带 `ΔU + k·ΔV` 修正项；
+- `V` 也有原点管理（论文 §6.3）：`V = ∫i dt` 是从 `t = 0` 起、本身不衰减的
+  长积分，电流采样有一点直流偏置就会线性增长；存 `V' = V - v_off` 并让
+  `|V̄'| ≤ recenter_v_rel·RMS(V')`，剪切时补 `U_s += dk·v_off`；
+- 半径的有效范围写成 `θ` 的线性化伪观测（论文 §7），越界时把 `μggᵀ`/`-μzg`/`μz²`
+  加进法方程，**Newton 步、回溯线搜索、初始化扫描和输出都用同一个带罚项的
+  剖面**（`k` 也会被拉向可行域）；报告的损失/`sigma_rel` 仍用无罚项残差；
 - `R` 的更新用**无量纲可观性指数** `P''/(4R²Σw|V|²)` 门限 + 圆模型可信度
   `sigma_rel` 门限 + 随机游走先验 + 信任域 + 回溯线搜索，稳态自动冻结。
 
@@ -110,6 +116,18 @@
 点云质心超过 `0.25` 个内部单位时，把全部矩精确平移 `U → U - s`，把 `s`
 累加进 `off`；输出的圆心加回 `off`。这样 `|p| ~ ρ`，绝对坐标 1e5 也不影响精度。
 
+`V = ∫i dt` 同样是从 `t = 0` 起的长积分，且本身不衰减：电流采样只要有一点
+直流偏置，`|V|` 就线性增长，把 `Σw|V|²`、`ΣwUVᵀ` 等矩撑大。做法同 U（论文
+附录 A.3）：存储 `V' = V - v_off`，当 `|V̄'|` 超过 `recenter_v_rel·RMS(V')`
+时把均值搬进 `v_off`。这是纯规范（`P`、`P'`、`P''`、`k`、圆心、半径都不变），
+但剪切历史时必须补 `U_s += dk·v_off`（历史矩用 `translate_u(-dk·v_off)`、
+当前样本用 `u += dk·v_off`），否则每拍系统性偏。
+
+阈值没有沿用论文对 U、V 共用的长度阈值 `0.25L`：`V` 是“长度/k”的积分，量纲
+不同，绝对阈值在电机里几乎不可达（本仿真 8 s 时 `|V̄| ≈ 0.011`，而阈值是
+`0.25`）。改用相对 RMS 的判据后，纯旋转的 `V`（`|V̄|/RMS ~ 1/(ωτ)`）不触发，
+只有积分漂移把它推高才搬；8 s 仿真里触发约 50 次，结果与不启用时逐位一致。
+
 ### 3.4 变量投影 + 解析导数 + Newton
 
 对固定 `k` 有闭式 `θ*(k) = -M(k)⁻¹q(k)`，剖面损失
@@ -120,9 +138,15 @@
 
 `P'`、`P''` 都有解析式（论文 §5.2/§5.3），每拍做 1~2 步 Newton，带：
 
+- 半径越界时把线性化伪观测 `μ(gᵀθ - z)²` 加进 `M₀/b₀/c₀`，用**带罚项的**
+  `P`、`P'`、`P''` 走步，并用同一个带罚项目标做线搜索（论文 §7/§9.7）；
 - 信任域 `|δk| ≤ 0.02·(1+|k|)`；
 - 回溯线搜索（只接受让真实 `P` 下降的步长，最多折半 10 次）；
 - 随机游走先验（在 Newton 分母上加阻尼，激励小时自动收缩）。
+
+> 罚项只做一次局部线性化：`g`、`z` 在一个 Newton 步（含线搜索）内固定，下一
+> 步再用新的无约束解重新线性化。报告的 `loss`/`sigma_rel` 必须用约束后 `θ` 上
+> 的**无罚项**残差，否则 `μz²`（`μ = 50Σw`）会混进来、把噪声门限带偏。
 
 ### 3.5 可观性：稳态必须冻结 `R`
 
@@ -135,6 +159,11 @@
 稳态（`iq`、`ω` 不变）时 `P(k) ≡ 0`，`obs → 0`，`k` 自动冻结；只有电流/转速
 瞬态才允许更新 `R`。实测：启动瞬态 `obs ≈ 0.05~0.2`；恒速稳态 `obs ≈ 1e-4~1e-5`。
 默认 `obs_min = 5e-3`。
+
+分母里的 `Σw|V|²` 取**物理** `V` 的二阶矩（`g0 + 2v_off·ΣwV' + Σw·|v_off|²`），
+所以 `recenter_v` 不会让门限跳变。曾把它换成中心化方差 `Σw|V - V̄|²`：形式上
+更“规范不变”，但同时拿掉了先验里对 `V` 漂移的阻尼，1 mA 稳态下 `R` 会从
++0.41% 漂到 +17.4%（实测），所以不用。
 
 ### 3.6 初始化网格扫描
 
@@ -175,7 +204,7 @@ PLL 捕获，交班后由拟合圆心接管。
 | 拟合 | 每 1 s / 每 2π 弧长做一次 5 参数几何 IRLS | 每拍一次 O(1) 变量投影 Newton |
 | 圆心 | 仿射 `c + v·t`，窗口间跳变 | 每拍与当前 `R` 一致，连续更新 |
 | `R` 门控 | `gamma` + `sigma/radius` + 固定 R 重拟合 | `obs` + `sigma_rel` + 先验 + 信任域 |
-| 半径 | 自由拟合，失败则冻结 | 自由拟合 + 范围约束 + 高噪声保持旧值 |
+| 半径 | 自由拟合，失败则冻结 | 自由拟合 + 罚项进 Newton/线搜索 + 高噪声保持旧值 |
 | 启动 | 至少 1 s + 1 整圈才首次拟合 | 2π 数据覆盖后扫描一次；瞬态即可辨识 |
 | 适用范围 | 稳态精度好，但高噪声下拟合经常被拒绝 | 高噪声下角度噪声约为前者一半 |
 
@@ -187,7 +216,7 @@ PLL 捕获，交班后由拟合圆心接管。
 
 | 文件 | 改动 |
 |---|---|
-| `src/simulation/controller/observer/kasa_flux_observer.rs` | **新增**：`V2`、`Moments`（36 矩）、`Tracker`、`FitConfig`、`Report`、`KasaFluxObserver`，8 个单测 |
+| `src/simulation/controller/observer/kasa_flux_observer.rs` | **新增**：`V2`、`Moments`（36 矩）、`Tracker`、`FitConfig`、`Report`、`KasaFluxObserver`，12 个单测 |
 | `src/simulation/controller/observer/mod.rs` | 注册 `pub mod kasa_flux_observer;` |
 | `examples/example1.rs` | 观测器接入（`use_observer=13`）、Scope、GUI、headless `--use-kasa` / `--observe-only` 与调参项 |
 | `kasa_flux/plot_kasa_trace.py` | 离线绘图脚本（Pillow）：把 headless CSV 画成角度误差 / R / 半径 / 可观性四联图 |
@@ -204,13 +233,18 @@ PLL 捕获，交班后由拟合圆心接管。
 cargo test --release --lib kasa_flux_observer
 ```
 
-8 个测试：
+12 个测试：
 
-- `shear_matches_direct` / `translate_matches_direct`：剪切、平移后的 36 个矩
-  与“直接重算”逐字段一致（相对误差 < 1e-12）；
+- `shear_matches_direct` / `translate_matches_direct` / `translate_v_matches_direct`：
+  剪切、U 平移、V 平移后的 36 个矩与“直接重算”逐字段一致（相对误差 < 1e-12）；
 - `profile_derivatives_match_finite_difference`：解析 `P'`、`P''` 与中点差分一致；
+- `v_constant_offset_is_a_gauge`：给所有 `V_n` 加常数后 `P`、`P'`、`P''` 不变；
+- `v_offset_does_not_break_k`：V 有常数偏移时从 +25% 初值仍收敛到真值，
+  且 `v_off` 非零（钉住剪切时的 `dk·v_off` 修正）；
+- `radius_penalty_enters_newton`：真实半径 1.35、范围 [1.0,1.2] 时输出贴 1.2、
+  `clamped=true`，且 `k` 被罚项拉离无约束解；报告损失等于约束后 θ 的无罚项残差；
 - `tracker_recovers_r_with_excitation`：从 +25% 初值恢复到 384.000（误差 0）；
-- `tracker_freezes_r_at_steady_state`：恒 `iq`/`ω` 时 `k` 保持初值（obs ~ 1e-13）；
+- `tracker_freezes_r_at_steady_state`：恒 `iq`/`ω` 时 `k` 保持初值（obs ~ 1e-14）；
 - `observer_recovers_r_with_excitation`：观测器从 +25% 恢复到真值；
 - `observer_tracks_angle_with_ideal_slope`：理想斜率下最差角度误差 0.0075 rad；
 - `observer_keeps_angle_with_wrong_r_at_steady_state`：稳态下即使 `R` 错 25%，
@@ -318,7 +352,10 @@ Newton 修到 +0.48%；第三张半径（10 mA 时会被 `radius_sigma_rel` 保�
    `σ_θ` 与 `σ_i/Δt`、`ψf/L` 有关；与旧观测器的结论一致。
 4. **斜率仍是 ODE 合成**：本仓库的功率桥是平均模型，没有真实 PWM 双采样，
    这一局限继承自 `example1`，与拟合算法无关。
-5. **可继续做**：用 `P''` 与残差方差估计 `R` 的不确定度并自适应 `τ`；
+5. **`V` 的斜坡去不掉**：V 原点管理只搬掉**常数**偏移；电流采样直流偏置在
+   `B = ∫i dt` 里留下的是**斜坡**，它仍会改变 `P(k)`。真出现时应在模拟前端
+   去偏置，或把 `B` 换成带泄漏的积分，而不是再加变换。
+6. **可继续做**：用 `P''` 与残差方差估计 `R` 的不确定度并自适应 `τ`；
    对 `A` 用梯形/Simpson 积分减小离散偏差；把 `R` 的更新限制在
    “转速/负载变化率超过阈值”的窗口。
 

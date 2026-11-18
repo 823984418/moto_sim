@@ -26,15 +26,20 @@
 //!
 //! * **O(1) 内存**：36 个矩精确概括整个（指数遗忘的）窗口，不需要保存样本，
 //!   也就不存在“窗口长度 / 降采样 / 拟合触发 / 重锚点”这些离散逻辑；
-//! * **O(1) 时间**：每拍 2~3 次 3×3 Cholesky；圆心和半径**每拍**都与当前 `k`
-//!   一致（它等价于“固定当前 R 的几何拟合”），不会出现 `flux_circle_observer`
-//!   里“R 冻结但几何还是自由拟合那一套”的不一致；
+//! * **O(1) 时间**：每拍 2~3 次 3×3 Cholesky（半径罚项触发时翻倍）；圆心和半径
+//!   **每拍**都与当前 `k` 一致（它等价于“固定当前 R 的几何拟合”），不会出现
+//!   `flux_circle_observer` 里“R 冻结但几何还是自由拟合那一套”的不一致；
 //! * **数值稳定**：历史矩始终保存在“当前 `k` 的参考系”里（剪切 `U_s = U + k_ref V`），
 //!   所以求值永远在 `κ = 0` 处进行，`A` 与 `R B` 之间那种 1e2 量级的相消被移除了；
 //!   浮动原点再把点云质心移到零，使 `|p| ~ ρ`；
 //! * **可观性显式化**：`P''/(4 R² Σw|V|²)` 给出一个无量纲的 `k` 可观性指数。
 //!   稳态（iq、ω 不变）时 `P(k) ≡ 0`，该指数趋于零，`k` 自动冻结；只有电流/转速
 //!   瞬态才允许更新 `R`。
+//! * **半径约束进入剖面**：半径的有效范围写成 `θ` 的线性化伪观测（论文 §7）。
+//!   越界时把 `μ g gᵀ`、`-μ z g`、`μ z²` 加进 `M₀/b₀/c₀`，于是 `P`、`P'`、`P''`
+//!   一起变成“带罚项的剖面”；Newton 步、回溯线搜索、初始化扫描与输出都用同一个
+//!   目标，`k` 会被一起拉向可行域。报告的损失仍用**无罚项**残差
+//!   `θᵀA₀θ + 2θᵀb₀ + c₀`，罚项常数不会污染 `σ_rel`。
 //!
 //! # 3. 与 `flux_circle_observer` 相同的工程约定
 //!
@@ -47,6 +52,42 @@
 //! 与 `flux_circle_observer` 的唯一“接口差异”是：拟合并未估计圆心漂移 `v`。
 //! 指数遗忘本身就是一个因果低通，圆心（即 `λ(0)/L`）的慢漂会被窗口自然跟上，
 //! 不需要额外的仿射参数；少一个参数也让 `k` 的剖面更干净。
+//!
+//! # 4. 论文里哪些数值稳定措施在本场景不需要
+//!
+//! 论文的演示场景是“绝对坐标 1e5、半径 1.35”，U 的浮动原点是为这个比例服务的。
+//! 本观测器里 `U = A = ∫s0 dt` 是磁链表达式（`|A| ≲ 几倍 ρ`），没有 `10^5` 量级
+//! 的平移，保留 U 的浮动原点只是为了挡住从 `t=0` 起长积分里微小偏置造成的慢漂。
+//!
+//! `V = B = ∫i dt` 同理，而且更需要管：它也是从 `t=0` 起、本身不衰减的长积分，
+//! 电流采样只要有一点直流偏置，`|V|` 就线性增长。所以论文的 **V 原点管理照搬**
+//! （见 `Tracker::recenter_v`）：存储的 `V'` 的加权均值被限制在它自身 RMS 的
+//! `recenter_v_rel` 倍以内，超出的部分搬进 `v_off`（物理 `V = V' + v_off`）。
+//! 这是纯规范——`P`、`P'`、`P''`、`k`、圆心、半径都不变——作用只是不让
+//! `M₁/M₂/q₁..q₃` 被纯规范的大偏移撑大。代价是每次剪切必须补 `U_s += dk·v_off`
+//! （历史与当前样本都要补），漏掉会系统性偏。
+//!
+//! 还有一处与论文不同：论文 §6.7 只用 `P''/(4R²Σw|V|²)` 判断“曲率不为零”，
+//! 本观测器把它当**无量纲可观性门限**与先验尺度用，所以这里的 `Σw|V|²` 取
+//! **物理** `V` 的二阶矩（`v_second`，与 `v_off` 的拆分无关），否则 `recenter_v`
+//! 一触发门限就跳变。也试过换成中心化方差 `Σw|V - V̄|²`：它把 V 的积分偏移
+//! 当成“没有信息”一起拿掉，看起来更“正确”，但同时拿掉了先验对该偏移的阻尼，
+//! 1 mA 稳态下 `R` 会从 +0.4% 漂到 +17%（实测），所以不用。
+//! 注意 V 原点管理只去**常数**偏移，去不掉直流偏置积分出来的**斜坡**；斜坡仍会
+//! 改变 `P(k)`，那需要在模拟前端去偏置，或把 `B` 换成带泄漏的积分。
+//!
+//! 真正**没有搬**过来的是这两个：
+//!
+//! * **`reseed_after_init`**：论文担心热启动矩在坏参考系里累积。这里矩本来就是
+//!   `|p| ~ ρ` 的有界量，初始化后已用剪切精确重投影；把刚扫出 `k` 的窗口丢掉，
+//!   反而丢掉唯一的激励。
+//! * **`k_step_abs`**：电机里 `k = Rs/L` 是几百 s⁻¹，`k_min/k_max`（铭牌 ±1 个
+//!   数量级）加相对信任域 `k_step_rel·(1+|k|)` 已经够；1e6 的绝对上限永不触发。
+//!
+//! **保留**内部单位、U 浮动原点、剪切与补偿求和：前两者把 `A` 的长积分挡在
+//! `|p| ~ ρ` 附近；剪切是流式递推的求值框架（矩存 `U_s = U + k_ref V`，永远在
+//! `κ = 0` 求值），每改一次 `k` 只做一次 O(1) 精确变换；补偿求和与这些长积分
+//! 配套，成本可忽略。
 
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::{angle_normal, clarke};
@@ -494,6 +535,66 @@ impl Moments {
         // w, v, vv, g0, gv, gg 在平移下不变
     }
 
+    /// 坐标系平移 `V -> V - s`（`U` 不动）。精确；Kåsa 评分不变（每个 `k` 的
+    /// 点云只是平移 `(k - k_ref)s`），所以 `P`、`P'`、`P''` 与圆参数都不受影响，
+    /// 但存储的 `V` 族矩会随 `s` 变小。
+    ///
+    /// `V = ∫i dt` 是从 `t=0` 起的长积分，电流的直流偏置会让它线性增长；搬掉
+    /// 加权均值后，`Σw|V|²` 里只剩窗口内的变化，`M₁/M₂/q₁..q₃` 不会被一个纯
+    /// 规范的大偏移撑大（论文附录 A.3）。
+    ///
+    /// 物理 `V = V' + v_off`；因此剪切历史时必须补 `U_s += dk·v_off`
+    /// （见 `Tracker::newton`）。
+    fn translate_v(&mut self, s: V2) {
+        if s.norm2() == 0.0 {
+            return;
+        }
+        let (w, u, v, uu, uv, vv) = (self.w, self.u, self.v, self.uu, self.uv, self.vv);
+        let (a0, au, av) = (self.a0, self.au, self.av);
+        let (b0, bu, bv) = (self.b0, self.bu, self.bv);
+        let (g0, gu, gv) = (self.g0, self.gu, self.gv);
+        let (ab, bb, ag, bg, gg) = (self.ab, self.bb, self.ag, self.bg, self.gg);
+
+        let s2 = s.norm2();
+        let su = s.dot(u); // s·ΣwU
+        let sv = s.dot(v); // s·ΣwV
+        let uu_s = mv(&uu, s); // (ΣwUUᵀ)s
+        let uv_s = mv(&uv, s); // (ΣwUVᵀ)s
+        let vu_s = mv(&mtr(&uv), s); // (ΣwVUᵀ)s
+        let vv_s = mv(&vv, s); // (ΣwVVᵀ)s
+
+        self.v = v.sub(s.mul(w));
+        self.vv = madd(
+            &msub(&msub(&vv, &outer(v, s)), &outer(s, v)),
+            &msc(&outer(s, s), w),
+        );
+        self.uv = msub(&uv, &outer(u, s));
+
+        self.av = av.sub(s.mul(a0));
+
+        self.b0 = b0 - su;
+        self.bu = bu.sub(uu_s);
+        self.bv = bv.sub(s.mul(b0)).sub(vu_s).add(s.mul(su));
+
+        self.g0 = g0 - 2.0 * sv + s2 * w;
+        self.gu = gu.sub(uv_s.mul(2.0)).add(u.mul(s2));
+        self.gv = gv
+            .sub(s.mul(g0))
+            .sub(vv_s.mul(2.0))
+            .add(v.mul(s2))
+            .add(s.mul(2.0 * sv))
+            .sub(s.mul(s2 * w));
+
+        self.ab = ab - s.dot(au);
+        self.bb = bb - 2.0 * s.dot(bu) + s.dot(uu_s);
+        self.ag = ag - 2.0 * s.dot(av) + s2 * a0;
+        self.bg = bg - 2.0 * s.dot(bv) - s.dot(gu) + 2.0 * s.dot(uv_s) + s2 * b0
+            - s2 * su;
+        self.gg = gg - 4.0 * s.dot(gv) + 2.0 * s2 * g0 + 4.0 * s.dot(vv_s) - 4.0 * s2 * sv
+            + s2 * s2 * w;
+        // w, u, uu, a0, au, aa 在 V 平移下不变
+    }
+
     #[inline]
     fn a_mat(&self) -> M3 {
         [
@@ -555,41 +656,18 @@ impl Moments {
         if !(self.w > 0.0) {
             return None;
         }
+        fit_from_coef(&self.coef())
+    }
+
+    /// 给定 `θ` 在**无罚项**法方程上的残差平方和
+    /// `θᵀA₀θ + 2θᵀb₀ + c₀`（权重已含在内）。
+    ///
+    /// 半径罚项是局部线性化，越界时会把 `μ z²` 加进剖面常数；报告里的损失
+    /// 必须来自这个量，否则 `μ = 50Σw` 量级的罚项常数会混进 `P/Σw`，
+    /// 把 `σ_rel`（圆模型可信度）彻底带偏。
+    fn loss_at(&self, theta: &[S; 3]) -> S {
         let co = self.coef();
-        let chol = chol3(&co.a0)?;
-        let u = chol_solve(&chol, &co.b0); // u = A⁻¹ b, θ* = -u
-        let au = mv3(&co.a1, &u); // A' u
-        let s_bp = chol_solve(&chol, &co.b1); // A⁻¹ b'
-        let s_au = chol_solve(&chol, &au); // A⁻¹ A' u
-
-        let p = co.c0 - dot3(&co.b0, &u);
-        let p1 = co.c1 - 2.0 * dot3(&u, &co.b1) + dot3(&u, &au);
-
-        let bpp = [2.0 * co.b2[0], 2.0 * co.b2[1], 2.0 * co.b2[2]];
-        let app_u = mv3(&msc3(&co.a2, 2.0), &u);
-        let p2 = 2.0 * co.c2 - 2.0 * dot3(&co.b1, &s_bp) + 4.0 * dot3(&s_bp, &au)
-            - 2.0 * dot3(&u, &bpp)
-            - 2.0 * dot3(&au, &s_au)
-            + dot3(&u, &app_u);
-
-        if !p.is_finite() || !p1.is_finite() || !p2.is_finite() {
-            return None;
-        }
-        let theta = [-u[0], -u[1], -u[2]];
-        let center = V2::new(-0.5 * theta[0], -0.5 * theta[1]);
-        let r2 = center.norm2() - theta[2];
-        let radius = if r2 > 0.0 && r2.is_finite() {
-            r2.sqrt()
-        } else {
-            S::NAN
-        };
-        Some(Profile {
-            theta,
-            radius,
-            p,
-            p1,
-            p2,
-        })
+        co.c0 + 2.0 * dot3(theta, &co.b0) + dot3(theta, &mv3(&co.a0, theta))
     }
 }
 
@@ -614,6 +692,87 @@ struct Profile {
     p: S,
     p1: S,
     p2: S,
+}
+
+/// 半径伪观测 `μ (gᵀθ - z)²` 的线性化：在无约束解处取 `g`、`z`，在一个
+/// Newton 步（含线搜索）内保持不变，下一步再用新的解重新线性化。
+#[derive(Clone, Copy, Debug)]
+struct RadiusPenalty {
+    /// `R²(θ)` 的梯度。
+    g: [S; 3],
+    /// 目标约束 `gᵀθ = z`。
+    z: S,
+    /// 权重 `μ = r_kappa·Σw`。
+    mu: S,
+}
+
+/// 由剖面 Taylor 系数解出 `θ*`、`P`、`P'`、`P''`（`κ = 0` 处）。
+fn fit_from_coef(co: &Coef) -> Option<Profile> {
+    let chol = chol3(&co.a0)?;
+    let u = chol_solve(&chol, &co.b0); // u = A⁻¹ b, θ* = -u
+    let au = mv3(&co.a1, &u); // A' u
+    let s_bp = chol_solve(&chol, &co.b1); // A⁻¹ b'
+    let s_au = chol_solve(&chol, &au); // A⁻¹ A' u
+
+    let p = co.c0 - dot3(&co.b0, &u);
+    let p1 = co.c1 - 2.0 * dot3(&u, &co.b1) + dot3(&u, &au);
+
+    let bpp = [2.0 * co.b2[0], 2.0 * co.b2[1], 2.0 * co.b2[2]];
+    let app_u = mv3(&msc3(&co.a2, 2.0), &u);
+    let p2 = 2.0 * co.c2 - 2.0 * dot3(&co.b1, &s_bp) + 4.0 * dot3(&s_bp, &au)
+        - 2.0 * dot3(&u, &bpp)
+        - 2.0 * dot3(&au, &s_au)
+        + dot3(&u, &app_u);
+
+    if !p.is_finite() || !p1.is_finite() || !p2.is_finite() {
+        return None;
+    }
+    let theta = [-u[0], -u[1], -u[2]];
+    let center = V2::new(-0.5 * theta[0], -0.5 * theta[1]);
+    let r2 = center.norm2() - theta[2];
+    let radius = if r2 > 0.0 && r2.is_finite() {
+        r2.sqrt()
+    } else {
+        S::NAN
+    };
+    Some(Profile {
+        theta,
+        radius,
+        p,
+        p1,
+        p2,
+    })
+}
+
+/// 在 `m` 的当前参考 `k` 处求剖面；`pen` 非空时把线性化半径罚项加进
+/// 法方程：`A₀ += μggᵀ`、`b₀ -= μzg`、`c₀ += μz²`。
+///
+/// `g`、`z` 固定，所以 `P'`、`P''` 也是同一个带罚项剖面的导数，可以直接
+/// 拿去做 Newton 步和线搜索。
+fn fit_with_penalty(m: &Moments, pen: Option<RadiusPenalty>) -> Option<Profile> {
+    let Some(p) = pen else {
+        return m.fit();
+    };
+    let mut co = m.coef();
+    for i in 0..3 {
+        for j in 0..3 {
+            co.a0[i][j] += p.mu * p.g[i] * p.g[j];
+        }
+        co.b0[i] -= p.mu * p.z * p.g[i];
+    }
+    co.c0 += p.mu * p.z * p.z;
+    fit_from_coef(&co)
+}
+
+/// 物理 `V = V' + v_off` 的加权二阶矩 `Σw|V|² = g0 + 2 v_off·ΣwV' + w|v_off|²`。
+///
+/// 它与 `V` 的原点规范无关（`v_off` 怎么拆分都不变），所以 `recenter_v` 不会
+/// 让可观性/先验的尺度跳变。注意：这里**不用**中心化方差
+/// `Σw|V - V̄|²`——那会把 `V` 的积分偏移也当成“没有信息”去掉，1 mA 稳态下
+/// `R` 会被噪声推到 +17%（实测），因为它同时拿掉了先验里对漂移的阻尼。
+#[inline]
+fn v_second(m: &Moments, v_off: V2) -> S {
+    m.g0 + 2.0 * v_off.dot(m.v) + m.w * v_off.norm2()
 }
 
 // ===========================================================================
@@ -649,9 +808,21 @@ pub struct FitConfig {
     pub inner_iters: usize,
     /// 浮动原点阈值（内部单位）。
     pub recenter_eps: S,
+    /// `V` 原点管理的触发阈值：存储 `V'` 的加权均值超过 `RMS(V')` 的这个倍数时
+    /// 把它搬进 `v_off`。
+    ///
+    /// 论文对 U、V 共用一个长度阈值 `recenter_eps`；但 `V` 是“长度 / k”的积分，
+    /// 量纲与 `U` 不同，绝对阈值会随工况放大到几乎不可达（本仿真 8 s 时
+    /// `|V̄| ≈ 0.011`，而 `recenter_eps = 0.25`）。改用相对 RMS 的判据后：
+    /// 纯旋转的 `V`（`|V̄|/RMS ~ 1/(ωτ)`）不触发，只有直流偏置/启动偏移把均值
+    /// 推高时才触发。
+    pub recenter_v_rel: S,
     /// `P''` 的绝对下限。
     pub p2_eps: S,
     /// 半径伪观测权重（相对 `Σw`）。
+    ///
+    /// 半径越界时它是“把 `R²` 拉回 `[r_min², r_max²]`”的罚项权重；罚项加进
+    /// `M₀/b₀/c₀`，所以同时影响 `P`、`P'`、`P''`（Newton 步与线搜索）。
     pub r_kappa: S,
     /// 允许更新 `k` 所需的最小有效样本数（`Σw`）。
     pub min_weight: S,
@@ -682,6 +853,7 @@ impl Default for FitConfig {
             scan_obs_min: 1.0e-4,
             inner_iters: 2,
             recenter_eps: 0.25,
+            recenter_v_rel: 0.25,
             p2_eps: 1.0e-18,
             r_kappa: 50.0,
             min_weight: 8.0,
@@ -730,6 +902,9 @@ pub struct Report {
 ///
 /// 存储的 `(U, V)` 始终是“当前参考 `k`”下的量：`U_s = U + k_ref V`。因此
 /// 每拍求值都在 `κ = 0` 处进行，不需要组装 `Σ kʲ b_j`。
+///
+/// `V` 另外有一个原点偏移：物理 `V = v + v_off`。`v` 存的是搬掉加权均值后
+/// 的 `V'`，所以 `U_s` 仍是物理量，剪切时要补 `dk·v_off`。
 #[derive(Clone, Debug)]
 pub struct Tracker {
     cfg: FitConfig,
@@ -744,9 +919,12 @@ pub struct Tracker {
     k_initial: S,
     /// 当前样本在局部参考系中的位置 `U_s`。
     u: Vacc,
+    /// 当前样本的 `V'`（已搬掉原点；物理 `V = V' + v_off`）。
     v: Vacc,
     /// 局部原点在绝对（用户）坐标系中的位置。
     off: V2,
+    /// `V` 的原点偏移：物理 `V = v + v_off`。
+    v_off: V2,
     t_last: S,
     started: bool,
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
@@ -780,6 +958,7 @@ impl Tracker {
             u: Vacc::default(),
             v: Vacc::default(),
             off: V2::ZERO,
+            v_off: V2::ZERO,
             t_last: 0.0,
             started: false,
             path: 0.0,
@@ -811,6 +990,18 @@ impl Tracker {
     #[inline]
     pub fn off(&self) -> V2 {
         self.off
+    }
+
+    /// 物理 `V` 相对存储 `V'` 的原点偏移（内部单位）：`V = V' + v_off`。
+    #[inline]
+    pub fn v_off(&self) -> V2 {
+        self.v_off
+    }
+
+    /// 物理 `V` 的加权二阶矩 `Σw|V|²`（对 `recenter_v` 不变）。
+    #[inline]
+    fn v_second(&self) -> S {
+        v_second(&self.m, self.v_off)
     }
 
     /// 当前样本在局部参考系中的位置（内部单位）。
@@ -869,8 +1060,9 @@ impl Tracker {
         };
         self.m.add(ui, vi, q);
 
-        // 4. 浮动原点
+        // 4. 浮动原点：`U` 的质心归零、`V` 的加权均值归零
         self.recenter();
+        self.recenter_v();
 
         // 5. 变量投影 Newton（由调用方用 newton_iters 控制是否允许更新 k）
         self.steps = if newton_iters > 0 {
@@ -879,6 +1071,7 @@ impl Tracker {
             0
         };
         self.recenter();
+        self.recenter_v();
 
         self.report()
     }
@@ -895,9 +1088,8 @@ impl Tracker {
     /// `P(k) ≡ 0`，扫描找不到显著更优的点，于是保持初始 `k` 不动并返回
     /// `false`——调用方可以稍后重试（等真正的瞬态到来）。
     pub fn initialize(&mut self) -> bool {
-        let f_cur = match self.m.fit() {
-            Some(f) => f,
-            None => return false,
+        let Some((_, f_cur, _)) = self.fit_hinge(&self.m) else {
+            return false;
         };
         let lo = (self.k_initial / self.cfg.scan_rel.max(1.0)).max(self.cfg.k_min);
         let hi = (self.k_initial * self.cfg.scan_rel.max(1.0)).min(self.cfg.k_max);
@@ -912,9 +1104,9 @@ impl Tracker {
             if k == self.k {
                 continue;
             }
-            let mut m = self.m.clone();
-            m.shear(k - self.k);
-            if let Some(fit) = m.fit() {
+            // 扫描目标是**带半径罚项**的剖面：半径越界时不能去追一个
+            // 数据上更圆、但半径更越界的盆地。
+            if let Some((_, fit, _)) = self.fit_hinge_at(k) {
                 if fit.p.is_finite() && fit.p >= 0.0 && best.map_or(true, |(bp, _)| fit.p < bp) {
                     best = Some((fit.p, k));
                 }
@@ -931,22 +1123,24 @@ impl Tracker {
         }
         let mut m = self.m.clone();
         m.shear(k_best - self.k);
-        let fit = match m.fit() {
-            Some(f) => f,
-            None => return false,
+        let Some((_, _, f0_best)) = self.fit_hinge(&m) else {
+            return false;
         };
-        let scale = 4.0 * fit.radius * fit.radius * m.g0;
+        // 可辨识性与噪声门限只看**无约束**剖面：半径罚项是先验，不能替数据
+        // 证明“这个 k 是数据支持的”。
+        let v2 = v_second(&m, self.v_off);
+        let scale = 4.0 * f0_best.radius * f0_best.radius * v2;
         let obs = if scale > 0.0 && scale.is_finite() {
-            fit.p2 / scale
+            f0_best.p2 / scale
         } else {
             0.0
         };
-        if !obs.is_finite() || obs < self.cfg.scan_obs_min || !(m.g0 > 0.0) {
+        if !obs.is_finite() || obs < self.cfg.scan_obs_min || !(v2 > 0.0) {
             return false;
         }
         // 圆模型可信度：高噪声下“更优的盆地”只是噪声，不能把 k 带跑。
-        let sigma_rel = (fit.p.max(0.0) / m.w.max(1.0e-300)).sqrt()
-            / (2.0 * fit.radius.max(1.0e-12));
+        let sigma_rel = (f0_best.p.max(0.0) / m.w.max(1.0e-300)).sqrt()
+            / (2.0 * f0_best.radius.max(1.0e-12));
         if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
             return false;
         }
@@ -954,6 +1148,9 @@ impl Tracker {
         let dk = k_best - self.k;
         self.m.shear(dk);
         self.u.add(self.v.val().mul(dk));
+        // 物理 V = V' + v_off：历史与当前样本都要补上 dk·v_off。
+        self.u.add(self.v_off.mul(dk));
+        self.m.translate_u(self.v_off.mul(-dk));
         self.k = k_best;
         self.obs = obs;
         // 用较低的扫描门限把网格点抛光到局部极小；之后逐拍 Newton 仍用
@@ -979,11 +1176,75 @@ impl Tracker {
         self.off = self.off.add(s);
     }
 
-    /// 任意 `k` 处的剖面损失（拷贝矩 + 剪切 + 求值）。
-    fn p_at(&self, k: S) -> Option<S> {
+    /// `V` 的原点管理：存储 `V'` 的加权均值超过它自身 RMS 的
+    /// `recenter_v_rel` 倍时，把均值搬进 `v_off`（物理 `V = V' + v_off`）。
+    ///
+    /// 这是纯规范：`P(k)`、`k`、圆心、半径都不变；作用只是不让 `V = ∫i dt` 的
+    /// 积分漂移把 `M₁/M₂/q₁..q₃` 的量级撑大。阈值取相对量，纯旋转的 `V` 不会
+    /// 触发，只有积分漂移才会。
+    fn recenter_v(&mut self) {
+        let w = self.m.w;
+        if !(w > 0.0) {
+            return;
+        }
+        let c = self.m.v.mul(1.0 / w);
+        let rms = (self.m.g0 / w).sqrt();
+        if !c.finite() || !rms.is_finite() || c.norm() <= self.cfg.recenter_v_rel * rms {
+            return;
+        }
+        self.m.translate_v(c);
+        self.v.shift(c);
+        self.v_off = self.v_off.add(c);
+    }
+
+    /// 在 `m` 上先做无约束拟合；半径越界时把线性化罚项加进法方程再解一次。
+    ///
+    /// 返回 `(罚项, 带罚项解, 无约束解)`。两个解都在 `κ = 0` 处：可辨识性 /
+    /// 噪声门限用无约束解，Newton 步与线搜索用带罚项解。
+    fn fit_hinge(&self, m: &Moments) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
+        let f0 = m.fit()?;
+        match self.radius_penalty(&f0, m.w) {
+            None => Some((None, f0, f0)),
+            Some(pen) => {
+                let f = fit_with_penalty(m, Some(pen))?;
+                Some((Some(pen), f, f0))
+            }
+        }
+    }
+
+    /// 半径范围写成对 `θ` 的线性化伪观测 `gᵀθ = z`；`R²` 在范围内时返回 `None`。
+    ///
+    /// 只在越界时触发（hinge）：正常情况下完全不改变解。
+    fn radius_penalty(&self, f: &Profile, w: S) -> Option<RadiusPenalty> {
+        let r2 = 0.25 * (f.theta[0] * f.theta[0] + f.theta[1] * f.theta[1]) - f.theta[2];
+        let r2min = self.rmin_i * self.rmin_i;
+        let r2max = self.rmax_i * self.rmax_i;
+        if !r2.is_finite() || (r2 >= r2min && r2 <= r2max) {
+            return None;
+        }
+        let target = if r2 < r2min { r2min } else { r2max };
+        let g = [0.5 * f.theta[0], 0.5 * f.theta[1], -1.0];
+        let z = target - r2 + dot3(&g, &f.theta);
+        Some(RadiusPenalty {
+            g,
+            z,
+            mu: self.cfg.r_kappa * w.max(1.0e-300),
+        })
+    }
+
+    /// 任意 `k` 处的 `fit_hinge`（拷贝矩 + 剪切 + 求值）。
+    fn fit_hinge_at(&self, k: S) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
         let mut m = self.m.clone();
         m.shear(k - self.k);
-        m.fit().map(|f| f.p)
+        self.fit_hinge(&m)
+    }
+
+    /// 固定罚项的剖面损失。线搜索必须与 Newton 步用同一个目标，否则
+    /// “`P` 下降”与“带罚项 `P` 下降”会互相打架。
+    fn p_at_with_penalty(&self, k: S, pen: Option<RadiusPenalty>) -> Option<S> {
+        let mut m = self.m.clone();
+        m.shear(k - self.k);
+        fit_with_penalty(&m, pen).map(|f| f.p)
     }
 
     fn newton(&mut self, iters: usize) -> u32 {
@@ -994,15 +1255,18 @@ impl Tracker {
         let k_start = self.k;
         let mut taken = 0;
         for _ in 0..iters {
-            let f = match self.m.fit() {
-                Some(f) => f,
+            // 无约束解决定门限，带罚项解决定步长：半径越界时 Newton 会把 k
+            // 一起拉向可行域，而不是只把输出半径按到边界上。
+            let (pen, f, f0) = match self.fit_hinge(&self.m) {
+                Some(x) => x,
                 None => break,
             };
             // 满激励时 `P'' = 2Σw(∂r/∂k)² + ...`，而 `|∂r/∂k| <= 2R|V|`，
-            // 用 `4R²Σw|V|²` 作尺度得到无量纲可观性指数。
-            let scale = 4.0 * f.radius * f.radius * self.m.g0;
+            // 用 `4R²Σw|V|²` 作尺度得到无量纲可观性指数。门限一律用**无约束**
+            // 剖面：半径罚项只会增加曲率，不能拿它冒充“k 被数据辨识出来了”。
+            let scale = 4.0 * f0.radius * f0.radius * self.v_second();
             self.obs = if scale > 0.0 && scale.is_finite() {
-                f.p2 / scale
+                f0.p2 / scale
             } else {
                 0.0
             };
@@ -1010,8 +1274,8 @@ impl Tracker {
                 break;
             }
             // 高噪声下圆模型不成立：冻结 k，避免把噪声拟合进 R。
-            let sigma_rel = (f.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
-                / (2.0 * f.radius.max(1.0e-12));
+            let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
+                / (2.0 * f0.radius.max(1.0e-12));
             if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
                 break;
             }
@@ -1033,7 +1297,7 @@ impl Tracker {
                 break;
             }
 
-            // 回溯线搜索：只接受让真实 P 下降的步长。
+            // 回溯线搜索：只接受让**同一个（带罚项）目标**下降的步长。
             let p_cur = f.p;
             let mut s = step;
             let mut ok = false;
@@ -1042,7 +1306,7 @@ impl Tracker {
                 if k_try == self.k {
                     break;
                 }
-                match self.p_at(k_try) {
+                match self.p_at_with_penalty(k_try, pen) {
                     Some(pt) if pt.is_finite() && pt <= p_cur => {
                         s = k_try - self.k;
                         ok = true;
@@ -1060,9 +1324,11 @@ impl Tracker {
             if dk == 0.0 {
                 break;
             }
-            // 精确地把历史重新投影到新的 k。
+            // 精确地把历史重新投影到新的 k：存储的 `V'` 加上物理偏移 `v_off`。
             self.m.shear(dk);
             self.u.add(self.v.val().mul(dk));
+            self.u.add(self.v_off.mul(dk));
+            self.m.translate_u(self.v_off.mul(-dk));
             self.k = k_new;
             taken += 1;
             if dk.abs() < 1e-14 * (1.0 + self.k.abs()) {
@@ -1072,52 +1338,24 @@ impl Tracker {
         taken
     }
 
-    /// 半径软约束：把 `R² = |a|²/4 - d` 拉回 `[r_min², r_max²]`。
-    fn apply_radius(&self, theta: [S; 3]) -> ([S; 3], bool) {
-        let w = self.m.w;
-        if !(w > 0.0) {
-            return (theta, false);
-        }
-        let r2 = 0.25 * (theta[0] * theta[0] + theta[1] * theta[1]) - theta[2];
-        let r2min = self.rmin_i * self.rmin_i;
-        let r2max = self.rmax_i * self.rmax_i;
-        let target = if r2 < r2min {
-            r2min
-        } else if r2 > r2max {
-            r2max
-        } else {
-            return (theta, false);
-        };
-        let g = [0.5 * theta[0], 0.5 * theta[1], -1.0];
-        let z = target - r2 + dot3(&g, &theta);
-        let kappa = self.cfg.r_kappa * w;
-
-        let mut a = self.m.a_mat();
-        let mut b = self.m.b_vec();
-        for i in 0..3 {
-            for j in 0..3 {
-                a[i][j] += kappa * g[i] * g[j];
-            }
-            b[i] -= kappa * z * g[i];
-        }
-        match chol3(&a) {
-            Some(ch) => {
-                let u = chol_solve(&ch, &b);
-                ([-u[0], -u[1], -u[2]], true)
-            }
-            None => (theta, true),
-        }
-    }
-
     fn report(&self) -> Option<Report> {
-        let f = self.m.fit()?;
-        let scale = 4.0 * f.radius * f.radius * self.m.g0;
+        let f0 = self.m.fit()?;
+        let scale = 4.0 * f0.radius * f0.radius * v_second(&self.m, self.v_off);
         let obs = if scale > 0.0 && scale.is_finite() {
-            f.p2 / scale
+            f0.p2 / scale
         } else {
             0.0
         };
-        let (theta, clamped) = self.apply_radius(f.theta);
+        let pen = self.radius_penalty(&f0, self.m.w);
+        let (theta, clamped) = match pen {
+            None => (f0.theta, false),
+            Some(p) => match fit_with_penalty(&self.m, Some(p)) {
+                Some(f) => (f.theta, true),
+                // 罚项方程奇异时退回无约束解：宁可输出一个越界半径，
+                // 也不要丢掉这一拍的圆心 / 角度。
+                None => (f0.theta, false),
+            },
+        };
         let c = V2::new(-0.5 * theta[0], -0.5 * theta[1]);
         let r2 = c.norm2() - theta[2];
         if !(r2 > 0.0) || !r2.is_finite() {
@@ -1129,7 +1367,10 @@ impl Tracker {
         let dist = rel.norm();
         let l = self.unit_len;
         let w = self.m.w.max(1.0e-300);
-        let sigma_rel = (f.p.max(0.0) / w).sqrt() / (2.0 * r.max(1.0e-12));
+        // 损失与圆模型可信度都取**无罚项**残差（在约束后的 θ 上求值）：
+        // 罚项常数 μz² 不能混进 P/Σw，否则 `sigma_rel` 门限会失真。
+        let loss = self.m.loss_at(&theta);
+        let sigma_rel = (loss.max(0.0) / w).sqrt() / (2.0 * r.max(1.0e-12));
 
         Some(Report {
             k: self.k,
@@ -1138,11 +1379,11 @@ impl Tracker {
             p_rel: rel.mul(l),
             dist: dist * l,
             radial_err: (dist - r) * l,
-            loss: f.p / w,
+            loss: loss / w,
             sigma_rel,
             weight: self.m.w,
-            p1: f.p1,
-            p2: f.p2,
+            p1: f0.p1,
+            p2: f0.p2,
             obs,
             steps: self.steps,
             clamped,
@@ -1234,6 +1475,8 @@ pub struct KasaFluxObserver {
     pub radius_nominal: S,
     /// 是否已经被拟合圆心接管。
     pub use_fit: bool,
+    /// 最近一拍半径范围约束是否起作用（`Report::clamped`）。
+    pub radius_clamped: bool,
     /// 是否已经做过初始化网格扫描。
     pub scan_done: bool,
     /// 是否已允许 Newton 更新 `R`（首轮成熟扫描之后才打开）。
@@ -1291,6 +1534,7 @@ impl Default for KasaFluxObserver {
             r_nominal: 0.0,
             radius_nominal: 0.0,
             use_fit: false,
+            radius_clamped: false,
             scan_done: false,
             newton_enabled: false,
             scan_tries: 0,
@@ -1338,6 +1582,7 @@ impl KasaFluxObserver {
         self.arc = 0.0;
         self.narrowed = false;
         self.use_fit = false;
+        self.radius_clamped = false;
         self.scan_done = false;
         self.newton_enabled = false;
         self.scan_tries = 0;
@@ -1392,6 +1637,7 @@ impl KasaFluxObserver {
         tr.cfg.scan_gain = self.fit.scan_gain;
         tr.cfg.scan_points = self.fit.scan_points;
         tr.cfg.recenter_eps = self.fit.recenter_eps;
+        tr.cfg.recenter_v_rel = self.fit.recenter_v_rel;
         tr.cfg.p2_eps = self.fit.p2_eps;
         tr.cfg.r_kappa = self.fit.r_kappa;
     }
@@ -1491,11 +1737,14 @@ impl Observer<3> for KasaFluxObserver {
             self.p2 = rp.p2;
             self.sigma_rel = rp.sigma_rel;
             self.steps = rp.steps;
+            self.radius_clamped = rp.clamped;
             if rp.weight >= self.min_weight.max(self.fit.min_weight)
                 && (self.use_fit || self.data_arc >= self.min_arc)
             {
                 self.center = rp.center;
-                if rp.sigma_rel <= self.radius_sigma_rel {
+                // 半径罚项起作用时报告的是先验范围内的估计，不是噪声：
+                // 此时不应再被“高噪声保持旧半径”的门限挡住。
+                if rp.clamped || rp.sigma_rel <= self.radius_sigma_rel {
                     self.radius = rp.radius;
                 }
                 self.use_fit = true;
@@ -1820,6 +2069,212 @@ mod tests {
         }
         eprintln!("wrong-R angle: worst={:.4}rad r={:.3}", worst, ob.r);
         assert!(worst < 0.05, "worst angle error = {worst} rad");
+    }
+
+    /// 确定性的对称随机数（xorshift64），只为让“随机 U”可复现。
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+
+        fn sym(&mut self) -> S {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            2.0 * (x >> 11) as S / ((1u64 << 53) as S) - 1.0
+        }
+    }
+
+    /// 每个样本都满足 `p(k_true) = U + k_true·V` 严格落在半径 `r_true` 的圆上。
+    ///
+    /// 与论文 `radius_range_is_enforced` 同一构造：`U` 任意、`V = (p - U)/k`，
+    /// 所以数据对 `k_true` 绝对共圆。只喂增量，检验流式递推。
+    fn circle_stream(k_true: S, r_true: S, n: usize, seed: u64) -> Vec<(V2, V2)> {
+        let mut rng = XorShift::new(seed);
+        let (mut pu, mut pv) = (V2::ZERO, V2::ZERO);
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let th = i as S * 0.17;
+            let target = V2::new(r_true * th.cos(), r_true * th.sin());
+            let u = V2::new(1.5 * rng.sym(), 1.5 * rng.sym());
+            let v = target.sub(u).mul(1.0 / k_true);
+            out.push((u.sub(pu), v.sub(pv)));
+            pu = u;
+            pv = v;
+        }
+        out
+    }
+
+    fn config_for_range(r_min: S, r_max: S) -> FitConfig {
+        let mut cfg = FitConfig::default();
+        cfg.tau = 0.0; // 300 个样本的短窗口，不需要遗忘
+        cfg.r_min = r_min;
+        cfg.r_max = r_max;
+        cfg.k_min = -50.0;
+        cfg.k_max = 50.0;
+        cfg.obs_min = 0.0;
+        cfg.max_sigma_rel = 10.0;
+        cfg.k_prior_rel = 0.0;
+        cfg
+    }
+
+    /// 论文 §7 的半径伪观测必须进入**法方程/剖面**，而不只是修输出：
+    /// 数据真实半径 1.35、配置范围 [1.0,1.2] 时，Newton 后的半径贴在 1.2，
+    /// 且 `k` 被一起拉离无约束解。
+    #[test]
+    fn radius_penalty_enters_newton() {
+        let k_true = 0.7;
+        let r_true = 1.35;
+        let stream = circle_stream(k_true, r_true, 300, 0x5eed);
+
+        let mut tight = Tracker::new(config_for_range(1.0, 1.2), k_true);
+        for (i, (du, dv)) in stream.iter().enumerate() {
+            tight.update(*du, *dv, i as S * 0.01, 1.0, 0);
+        }
+        tight.newton(8);
+        let rep = tight.report_now().expect("report");
+        assert!(rep.clamped, "半径越界时罚项必须触发");
+        assert!(
+            (rep.radius - 1.2).abs() < 0.02,
+            "radius {} 应被拉到 r_max=1.2",
+            rep.radius
+        );
+
+        // 同一数据、同一初值的无约束对照。
+        let mut free = Tracker::new(config_for_range(0.3 * r_true, 3.0 * r_true), k_true);
+        for (i, (du, dv)) in stream.iter().enumerate() {
+            free.update(*du, *dv, i as S * 0.01, 1.0, 0);
+        }
+        free.newton(8);
+        let free_rep = free.report_now().expect("free report");
+        assert!(!free_rep.clamped);
+        assert!((free.k() - k_true).abs() < 1e-6, "free k={}", free.k());
+        assert!(
+            (free_rep.radius - r_true).abs() < 1e-6,
+            "free radius {}",
+            free_rep.radius
+        );
+        assert!(
+            (tight.k() - free.k()).abs() > 1.0e-3,
+            "罚项没有进入 Newton：tight k={} free k={}",
+            tight.k(),
+            free.k()
+        );
+
+        // 报告的损失必须是约束后 θ 上的**无罚项**残差：μz² 不能混进 P/Σw。
+        let w = tight.m.w;
+        let l = tight.unit_len();
+        let c = rep.center.mul(1.0 / l).sub(tight.off());
+        let r = rep.radius / l;
+        let theta = [-2.0 * c.x, -2.0 * c.y, c.norm2() - r * r];
+        let unpen = tight.m.loss_at(&theta);
+        assert!(
+            (unpen - rep.loss * w).abs() <= 1.0e-9 * (1.0 + unpen.abs()),
+            "loss={} 不是约束后 θ 的无罚项残差 {}",
+            rep.loss,
+            unpen / w
+        );
+        let f0 = tight.m.fit().unwrap();
+        let pen = tight.radius_penalty(&f0, w).expect("penalty");
+        let fpen = fit_with_penalty(&tight.m, Some(pen)).unwrap();
+        eprintln!(
+            "radius: tight k={:.4} R={:.4} | free k={:.4} R={:.4} | loss={:.3e} unpen={:.3e} pen_p={:.3e}",
+            tight.k(),
+            rep.radius,
+            free.k(),
+            free_rep.radius,
+            rep.loss,
+            unpen / w,
+            fpen.p / w
+        );
+        assert!(
+            fpen.p > unpen * 1.001,
+            "罚项常数没有体现在带罚项 P 上：{} vs {}",
+            fpen.p,
+            unpen
+        );
+    }
+
+    /// 给所有 `V_n` 加同一个常数只是把 `p_n(κ)` 平移 `κc`：`P`、`P'`、`P''`
+    /// 必须完全不变，`Σw|V - V̄|²` 也必须不变。这既是 V 原点管理（规范变换）
+    /// 的正确性依据，也是可观性指数用中心化方差的依据（模块文档 §4）。
+    #[test]
+    fn v_constant_offset_is_a_gauge() {
+        let c = V2::new(0.9, -1.4);
+        let (mut a, mut b) = (Moments::default(), Moments::default());
+        for i in 0..60u32 {
+            let t = i as S * 0.23;
+            let u = V2::new(1.3 * t.cos() + 0.2 * t.sin(), 1.3 * t.sin());
+            let v = V2::new(
+                0.35 * t.cos() + 0.15 * t.sin(),
+                0.3 * t.sin() - 0.1 * t.cos(),
+            );
+            a.add(u, v, 1.0);
+            b.add(u, v.add(c), 1.0);
+        }
+        let rel = |x: S, y: S| (x - y).abs() / (1.0 + x.abs().max(y.abs()));
+        // 物理 V 的二阶矩与原点拆分无关：把 b 的偏移 c 加回去应当等于 a 的 g0。
+        assert!(rel(v_second(&b, V2::new(-c.x, -c.y)), a.g0) < 1.0e-12);
+        for &k in &[0.0, 0.37, 1.1] {
+            let (mut ma, mut mb) = (a.clone(), b.clone());
+            ma.shear(k);
+            mb.shear(k);
+            let (fa, fb) = (ma.fit().unwrap(), mb.fit().unwrap());
+            assert!(rel(fa.p, fb.p) < 1.0e-12, "P 变了 (k={k})");
+            assert!(rel(fa.p1, fb.p1) < 1.0e-11, "P' 变了 (k={k})");
+            assert!(rel(fa.p2, fb.p2) < 1.0e-10, "P'' 变了 (k={k})");
+        }
+    }
+
+    #[test]
+    fn translate_v_matches_direct() {
+        let (mut a, mut samples) = (Moments::default(), Vec::new());
+        for k in 0..40u32 {
+            let t = k as S * 0.3;
+            let u = V2::new(t.cos() * 1.5 + 0.7, t.sin() * 1.5 - 0.4);
+            let v = V2::new(0.2 * t.cos() + 0.05 * t, -0.3 * t.sin() + 0.1);
+            a.add(u, v, 1.0);
+            samples.push((u, v));
+        }
+        let s = V2::new(0.63, -0.91);
+        a.translate_v(s);
+        let mut b = Moments::default();
+        for (u, v) in &samples {
+            b.add(*u, v.sub(s), 1.0);
+        }
+        assert_close(&a, &b, "translate_v", 1e-12);
+        assert!((a.g0 - b.g0).abs() < 1e-9);
+    }
+
+    /// `V = ∫i dt` 的常数偏移是规范：注入一个偏置后 `k` 仍须从 +25% 初值恢复到
+    /// 真值；`v_off` 负责把这个偏移从存储的 `V'` 里搬走。漏掉剪切时的
+    /// `dk·v_off` 修正，这个恢复就会偏。
+    #[test]
+    fn v_offset_does_not_break_k() {
+        let k_true = 0.7;
+        let r_true = 1.35;
+        let mut stream = circle_stream(k_true, r_true, 300, 0xc0ffee);
+        stream[0].1 = stream[0].1.add(V2::new(2.0, -1.0));
+
+        let mut tr = Tracker::new(config_for_range(0.3 * r_true, 3.0 * r_true), 1.25 * k_true);
+        for (i, (du, dv)) in stream.iter().enumerate() {
+            tr.update(*du, *dv, i as S * 0.01, 1.0, 2);
+        }
+        let rep = tr.report_now().expect("report");
+        eprintln!(
+            "v-offset: k={:.6} v_off={:?} R={:.4} obs={:.2e}",
+            tr.k(),
+            tr.v_off(),
+            rep.radius,
+            tr.obs()
+        );
+        assert!((tr.k() - k_true).abs() < 1.0e-3, "k={}", tr.k());
+        assert!(tr.v_off().norm() > 0.5, "v_off 没生效: {:?}", tr.v_off());
+        assert!((rep.radius - r_true).abs() < 1.0e-3, "R={}", rep.radius);
     }
 
     fn assert_close(a: &Moments, b: &Moments, what: &str, tol: S) {
