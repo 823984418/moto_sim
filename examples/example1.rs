@@ -1469,6 +1469,11 @@ fn run_headless(args: &[String]) {
     let dead_scale = arg_f64(args, "--dead-scale", 1.0);
     let current_noise = arg_value(args, "--current-noise").and_then(|s| s.parse::<f64>().ok());
     let speed_ramp = arg_f64(args, "--speed-ramp", 1000.0);
+    // 调试用速度阶跃：`--speed2/--speed3` + 生效时刻，用来复现“先加速再减速”。
+    let speed2 = arg_f64(args, "--speed2", f64::NAN);
+    let speed2_time = arg_f64(args, "--speed2-time", 1.0);
+    let speed3 = arg_f64(args, "--speed3", f64::NAN);
+    let speed3_time = arg_f64(args, "--speed3-time", 3.0);
     let speed_kp = arg_f64(args, "--speed-kp", 0.1);
     let speed_ki = arg_f64(args, "--speed-ki", 0.1);
     let load = arg_value(args, "--load").and_then(|s| s.parse::<f64>().ok());
@@ -1587,6 +1592,13 @@ fn run_headless(args: &[String]) {
     let mut last_print = 0.0;
 
     for k in 0..steps {
+        let t_step = k as f64 * dt;
+        if speed2.is_finite() && t_step >= speed2_time {
+            sim.cmd_speed = speed2;
+        }
+        if speed3.is_finite() && t_step >= speed3_time {
+            sim.cmd_speed = speed3;
+        }
         if (use_flux_circle || use_kasa) && !observe_only && handover > 0.0 {
             sim.use_observer = if (k as f64) * dt >= handover {
                 closed_loop_idx
