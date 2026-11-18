@@ -1081,6 +1081,79 @@ impl Tracker {
         self.report()
     }
 
+    /// 把**最新样本**搬到局部原点：`U_s -> U_s - u`、`V' -> V' - v`。
+    ///
+    /// 两个平移都是精确变换；`off` / `v_off` 累加被搬走的偏移，绝对坐标诊断
+    /// 不受影响。之后 `p_local() == 0`，下一个周期的增量从 0 起算。
+    fn recenter_latest(&mut self) {
+        let (ui, vi) = (self.u.val(), self.v.val());
+        if !ui.finite() || !vi.finite() || (ui.norm2() == 0.0 && vi.norm2() == 0.0) {
+            return;
+        }
+        self.m.translate_u(ui);
+        self.m.translate_v(vi);
+        self.u.shift(ui);
+        self.v.shift(vi);
+        self.off = self.off.add(ui);
+        self.v_off = self.v_off.add(vi);
+    }
+
+    /// 一个降采样周期：积分增量入矩 → 最新样本搬原点 → **一次**带可观性权重
+    /// 的 Newton → 再搬一次原点。返回 `(报告, 局部圆心)`。
+    ///
+    /// `delta_u` / `delta_v` 是快速环自上个周期以来对 `s0` 与 `i` 的积分（用户
+    /// 单位），`weight` 是这段时间内 `Σ(slope_dt/Δt)²`。
+    pub fn step_once(
+        &mut self,
+        delta_u: V2,
+        delta_v: V2,
+        t: S,
+        weight: S,
+    ) -> Option<(Report, V2)> {
+        // 1. 遗忘（按降采样时间推进）
+        let rho = if self.cfg.tau > 0.0 {
+            if self.started {
+                (-(t - self.t_last).max(0.0) / self.cfg.tau).exp()
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        self.t_last = t;
+        self.started = true;
+        self.m.decay(rho);
+
+        // 2. 积分增量入矩（内部单位）
+        let inv = 1.0 / self.unit_len;
+        let du = delta_u.mul(inv);
+        let dv = delta_v.mul(inv);
+        let du_s = du.add(dv.mul(self.k));
+        self.u.add(du_s);
+        self.v.add(dv);
+        self.path += du_s.norm();
+
+        let (ui, vi) = (self.u.val(), self.v.val());
+        let q = if weight.is_finite() && weight > 0.0 {
+            weight
+        } else {
+            1.0
+        };
+        self.m.add(ui, vi, q);
+
+        // 3. 最新样本搬到原点（U 与 V 各一次精确平移）
+        self.recenter_latest();
+
+        // 4. 恰好一次 Newton；可观性只缩放步长，不硬冻结
+        self.steps = self.newton_weighted();
+
+        // 5. Newton 的剪切把样本挪到了 dk·v_off；再搬一次原点，保证下一周期
+        //    的增量从 0 开始。
+        self.recenter_latest();
+
+        self.report_pair()
+    }
+
     /// 初始化网格扫描：在 `[k0/scan_rel, k0·scan_rel]` 上取对数网格，选剖面
     /// 损失最小且曲率为正的点，把矩剪切过去，然后跑几步 Newton。
     ///
@@ -1248,6 +1321,19 @@ impl Tracker {
     }
 
     fn newton(&mut self, iters: usize) -> u32 {
+        self.newton_impl(iters, false)
+    }
+
+    /// 降采样周期的单次 Newton：`obs` 只做**步长系数**
+    /// `w = clamp(|obs|/obs_min,0,1)²`，不设任何基于 `obs` 或 `sigma` 的冻结门限。
+    ///
+    /// 稳态 `obs→0` 时步长→0（近似慢冻结），瞬态 `obs≥obs_min` 时全步。
+    /// 保留 `newton()` 的旧行为（硬门限）做对照。
+    fn newton_weighted(&mut self) -> u32 {
+        self.newton_impl(1, true)
+    }
+
+    fn newton_impl(&mut self, iters: usize, weighted: bool) -> u32 {
         // 3 个有效样本必共圆，`k` 没有信息。
         if self.m.w < self.cfg.min_weight {
             return 0;
@@ -1270,14 +1356,36 @@ impl Tracker {
             } else {
                 0.0
             };
-            if !self.obs.is_finite() || self.obs < self.cfg.obs_min {
+            let w_obs = if weighted {
+                if !self.obs.is_finite() {
+                    break;
+                }
+                // `obs < 0` 表示当前点剖面是凹的；先验项会把分母拉正，等价于
+                // 一个下坡梯度步，再由线搜索兜底。
+                //
+                // 用平方而不是线性：线性权重在 1 mA 稳态（obs≈4e-5、obs_min=5e-3）
+                // 仍会累积 +1.6%/8 s 的 R 漂移；平方后压到 <0.1%，而瞬态
+                // （obs≥obs_min）仍然是全步。线性版本保留在这个注释里供对比：
+                // `let w = (obs/obs_min).clamp(0,1);`
+                let w = (self.obs.abs() / self.cfg.obs_min.max(1.0e-12)).clamp(0.0, 1.0);
+                w * w
+            } else {
+                if !self.obs.is_finite() || self.obs < self.cfg.obs_min {
+                    break;
+                }
+                1.0
+            };
+            if w_obs <= 0.0 {
                 break;
             }
-            // 高噪声下圆模型不成立：冻结 k，避免把噪声拟合进 R。
-            let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
-                / (2.0 * f0.radius.max(1.0e-12));
-            if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
-                break;
+            // 噪声不再作为门限：直接观测器只让可观性缩放步长。
+            // 旧 Kåsa 的非加权路径仍保留 sigma 硬门限（它与本观测器的设计不同）。
+            if !weighted {
+                let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
+                    / (2.0 * f0.radius.max(1.0e-12));
+                if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
+                    break;
+                }
             }
 
             // 随机游走先验：等价于给法方程加阻尼。以本拍起点为参考，
@@ -1287,7 +1395,7 @@ impl Tracker {
             if !denom.is_finite() || denom <= self.cfg.p2_eps {
                 break;
             }
-            let mut step = -(f.p1 + 2.0 * prior * (self.k - k_start)) / denom;
+            let mut step = -(f.p1 + 2.0 * prior * (self.k - k_start)) / denom * w_obs;
             if !step.is_finite() {
                 break;
             }
@@ -1339,6 +1447,12 @@ impl Tracker {
     }
 
     fn report(&self) -> Option<Report> {
+        self.report_pair().map(|(r, _)| r)
+    }
+
+    /// 报告 + **局部圆心**：后者是当前参考 `k` 下、以最新样本为原点（内部
+    /// 单位）的拟合圆心，供快速环做“目标相对圆心”。
+    fn report_pair(&self) -> Option<(Report, V2)> {
         let f0 = self.m.fit()?;
         let scale = 4.0 * f0.radius * f0.radius * v_second(&self.m, self.v_off);
         let obs = if scale > 0.0 && scale.is_finite() {
@@ -1372,7 +1486,7 @@ impl Tracker {
         let loss = self.m.loss_at(&theta);
         let sigma_rel = (loss.max(0.0) / w).sqrt() / (2.0 * r.max(1.0e-12));
 
-        Some(Report {
+        Some((Report {
             k: self.k,
             radius: r * l,
             center: c.add(self.off).mul(l),
@@ -1387,7 +1501,7 @@ impl Tracker {
             obs,
             steps: self.steps,
             clamped,
-        })
+        }, c))
     }
 }
 
@@ -1498,7 +1612,7 @@ impl Default for KasaFluxObserver {
         Self {
             fit: FitConfig::default(),
             fit_enabled: true,
-            radius_scale: (0.3, 3.0),
+            radius_scale: (0.1, 10.0),
             k_scale: (0.1, 10.0),
             min_arc: 2.0 * std::f64::consts::PI,
             min_weight: 8.0,

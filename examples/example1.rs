@@ -17,6 +17,7 @@ use moto_sim::simulation::controller::observer::ex_flux_observer::ExFluxObserver
 use moto_sim::simulation::controller::observer::flux_circle_observer::FluxCircleObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
+use moto_sim::simulation::controller::observer::direct_flux_observer::DirectFluxObserver;
 use moto_sim::simulation::controller::observer::kasa_flux_observer::KasaFluxObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
 use moto_sim::simulation::controller::observer::mp_observer::MpObserver;
@@ -127,6 +128,7 @@ pub struct Simulation {
     all_observer_output: ObserverOutput,
     pub flux_circle_observer_output: ObserverOutput,
     pub kasa_flux_observer_output: ObserverOutput,
+    pub direct_flux_observer_output: ObserverOutput,
 
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
@@ -152,6 +154,7 @@ pub struct Simulation {
     pub all_observer: AllObserver,
     pub flux_circle_observer: FluxCircleObserver,
     pub kasa_flux_observer: KasaFluxObserver,
+    pub direct_flux_observer: DirectFluxObserver,
 
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
@@ -351,6 +354,16 @@ impl Simulation {
         kasa_flux_observer.pll_wn_min = 50.0;
         kasa_flux_observer.fit.tau = 1.0;
 
+        // 直接磁链积分观测器（无 PLL，快速环反正切 + 10 ms 圆拟合）。
+        let mut direct_flux_observer = DirectFluxObserver::new();
+        direct_flux_observer.set_initial(
+            initial_electrical_angle,
+            0.0,
+            nominal_r * 0.2,
+            nominal_radius,
+        );
+        direct_flux_observer.fit.tau = 10.0;
+
         Self {
             delta_time: 0.0001,
             timer: Timer::new(vec![1e-7, 1.0 / 20e3]),
@@ -422,6 +435,7 @@ impl Simulation {
             all_observer,
             flux_circle_observer,
             kasa_flux_observer,
+            direct_flux_observer,
             dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
@@ -621,6 +635,9 @@ impl Simulation {
                     self.kasa_flux_observer_output = self
                         .kasa_flux_observer
                         .update(delta_time, &self.observer_input);
+                    self.direct_flux_observer_output = self
+                        .direct_flux_observer
+                        .update(delta_time, &self.observer_input);
 
                     let use_observer = match self.use_observer {
                         0 => &self.sensor_observer_output,
@@ -637,6 +654,7 @@ impl Simulation {
                         11 => &self.all_observer_output,
                         12 => &self.flux_circle_observer_output,
                         13 => &self.kasa_flux_observer_output,
+                        14 => &self.direct_flux_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
@@ -664,7 +682,7 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 0.0
+                            id + 0.1
                                 * f64::cos(
                                     use_observer.electrical_angle - self.res_tune.tune_angle,
                                 ),
@@ -687,7 +705,7 @@ impl Simulation {
                         self.current_regulator_input.electrical_angle,
                     ));
                     let inject_voltage =
-                        inverse_clarke(rotate([00.0, 0.0], 5000.0 * self.timer.time));
+                        inverse_clarke(rotate([0.0, 0.0], 5000.0 * self.timer.time));
                     command_voltage[0] += inject_voltage[0];
                     command_voltage[1] += inject_voltage[1];
                     command_voltage[2] += inject_voltage[2];
@@ -815,18 +833,18 @@ impl Application {
                     // ScopeData::new("sensor_angle", |s: &mut Simulation| {
                     //     s.sensor_observer_output.electrical_angle
                     // }),
-                    ScopeData::new("flux_angle", |s: &mut Simulation| {
-                        s.flux_observer_output.electrical_angle
-                    }),
-                    ScopeData::new("grad_angle", |s: &mut Simulation| {
-                        s.grad_observer_output.electrical_angle
-                    }),
-                    ScopeData::new("mix_angle", |s: &mut Simulation| {
-                        s.mix_observer_output.electrical_angle
-                    }),
-                    ScopeData::new("mp_angle", |s: &mut Simulation| {
-                        s.mp_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("flux_angle", |s: &mut Simulation| {
+                    //     s.flux_observer_output.electrical_angle
+                    // }),
+                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
+                    //     s.grad_observer_output.electrical_angle
+                    // }),
+                    // ScopeData::new("mix_angle", |s: &mut Simulation| {
+                    //     s.mix_observer_output.electrical_angle
+                    // }),
+                    // ScopeData::new("mp_angle", |s: &mut Simulation| {
+                    //     s.mp_observer_output.electrical_angle
+                    // }),
                     // ScopeData::new("ds_angle", |s: &mut Simulation| {
                     //     s.ds_observer_output.electrical_angle
                     // }),
@@ -845,14 +863,17 @@ impl Application {
                     // ScopeData::new("ss2_angle", |s: &mut Simulation| {
                     //     s.ss2_observer_output.electrical_angle
                     // }),
-                    ScopeData::new("all_angle", |s: &mut Simulation| {
-                        s.all_observer_output.electrical_angle
-                    }),
+                    // ScopeData::new("all_angle", |s: &mut Simulation| {
+                    //     s.all_observer_output.electrical_angle
+                    // }),
                     ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
                         s.flux_circle_observer_output.electrical_angle
                     }),
                     ScopeData::new("kasa_angle", |s: &mut Simulation| {
                         s.kasa_flux_observer_output.electrical_angle
+                    }),
+                    ScopeData::new("direct_angle", |s: &mut Simulation| {
+                        s.direct_flux_observer_output.electrical_angle
                     }),
                 ],
             ),
@@ -925,12 +946,12 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
-                    ScopeData::new("all_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.all_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
+                    // ScopeData::new("all_angle", |s: &mut Simulation| {
+                    //     angle_normal(
+                    //         s.all_observer_output.electrical_angle
+                    //             - s.motion_load.angle * s.motor.pole_pairs,
+                    //     )
+                    // }),
                     ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
                         angle_normal(
                             s.flux_circle_observer_output.electrical_angle
@@ -947,6 +968,19 @@ impl Application {
                     ScopeData::new("kasa_meas", |s: &mut Simulation| {
                         angle_normal(
                             s.kasa_flux_observer.theta_meas
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    // 直接磁链：输出角误差与未滤波的反正切角误差（无 PLL）。
+                    ScopeData::new("direct_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.direct_flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("direct_meas", |s: &mut Simulation| {
+                        angle_normal(
+                            s.direct_flux_observer.theta_meas
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
@@ -991,14 +1025,17 @@ impl Application {
                     // ScopeData::new("ss2_speed", |s: &mut Simulation| {
                     //     s.ss2_observer_output.electrical_speed
                     // }),
-                    ScopeData::new("all_speed", |s: &mut Simulation| {
-                        s.all_observer_output.electrical_speed
-                    }),
+                    // ScopeData::new("all_speed", |s: &mut Simulation| {
+                    //     s.all_observer_output.electrical_speed
+                    // }),
                     ScopeData::new("flux_circle_speed", |s: &mut Simulation| {
                         s.flux_circle_observer_output.electrical_speed
                     }),
                     ScopeData::new("kasa_speed", |s: &mut Simulation| {
                         s.kasa_flux_observer_output.electrical_speed
+                    }),
+                    ScopeData::new("direct_speed", |s: &mut Simulation| {
+                        s.direct_flux_observer_output.electrical_speed
                     }),
                 ],
             ),
@@ -1075,27 +1112,29 @@ impl Application {
                     }),
                 ],
             ),
-            (
-                "sdq".to_string(),
-                vec![
-                    ScopeData::new("sd", |s: &mut Simulation| s.mix_observer.sync_speed_lp[0]),
-                    ScopeData::new("sq", |s: &mut Simulation| s.mix_observer.sync_speed_lp[1]),
-                ],
-            ),
-            (
-                "ex_flux".to_string(),
-                vec![
-                    ScopeData::new("x", |s: &mut Simulation| s.base_flux_observer.x[0]),
-                    ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.x[1]),
-                ],
-            ),
-            (
-                "ex_fluxx".to_string(),
-                vec![
-                    ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.y),
-                    ScopeData::new("y_lp", |s: &mut Simulation| s.base_flux_observer.omega_l),
-                ],
-            ),
+            // 以下 sdq / ex_flux / ex_fluxx 属于旧观测器（mix_observer、base_flux_observer），
+            // 与当前直接磁链工作无关，先注释掉。
+            // (
+            //     "sdq".to_string(),
+            //     vec![
+            //         ScopeData::new("sd", |s: &mut Simulation| s.mix_observer.sync_speed_lp[0]),
+            //         ScopeData::new("sq", |s: &mut Simulation| s.mix_observer.sync_speed_lp[1]),
+            //     ],
+            // ),
+            // (
+            //     "ex_flux".to_string(),
+            //     vec![
+            //         ScopeData::new("x", |s: &mut Simulation| s.base_flux_observer.x[0]),
+            //         ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.x[1]),
+            //     ],
+            // ),
+            // (
+            //     "ex_fluxx".to_string(),
+            //     vec![
+            //         ScopeData::new("y", |s: &mut Simulation| s.base_flux_observer.y),
+            //         ScopeData::new("y_lp", |s: &mut Simulation| s.base_flux_observer.omega_l),
+            //     ],
+            // ),
             (
                 "rs".to_string(),
                 vec![
@@ -1107,9 +1146,9 @@ impl Application {
                     //     s.super_flux_observer.rs
                     // }),
                     // ScopeData::new("ss2_observer", |s: &mut Simulation| s.ss2_observer.rs_est),
-                    ScopeData::new("all_observer", |s: &mut Simulation| {
-                        s.all_observer.any_observer.resistor
-                    }),
+                    // ScopeData::new("all_observer", |s: &mut Simulation| {
+                    //     s.all_observer.any_observer.resistor
+                    // }),
                 ],
             ),
             (
@@ -1137,9 +1176,9 @@ impl Application {
                     //     s.super_flux_observer.inductance
                     // }),
                     // ScopeData::new("ss2_observer", |s: &mut Simulation| s.ss2_observer.l0_est),
-                    ScopeData::new("all_observer", |s: &mut Simulation| {
-                        s.all_observer.any_observer.inductor
-                    }),
+                    // ScopeData::new("all_observer", |s: &mut Simulation| {
+                    //     s.all_observer.any_observer.inductor
+                    // }),
                 ],
             ),
             (
@@ -1150,7 +1189,7 @@ impl Application {
                     }),
                     // ScopeData::new("grad_l1", |s: &mut Simulation| s.grad_observer.l1),
                     // ScopeData::new("ss_observer", |s: &mut Simulation| s.ss_observer.l1_est),
-                    ScopeData::new("ss2_observer", |s: &mut Simulation| s.ss2_observer.l1_est),
+                    // ScopeData::new("ss2_observer", |s: &mut Simulation| s.ss2_observer.l1_est),
                 ],
             ),
             (
@@ -1163,9 +1202,9 @@ impl Application {
                     //     s.super_flux_observer.flux
                     // }),
                     // ScopeData::new("ss2_observer", |s: &mut Simulation| s.ss2_observer.flux_est),
-                    ScopeData::new("all_observer", |s: &mut Simulation| {
-                        s.all_observer.any_observer.flux
-                    }),
+                    // ScopeData::new("all_observer", |s: &mut Simulation| {
+                    //     s.all_observer.any_observer.flux
+                    // }),
                 ],
             ),
             (
@@ -1230,6 +1269,60 @@ impl Application {
                     }),
                     ScopeData::new("estimated_radius", |s: &mut Simulation| {
                         s.kasa_flux_observer.radius
+                    }),
+                ],
+            ),
+            (
+                "direct_flux".to_string(),
+                vec![
+                    ScopeData::new("true_R", |s: &mut Simulation| {
+                        s.motor.rs / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
+                    }),
+                    ScopeData::new("R", |s: &mut Simulation| s.direct_flux_observer.r),
+                    ScopeData::new("R_fit", |s: &mut Simulation| {
+                        s.direct_flux_observer.r_fit
+                    }),
+                    ScopeData::new("radius", |s: &mut Simulation| {
+                        s.direct_flux_observer.radius
+                    }),
+                    ScopeData::new("radius_fit", |s: &mut Simulation| {
+                        s.direct_flux_observer.radius_fit
+                    }),
+                    ScopeData::new("obs", |s: &mut Simulation| s.direct_flux_observer.obs),
+                    ScopeData::new("steps", |s: &mut Simulation| {
+                        s.direct_flux_observer.steps as f64
+                    }),
+                ],
+            ),
+            (
+                "direct_flux_mag".to_string(),
+                vec![
+                    ScopeData::new("flux_mag", |s: &mut Simulation| {
+                        s.direct_flux_observer.flux_mag
+                    }),
+                    ScopeData::new("radius", |s: &mut Simulation| {
+                        s.direct_flux_observer.radius
+                    }),
+                ],
+            ),
+            (
+                "direct_flux_valid".to_string(),
+                vec![
+                    ScopeData::new("valid", |s: &mut Simulation| {
+                        if s.direct_flux_observer.valid {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }),
+                    ScopeData::new("weight", |s: &mut Simulation| {
+                        s.direct_flux_observer.weight
+                    }),
+                    ScopeData::new("data_arc", |s: &mut Simulation| {
+                        s.direct_flux_observer.data_arc
+                    }),
+                    ScopeData::new("sigma_rel", |s: &mut Simulation| {
+                        s.direct_flux_observer.sigma_rel
                     }),
                 ],
             ),
@@ -1341,7 +1434,7 @@ impl App for Application {
                 ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=13).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=14).ui(ui);
                 ui.label(match self.simulation.use_observer {
                     0 => "sensor_observer",
                     1 => "grad_observer",
@@ -1357,6 +1450,7 @@ impl App for Application {
                     11 => "all_observer",
                     12 => "flux_circle_observer",
                     13 => "kasa_flux_observer",
+                    14 => "direct_flux_observer",
                     _ => "sensor_observer",
                 });
                 if ui
@@ -1479,6 +1573,7 @@ fn run_headless(args: &[String]) {
     let load = arg_value(args, "--load").and_then(|s| s.parse::<f64>().ok());
     let use_flux_circle = args.iter().any(|a| a == "--use-flux-circle");
     let use_kasa = args.iter().any(|a| a == "--use-kasa");
+    let use_direct = args.iter().any(|a| a == "--use-direct");
     // 观测器只做旁观（电流环仍用传感器角），用来单独评价观测器。
     let observe_only = args.iter().any(|a| a == "--observe-only");
     let handover = arg_f64(args, "--handover", 0.0);
@@ -1502,7 +1597,13 @@ fn run_headless(args: &[String]) {
     let warmup_fraction = arg_f64(args, "--warmup", 0.5).clamp(0.0, 0.99);
     let csv = arg_value(args, "--csv").map(|s| s.to_string());
     let verbose = args.iter().any(|a| a == "--verbose");
-    let closed_loop_idx = if use_kasa { 13 } else { 12 };
+    let closed_loop_idx = if use_direct {
+        14
+    } else if use_kasa {
+        13
+    } else {
+        12
+    };
 
     let dt = 1.0 / 20e3;
     let mut sim = Simulation::new();
@@ -1526,7 +1627,7 @@ fn run_headless(args: &[String]) {
     if let Some(torque) = load {
         sim.motion_load.static_friction_torque = torque;
     }
-    if (use_flux_circle || use_kasa) && !observe_only {
+    if (use_flux_circle || use_kasa || use_direct) && !observe_only {
         // 默认从 0 秒就闭环；--handover 可先让传感器闭环把转子带到低速，
         // 再交班给观测器（对应 PAPER.md §7 的 RUN 阶段）。
         sim.use_observer = if handover > 0.0 { 0 } else { closed_loop_idx };
@@ -1563,10 +1664,22 @@ fn run_headless(args: &[String]) {
     sim.kasa_flux_observer.min_arc = kasa_min_arc;
     sim.kasa_flux_observer.fit_enabled = !no_fit;
 
+    sim.direct_flux_observer
+        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
+    sim.direct_flux_observer.fit.tau = kasa_tau;
+    sim.direct_flux_observer.fit.obs_min = kasa_obs_min;
+    sim.direct_flux_observer.fit.k_step_rel = kasa_step;
+
     let steps = (seconds / dt).round() as usize;
     let warmup_steps = (steps as f64 * warmup_fraction) as usize;
 
-    let mut csv_writer = csv.as_ref().map(|path| {
+    let mut csv_writer = if use_direct {
+        if csv.is_some() {
+            eprintln!("--csv 还没有为 --use-direct 接线，忽略导岀。");
+        }
+        None
+    } else {
+        csv.as_ref().map(|path| {
         let file = std::fs::File::create(path).expect("create csv");
         let mut writer = std::io::BufWriter::new(file);
         if use_kasa {
@@ -1583,7 +1696,8 @@ fn run_headless(args: &[String]) {
             .unwrap();
         }
         writer
-    });
+    })
+    };
 
     let mut startup = Metrics::default();
     let mut steady = Metrics::default();
@@ -1599,7 +1713,7 @@ fn run_headless(args: &[String]) {
         if speed3.is_finite() && t_step >= speed3_time {
             sim.cmd_speed = speed3;
         }
-        if (use_flux_circle || use_kasa) && !observe_only && handover > 0.0 {
+        if (use_flux_circle || use_kasa || use_direct) && !observe_only && handover > 0.0 {
             sim.use_observer = if (k as f64) * dt >= handover {
                 closed_loop_idx
             } else {
@@ -1611,7 +1725,17 @@ fn run_headless(args: &[String]) {
         let true_angle = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
         let true_speed = sim.motion_load.speed * sim.motor.pole_pairs;
 
-        let (out, obs_r, obs_radius, obs_index, valid, theta_meas) = if use_kasa {
+        let (out, obs_r, obs_radius, obs_index, valid, theta_meas) = if use_direct {
+            let o = &sim.direct_flux_observer;
+            (
+                sim.direct_flux_observer_output.clone(),
+                o.r,
+                o.radius,
+                o.obs,
+                o.valid,
+                o.theta_meas,
+            )
+        } else if use_kasa {
             let o = &sim.kasa_flux_observer;
             (
                 sim.kasa_flux_observer_output.clone(),
@@ -1731,6 +1855,17 @@ fn run_headless(args: &[String]) {
              narrow_time={narrow_time} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
             current_noise.unwrap_or(0.01),
         );
+    } else if use_direct {
+        println!("=== direct flux observer (headless) ===");
+        println!(
+            "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
+             slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
+             tau={kasa_tau} obs_min={kasa_obs_min:.1e} prior={kasa_prior} step={kasa_step} \
+             sigma_rel={kasa_max_sigma:.3} fit_period={:.4} speed_kp={speed_kp} \
+             speed_ki={speed_ki} handover={handover}",
+            current_noise.unwrap_or(0.01),
+            sim.direct_flux_observer.fit_period,
+        );
     } else {
         println!("=== flux circle observer (headless) ===");
         println!(
@@ -1780,6 +1915,25 @@ fn run_headless(args: &[String]) {
         println!(
             "use_fit={} fit_updates={} updates={} valid={}",
             o.use_fit, o.fit_updates, o.updates, o.valid
+        );
+    } else if use_direct {
+        let o = &sim.direct_flux_observer;
+        println!(
+            "observer: r={:.3} ({:+.2}%) r_fit={:.3} radius={:.4} ({:+.2}%) radius_fit={:.4} obs={:.3e} sigma_rel={:.3e} weight={:.0} steps={} fits={} updates={} valid={} slope_dt={:.2}us",
+            o.r,
+            100.0 * (o.r - nominal_r) / nominal_r,
+            o.r_fit,
+            o.radius,
+            100.0 * (o.radius - nominal_radius) / nominal_radius,
+            o.radius_fit,
+            o.obs,
+            o.sigma_rel,
+            o.weight,
+            o.steps,
+            o.fit_updates,
+            o.updates,
+            o.valid,
+            sim.last_slope_dt * 1.0e6,
         );
     } else {
         println!(

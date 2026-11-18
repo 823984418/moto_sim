@@ -1,5 +1,6 @@
 pub mod any_observer;
 pub mod base_flux_observer;
+pub mod direct_flux_observer;
 pub mod ds_observer;
 pub mod ex_flux_observer;
 pub mod flux_circle_observer;
