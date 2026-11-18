@@ -1123,7 +1123,7 @@ $$
 
 ### 9.6 斜率传感器模型
 
-`examples/example1.rs` 中的合成代码：
+`../examples/example1.rs` 中的合成代码：
 
 ```rust
 let theta_e = self.motion_load.angle * self.motor.pole_pairs;
@@ -1160,7 +1160,7 @@ $$
 
 ### 9.7 GUI 与无界面模式
 
-`examples/example1.rs` 新增：
+`../examples/example1.rs` 新增：
 
 - `use_observer=12`：选中 `flux_circle_observer`；
 - 复选框 **flux 1mA**：把电流采样噪声从 10 mA 切到 1 mA；
@@ -1510,10 +1510,10 @@ $$
 
 | 文件 | 作用 |
 |---|---|
-| `src/simulation/controller/observer/flux_circle_observer.rs` | 新增观测器：`V2`、`Obs`、`FitCfg`、`Fit`、`solve`、`schur_r`、`kasa`、`cost_at`、`fit_local`、`fit`、`fit_fixed_r`、`FluxCircleObserver` |
-| `src/simulation/controller/observer/mod.rs` | 注册模块；`ObserverInput` 增加 `current_slope`、`current_slope_dt` |
-| `src/simulation/power_bridge/two_level_power_bridge.rs` | 增加 `dead_scale`（死区倍率，默认 1.0） |
-| `examples/example1.rs` | 斜率传感器模型、观测器接入、Scope、GUI 复选框、`--headless` 批处理、速度环增益可调 |
+| `../src/simulation/controller/observer/flux_circle_observer.rs` | 新增观测器：`V2`、`Obs`、`FitCfg`、`Fit`、`solve`、`schur_r`、`kasa`、`cost_at`、`fit_local`、`fit`、`fit_fixed_r`、`FluxCircleObserver` |
+| `../src/simulation/controller/observer/mod.rs` | 注册模块；`ObserverInput` 增加 `current_slope`、`current_slope_dt` |
+| `../src/simulation/power_bridge/two_level_power_bridge.rs` | 增加 `dead_scale`（死区倍率，默认 1.0） |
+| `../examples/example1.rs` | 斜率传感器模型、观测器接入、Scope、GUI 复选框、`--headless` 批处理、速度环增益可调 |
 | `trace_1ma.csv`、`trace_10ma.csv`、`trace_rid.csv`、`trace_closed_ok.csv`、`trace_circle.csv` | 本文数据 |
 | `plot_flux_circle.py`、`plot_closed_loop.py`、`plot_circle_trajectory.py`、`plot_schematics.py` | 绘图脚本（Pillow，无需 matplotlib） |
 

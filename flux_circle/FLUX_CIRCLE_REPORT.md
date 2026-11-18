@@ -7,7 +7,7 @@
 
 ### 1.1 新增观测器
 
-`src/simulation/controller/observer/flux_circle_observer.rs`
+`../src/simulation/controller/observer/flux_circle_observer.rs`
 
 按 PAPER.md 移植并适配：
 
@@ -38,7 +38,7 @@ pub current_slope_dt: f64,     // 零矢量内可用的双采样间隔 Δt (s)�
 ### 1.3 仿真里的斜率传感器模型
 
 本仓库的 `TwoLevelPowerBridge` 是**平均模型**，没有真实载波和开关状态，无法在
-零矢量内做两次真实电流采样。因此 `examples/example1.rs` 里用电机 dq ODE 在
+零矢量内做两次真实电流采样。因此 `../examples/example1.rs` 里用电机 dq ODE 在
 `vd = vq = 0` 时的导数合成斜率：
 
 ```
@@ -231,10 +231,10 @@ cargo test --lib flux_circle_observer
 
 | 文件 | 改动 |
 |---|---|
-| `src/simulation/controller/observer/flux_circle_observer.rs` | 新增，约 1100 行，含拟合器、观测器、4 个单元测试 |
-| `src/simulation/controller/observer/mod.rs` | 注册新模块；`ObserverInput` 增加 `current_slope` / `current_slope_dt` |
-| `src/simulation/power_bridge/two_level_power_bridge.rs` | 增加 `dead_scale`（仅用于敏感性实验，默认 1.0） |
-| `examples/example1.rs` | 斜率传感器模型、观测器接入（`use_observer=12`）、Scope、headless 模式、GUI 复选框、速度环增益可调 |
+| `../src/simulation/controller/observer/flux_circle_observer.rs` | 新增，约 1100 行，含拟合器、观测器、4 个单元测试 |
+| `../src/simulation/controller/observer/mod.rs` | 注册新模块；`ObserverInput` 增加 `current_slope` / `current_slope_dt` |
+| `../src/simulation/power_bridge/two_level_power_bridge.rs` | 增加 `dead_scale`（仅用于敏感性实验，默认 1.0） |
+| `../examples/example1.rs` | 斜率传感器模型、观测器接入（`use_observer=12`）、Scope、headless 模式、GUI 复选框、速度环增益可调 |
 | `trace_1ma.csv`, `trace_10ma.csv`, `trace_rid.csv`, `trace_closed_ok.csv` | 复现用数据 |
 | `plot_flux_circle.py`, `plot_closed_loop.py` | 绘图脚本（Pillow，无需 matplotlib） |
 | `flux_circle_report.png`, `flux_circle_closed_loop.png` | 报告图 |
