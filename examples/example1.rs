@@ -1377,9 +1377,6 @@ fn run_headless(args: &[String]) {
     let max_sigma_rel = arg_f64(args, "--max-sigma-rel", 0.02);
     let k_sigma = arg_f64(args, "--k-sigma", 0.0);
     let hard_sigma = args.iter().any(|a| a == "--hard-sigma");
-    // A/B：`--shear` 打开剪切（U_s -> U + k_ref·V）；默认不剪切，直接在
-    // κ=k 处展开三/四次剖面。
-    let shear = args.iter().any(|a| a == "--shear");
     let fit_period = arg_f64(args, "--fit-period", 0.01);
     let warmup_fraction = arg_f64(args, "--warmup", 0.5).clamp(0.0, 0.99);
     let verbose = args.iter().any(|a| a == "--verbose");
@@ -1427,7 +1424,6 @@ fn run_headless(args: &[String]) {
     sim.direct_flux_observer.fit.max_sigma_rel = max_sigma_rel;
     sim.direct_flux_observer.fit.k_sigma = k_sigma;
     sim.direct_flux_observer.fit.gate_sigma_rel = hard_sigma;
-    sim.direct_flux_observer.fit.shear = shear;
     sim.direct_flux_observer.fit_period = fit_period;
     sim.direct_flux_observer
         .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
@@ -1503,9 +1499,8 @@ fn run_headless(args: &[String]) {
          slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
          tau={tau} obs_min={obs_min:.1e} prior={k_prior} step={k_step} \
          sigma_rel={max_sigma_rel:.3} k_sigma={k_sigma} hard_sigma={hard_sigma} \
-         shear={} fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
+         fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
         current_noise.unwrap_or(0.01),
-        shear,
         sim.direct_flux_observer.fit_period,
     );
     println!("true R={nominal_r:.3} s^-1, true radius={nominal_radius:.4} A");

@@ -84,25 +84,22 @@ P(k) = c(k) - b(k)ᵀ A(k)⁻¹ b(k)
 `loss` / `sigma_rel` 仍用约束后 `θ` 上的**无罚项**残差，罚项常数不会污染
 噪声门限。
 
-### 3.3 浮动原点、V 原点管理与补偿求和
+### 3.3 浮动原点与 V 原点管理
 
 - `U = A` 的质心超过阈值时把全部矩精确平移 `U → U - s`，`s` 累进 `off`；
 - `V = B` 的加权均值超过 `RMS(V')·recenter_v_rel` 时搬进 `v_off`
   （物理 `V = V' + v_off`）；这是纯规范，`P`、`P'`、`P''`、`k`、圆心、半径不变；
-- 长积分用 `Acc` / `Vacc` 补偿求和。
+- **不再用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量，长积分在
+  `off`/`v_off` 里；去掉 Neumaier 累加器后 4 组工况输出逐位不变。
 
-### 3.4 剪切开关
+### 3.4 为什么不再需要剪切
 
-`FitConfig::shear` 控制是否把历史矩剪切到当前 `k` 的参考系：
-
-- `true`：存 `U_s = U + k_ref·V`，永远在 `κ = 0` 求值；
-- `false`（直接观测器的默认）：存原始 `U`、`V'`，在 `κ = k` 处把 `b` 展开到
-  三次、`c` 到四次（`b3 = [g_vx, g_vy, 0]`、`c3 = 4b_g`、`c4 = g2`，都是已有矩）。
-
-两种写法数学等价。直接观测器每个拟合周期都把最新样本搬到原点，矩里的
-`|U|`、`|V|` 只有“一个周期内增量”的量级，`V` 的慢漂又在 `v_off` 里、求值时
-用 `translate_u(-κ·v_off)` 精确补回，所以 `κ = k` 处没有论文 §6.1 那种大数
-相消。`--shear` 可打开对照。
+矩里存原始 `U`、`V'`，在 `κ = k` 处把 `b` 展开到三次、`c` 到四次
+（`b3 = [g_vx, g_vy, 0]`、`c3 = 4b_g`、`c4 = g2`，都是已有矩）。直接观测器
+每个拟合周期都把最新样本搬到原点，矩里的 `|U|`、`|V|` 只有“一个周期内增量”
+的量级，`V` 的慢漂又在 `v_off` 里、求值时用 `translate_u(-κ·v_off)` 精确补回，
+所以 `κ = k` 处没有论文 §6.1 那种大数相消。旧的剪切代码和 `--shear` 已删除
+（A/B 见 §7.1）。
 
 ---
 
@@ -130,10 +127,10 @@ k   ← k   + sync_gain·(k_fit   - k)
 rad ← rad + sync_gain·(rad_fit - rad)
 ```
 
-`c_tgt = -(p_newest - c_fit) = -c_local`。不剪切时 `p_newest = κ·v_off`
-（最新样本的局部 `U`、`V` 已清零，但物理位置不是 0），所以 `c_local` 返回的是
-`c - κ·v_off`；剪切时 `κ = 0`，就是 `c`。三者共用一个增益，积分器清零不会让
-角度跳变，也不会把拟合值一次写死（默认 20 个周期 ≈ 200 ms 收敛）。
+`c_tgt = -(p_newest - c_fit) = -c_local`。最新样本的局部 `U`、`V` 已清零，但
+物理位置是 `κ·v_off`，所以 `c_local` 返回的是 `c - κ·v_off`。三者共用一个
+增益，积分器清零不会让角度跳变，也不会把拟合值一次写死（默认 20 个周期
+≈ 200 ms 收敛）。
 
 ### 4.3 角度与测速
 
@@ -172,16 +169,16 @@ step    = raw_step · w_obs · w_sig · w_sigma
 cargo test --release --lib
 ```
 
-当前 16 个测试全部通过，和本观测器相关的有：
+当前 12 个测试全部通过，和本观测器相关的有：
 
 - `direct_flux_tracks_speed_profile`：加速→减速后角度跟得上，交班不跳变；
 - `direct_flux_recovers_r_with_weighted_newton`：`R` 初值 +25% 能拉回；
 - `k_sigma_gate_can_be_switched`：显著性硬门限可开关，且软权重仍生效；
-- `step_once_puts_latest_sample_at_origin`：两种存储方式下最新样本都在原点；
-- `coef_at_matches_shear_round_trip`：`κ = k` 展开与剪切在矩层面一致；
-- `no_shear_tracker_matches_shear`：两种存储收敛到同一个 `k`、半径；
-- `set_shear_switch_preserves_profile`：运行时切换剪切是精确重投影；
-- 以及 36 矩的平移/剪切/剖面导数等基础测试。
+- `step_once_puts_latest_sample_at_origin`：拟合后最新样本在局部原点；
+- `radius_penalty_enters_newton`：半径罚项进入法方程，且报告损失用无罚项残差；
+- `v_constant_offset_is_a_gauge`：`V` 的常数偏移不改变 `P`、`P'`、`P''`；
+- `v_offset_does_not_break_k`：`v_off` 非零时 `k` 仍能从 +25% 初值恢复；
+- 以及 36 矩的平移、剖面导数、观测器跟踪等基础测试。
 
 ---
 
@@ -208,16 +205,35 @@ cargo run --release --example example1 -- --headless --observe-only `
 曲率，这是“只按可观性加权”的直接后果，也是 `--k-sigma` / `--hard-sigma`
 保留的原因。1 mA 下 `R` 与半径都在 ±0.5% 内。
 
-### 7.1 剪切 A/B
+### 7.1 剪切 / 补偿求和 / 二次平移的 A/B
 
-| 工况 | shear=true | shear=false |
-|---|---|---|
-| 100 rad/s, 1 mA | 1.573°, +0.03%, +0.02% | 同左，逐位一致 |
-| 5 rad/s, 10 mA | 17.725°, +38.97%, −14.26% | 同左，逐位一致 |
-| 0.5 rad/s, 10 mA, 负载 0.5 | 65.341°, 383.470, 1.2869 | 65.335°, 383.467, 1.2873 |
+| 改动 | 结果 |
+|---|---|
+| 剪切（保留开关但默认关）→ 删除整条路径 | 4 组工况的 `steady`、`observer` 行逐位一致 |
+| Neumaier 补偿求和 → 普通 `V2` 累加 | 同上，逐位一致 |
+| `step_once` 末尾的第二次 `recenter_latest` → 删除 | 同上，逐位一致（无剪切时 Newton 不碰 `u`、`v`，第二次平移本来就是空操作） |
 
-把 `fit_period` 放大到 0.2 s 也一致。结论：在这套“浮动原点 + 每拍重锚”的
-结构里，剪切是冗余的；默认关掉，`--shear` 只作对照。
+唯一有非零差异的是更早的剪切开关对照（0.5 rad/s、10 mA、负载 0.5）：
+`shear=true` 65.341° / 383.470 / 1.2869，`shear=false` 65.335° / 383.467 /
+1.2873，属于舍入量级。0.5~100 rad/s、1~10 mA、`fit_period` 放大到 0.2 s 的
+其余工况都逐位一致。
+
+结论：这套“浮动原点 + 每拍重锚”的结构里，剪切、补偿求和、第二次平移都是
+冗余的，已全部删除。
+
+### 7.2 平移 vs 拟合的开销
+
+release 构建、单次调用：
+
+| 操作 | 时间 |
+|---|---|
+| `translate_u` + `translate_v` | ~60 ns |
+| 36 矩 `add` | ~15 ns |
+| `coef_at` + `fit_from_coef` | ~120 ns |
+
+平移发生在 10 ms 一次的拟合里，约占该周期的 `6×10⁻⁶`；合并 `translate_u` 和
+`translate_v` 最多省一半，换不来可测量的收益，却要把两组精确变换合成一个带
+`s·t` 交叉项的大公式，风险大于收益。因此保留两条独立的精确平移。
 
 ---
 
@@ -241,7 +257,6 @@ cargo run --release --example example1 -- --headless --observe-only `
 | `--max-sigma-rel` | 0.02 | 噪声可信度权重尺度 |
 | `--k-sigma` | 0 | 可选显著性硬门限（以 `σ_k` 为单位） |
 | `--hard-sigma` | 关 | 可选的 `sigma_rel` 硬门限 |
-| `--shear` | 关 | 打开剪切 A/B |
 | `--verbose` | — | 每 5% 时长打印一次跟踪 |
 
 GUI：`cargo run --release --example example1`，`use_observer` 滑块选

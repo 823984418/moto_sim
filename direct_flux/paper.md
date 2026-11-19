@@ -29,7 +29,7 @@ $$
 
 ### 1.3 与上一版的关系
 
-拟合的 36 个矩、变量投影、剪切、$V$ 的原点管理、半径伪观测都复用上一版；它们现在和观测器一起放在 `direct_flux_observer.rs` 的“拟合核心”里（旧 `KasaFluxObserver` 已删除）。本文新增的是**观测器层的时序与交班**：`DirectFluxObserver` 和 `Tracker::step_once`。
+拟合的 36 个矩、变量投影、$V$ 的原点管理、半径伪观测都复用上一版；它们现在和观测器一起放在 `direct_flux_observer.rs` 的“拟合核心”里（旧 `KasaFluxObserver` 已删除）。本文新增的是**观测器层的时序与交班**：`DirectFluxObserver` 和 `Tracker::step_once`。
 
 ---
 
@@ -217,22 +217,24 @@ $g=0.05$ 对应约 20 个拟合周期（200 ms）收敛。因为清零后 $b=0$�
 每个拟合样本加入矩之后，对全部历史做两次**精确平移**：
 
 $$
-U_s\leftarrow U_s-u_{\mathrm{new}},\qquad V'\leftarrow V'-v_{\mathrm{new}},
+U\leftarrow U-u_{\mathrm{new}},\qquad V'\leftarrow V'-v_{\mathrm{new}},
 $$
 
 即 `Tracker::recenter_latest`。它是精确变换：圆拟合对平移不变，半径/圆心只是跟着平移；`off`、`v_off` 累加被搬走的偏移，绝对坐标诊断不受影响。之后 `p_local == 0`，下一个周期的增量从 0 起算。
 
-### 5.2 剪切与 $v_{\mathrm{off}}$
+### 5.2 为什么不再需要剪切
 
-矩里存的是 $U_s=U+k_{\mathrm{ref}}V$。Newton 改变 $k$ 时对整个历史做剪切，并把物理 $V=V'+v_{\mathrm{off}}$ 的缺失部分补上：
+上一版把矩保持在 $U_s=U+k_{\mathrm{ref}}V$ 的参考系里（附录 A.1 的剪切），求值固定在 $\kappa=0$。这一版不走这条路：矩里存原始 $U$、$V'$，每次在 $\kappa=k$ 处把 $b$ 展开到 $\kappa^3$、$c$ 到 $\kappa^4$：
 
 $$
-U_s\leftarrow U_s+\Delta k\,V',\qquad
-U_s\leftarrow U_s+\Delta k\,v_{\mathrm{off}},\qquad
-U_{\mathrm{new}}\leftarrow U_{\mathrm{new}}+\Delta k\,v_{\mathrm{off}}.
+\begin{aligned}
+A(\kappa)&=A_0+\kappa A_1+\kappa^2 A_2,\\
+b(\kappa)&=b_0+\kappa b_1+\kappa^2 b_2+\kappa^3 b_3,\\
+c(\kappa)&=c_0+\kappa c_1+\kappa^2 c_2+\kappa^3 c_3+\kappa^4 c_4.
+\end{aligned}
 $$
 
-`Tracker::newton` 里对应 `shear(dk)`、`translate_u(v_off·(-dk))`、`u += v_off·dk`。漏掉这一项会系统性偏（上一版的单测钉住了它）。
+其中 $b_3=[\sum w\gamma V_x,\ \sum w\gamma V_y,\ 0]$、$c_3=4\sum w\beta\gamma$、$c_4=\sum w\gamma^2$ 都是已有矩，不需要额外统计量。直接观测器每 10 ms 把最新样本搬到原点，矩里的 $|U|$、$|V|$ 只有一个周期增量的量级；$V$ 的慢漂在 $v_{\mathrm{off}}$ 里，`coef_at(κ)` 用 `translate_u(-κ·v_off)` 精确补回。因此 $\kappa=k$ 处不会出现论文 §6.1 的大数相消。实测 0.5~100 rad/s、1~10 mA、`fit_period` 放大到 0.2 s 都与剪切逐位一致；`FitConfig::shear` 与 `--shear` 已删除。
 
 ### 5.3 可观性加权的一步 Newton
 
@@ -279,7 +281,7 @@ $$
 - **内部单位** $L=(r_{\min}+r_{\max})/2$：半径 $O(1)$。
 - **$U$ 浮动原点**：质心超过 $0.25L$ 时精确平移，防长积分漂移。
 - **$V$ 原点管理**：存储 $V'=V-v_{\mathrm{off}}$，当 $|\bar V'|>0.25\,\mathrm{RMS}(V')$ 时把均值搬进 $v_{\mathrm{off}}$；可观性尺度用物理 $V$ 的二阶矩，与 $v_{\mathrm{off}}$ 的拆分无关。
-- **补偿求和**：$\int s_0$、$\int i$ 用 Neumaier 累加器。
+- **不用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量；长积分在 `off`/`v_off` 里。去掉 Neumaier 累加器后 4 组工况的输出逐位不变。
 
 ---
 
@@ -287,6 +289,7 @@ $$
 
 - 快速环：每拍一次积分、一次 `atan2`、一次低通，$O(1)$。
 - 低速环：每 10 ms 一次 36 矩衰减/更新、一次变量投影（2~3 次 $3\times3$ Cholesky）、一次线搜索；$O(1)$，与历史长度无关。
+- 每次拟合里的两次原点平移（`translate_u` + `translate_v`）约 60 ns，一次 `coef_at`+`fit_from_coef` 约 120 ns（release、本机）；平移只占 10 ms 周期的 $6\times10^{-6}$，合并两条平移不会改变量级。
 - 内存：36 个矩 + 十几个标量（快速环另加 5 个 `V2`/标量），约 500 B。
 
 ---
@@ -371,7 +374,7 @@ $\omega=0$、$i$ 恒定时磁链点不动，圆拟合退化成点/线，半径�
 
 ### 10.4 与上一版的关系
 
-上一版的 36 矩、变量投影、剪切、$V$ 原点管理、半径伪观测全部保留；本文换掉的是“观测器层”：PLL → 直接反正切、逐拍更新 → 双速率、每拍多步 Newton → 每 10 ms 一步、拟合值直接写 → 加锁加权交班。
+上一版的 36 矩、变量投影、$V$ 原点管理、半径伪观测保留；本文换掉的是“观测器层”：PLL → 直接反正切、逐拍更新 → 双速率、每拍多步 Newton → 每 10 ms 一步、拟合值直接写 → 加锁加权交班。剪切和 Neumaier 补偿求和都已删除（理由见 §5.2 与 §6）。
 
 ---
 
@@ -406,7 +409,7 @@ $$
 ## 附录 C 复现与选型
 
 - 直接磁链观测器是当前唯一的磁链圆观测器：`use_observer = 12`；headless 不需要选型参数，直接跑 `example1 --headless [--observe-only]` 即可。
-- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`sync_obs_weighted=false`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`、`fit.shear=false`（`--shear` 可打开对照）。
+- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`sync_obs_weighted=false`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`。
 
 ## 参考文献
 
