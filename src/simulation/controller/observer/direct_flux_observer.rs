@@ -7,10 +7,11 @@
 //!   转速只对 `Δθ/Δt` 做一阶低通，不构成闭环。
 //! * **双速率**。`∫s0`、`∫i` 与测角在每次 `update`（电流环频率）；
 //!   圆拟合每 `fit_period`（默认 10 ms）才取一次快速积分器的增量。
-//! * **每次拟合恰好一次 Newton**，可观性 `obs` 只缩放步长
-//!   `w = clamp(|obs|/obs_min, 0, 1)²`；不设基于 `obs`、`sigma_rel` 的冻结
-//!   门限，也不加随机游走先验（`k_prior_rel = 0`）。`obs_min` 在这里是权重
-//!   的参考尺度，不是“过/不过”的门限。
+//! * **每次拟合恰好一次 Newton**。所有门限都做成**权重**，没有硬截断：
+//!   可观性 `w_obs = clamp(|obs|/obs_min,0,1)²`、噪声可信度
+//!   `w_sigma = clamp((σ_max/σ_rel)²,0,1)`、统计显著性
+//!   `w_sig = δ²/(δ²+σ_k²)`，其中 `σ_k = sqrt(2P/((N_eff-3)P''))`、
+//!   `N_eff = (Σw)²/Σw²`。`obs_min`/`σ_max` 是权重尺度，不是“过/不过”的门限。
 //! * **每个拟合样本都把最新点搬到原点**（`U`、`V` 各一次精确平移），
 //!   拟合圆心因此总是相对“最新点”。
 //! * **加锁交班**：`Arc<Mutex<FastFlux>>` 内读并清零 `a`、`b`，同时
@@ -90,6 +91,8 @@ pub struct DirectFluxObserver {
     pub flux_mag: S,
     pub obs: S,
     pub sigma_rel: S,
+    /// `k` 的标准误（诊断/调参用）。
+    pub sigma_k: S,
     pub steps: u32,
     pub weight: S,
     pub data_arc: S,
@@ -138,6 +141,7 @@ impl Default for DirectFluxObserver {
             flux_mag: 0.0,
             obs: 0.0,
             sigma_rel: 0.0,
+            sigma_k: 0.0,
             steps: 0,
             weight: 0.0,
             data_arc: 0.0,
@@ -204,6 +208,7 @@ impl DirectFluxObserver {
         self.valid = false;
         self.obs = 0.0;
         self.sigma_rel = 0.0;
+        self.sigma_k = 0.0;
         self.steps = 0;
         self.weight = 0.0;
         self.data_arc = 0.0;
@@ -228,6 +233,10 @@ impl Observer<3> for DirectFluxObserver {
         }
         self.total_time += delta_time;
         self.updates += 1;
+        // 让运行中的 `fit` 改动（例如开/关显著性硬门限）传到 Tracker。
+        if let Some(tr) = self.tracker.as_mut() {
+            tr.sync_fit(&self.fit);
+        }
 
         let i = clarke(input.current);
         let s = clarke(input.current_slope);
@@ -298,6 +307,7 @@ impl Observer<3> for DirectFluxObserver {
                     self.radius_fit = rep.radius;
                     self.obs = rep.obs;
                     self.sigma_rel = rep.sigma_rel;
+                    self.sigma_k = rep.sigma_k;
                     self.steps = rep.steps;
                     self.weight = rep.weight;
                     self.center = rep.center;
@@ -496,6 +506,49 @@ mod tests {
         );
         assert!(rel < 0.03, "R rel error {rel}");
         assert!(tail < 0.1, "tail angle error {tail}");
+    }
+
+    /// 显著性硬门限可以开关；开启时软权重仍乘在步长上（不是二选一）。
+    #[test]
+    fn k_sigma_gate_can_be_switched() {
+        let r = 384.0;
+        let radius = 4.04;
+        let dt = 5.0e-5;
+        let omega = move |t: S| {
+            if t < 0.02 {
+                0.0
+            } else if t < 0.12 {
+                100.0 * (t - 0.02) / 0.1
+            } else {
+                100.0
+            }
+        };
+        let iq = move |t: S| 3.0 + 1.5 * (t * 40.0).sin() * (-t / 2.0).exp();
+        let stream = synth_stream_profile(r, radius, omega, iq, 4.0, dt);
+
+        let run = |k_sigma: S| {
+            let mut ob = DirectFluxObserver::new();
+            ob.fit.obs_min = 1.0e-5;
+            ob.fit.k_sigma = k_sigma;
+            ob.set_initial(0.0, 0.0, 1.05 * r, radius);
+            for (_, du, dv) in &stream {
+                ob.update(dt, &direct_input(*du, *dv, dt));
+            }
+            ob
+        };
+        // 门限关：只靠软权重
+        let soft = run(0.0);
+        // 门限开且极大：任何有限步长都会被硬门限挡住
+        let gated = run(1.0e9);
+        let rel_soft = (soft.r - r).abs() / r;
+        let rel_gated = (gated.r - 1.05 * r).abs() / r;
+        eprintln!(
+            "gate: soft r={:.3} (rel {rel_soft:.4}) | gated r={:.3} (rel {rel_gated:.4}) steps={}",
+            soft.r, gated.r, gated.steps
+        );
+        assert!(rel_soft < 0.02, "soft R rel {rel_soft}");
+        assert!(rel_gated < 0.005, "gated R moved: rel {rel_gated}");
+        assert_eq!(gated.steps, 0, "gate should block the step");
     }
 
     /// 最新样本必须位于拟合局部坐标原点（交班的前置条件）。

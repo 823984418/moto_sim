@@ -886,6 +886,13 @@ pub struct FitConfig {
     /// 高噪声下圆模型本身不成立，剖面曲率会被噪声抬高，`k` 的更新不可信
     /// （与 `flux_circle_observer` 的 `max_sigma_rel` 同一作用）。
     pub max_sigma_rel: S,
+    /// 统计显著性**可开关硬门限**（以 `σ_k` 为单位）；`0` = 关闭，只用软权重。
+    ///
+    /// 开启时：`|δk| < k_sigma·σ_k` 直接跳过本拍；同时软权重
+    /// `w_sig = δ²/(δ²+σ_k²)` 仍然相乘（门限与加权同时生效，不是二选一）。
+    pub k_sigma: S,
+    /// 是否对噪声可信度 `sigma_rel` 加硬门限（与软权重 `w_sigma` 同时生效）。
+    pub gate_sigma_rel: bool,
     /// 初始化网格扫描的相对范围：在 `[k0/scan_rel, k0·scan_rel]` 上取对数网格。
     pub scan_rel: S,
     /// 扫描接受条件：候选点的剖面损失必须低于 `scan_gain · 当前损失`。
@@ -913,6 +920,8 @@ impl Default for FitConfig {
             r_kappa: 50.0,
             min_weight: 8.0,
             max_sigma_rel: 0.02,
+            k_sigma: 0.0,
+            gate_sigma_rel: false,
             scan_rel: 2.0,
             scan_gain: 0.5,
             scan_points: 96,
@@ -939,6 +948,8 @@ pub struct Report {
     pub loss: S,
     /// 径向残差 RMS / 半径：圆模型可信度。
     pub sigma_rel: S,
+    /// `k` 的标准误 `sqrt(2P/((N_eff-3)P''))`，单位同 `k`；`P''≤0` 时为 `∞`。
+    pub sigma_k: S,
     /// 有效样本数 `Σw`。
     pub weight: S,
     /// 剖面一阶导 `P'`。
@@ -985,6 +996,9 @@ pub struct Tracker {
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
     /// 实际覆盖了多长弧”的度量；拿 PLL 的 `|ω|dt` 会在 `k` 错时严重低估。
     path: S,
+    /// `Σw²`：只用于算有效样本数 `N_eff = (Σw)²/Σw²`（Kish），
+    /// 进而估计 `k` 的标准误 `σ_k = sqrt(2P/((N_eff-3)P''))`。
+    w2: S,
     obs: S,
     steps: u32,
 }
@@ -1017,6 +1031,7 @@ impl Tracker {
             t_last: 0.0,
             started: false,
             path: 0.0,
+            w2: 0.0,
             obs: 0.0,
             steps: 0,
         }
@@ -1097,6 +1112,7 @@ impl Tracker {
         self.t_last = t;
         self.started = true;
         self.m.decay(rho);
+        self.w2 *= rho * rho;
 
         // 2. 积分增量（内部单位）。存储的是 U_s = U + k V，所以增量是
         //    ΔU + k ΔV，不能只加 ΔU。
@@ -1114,6 +1130,7 @@ impl Tracker {
             1.0
         };
         self.m.add(ui, vi, q);
+        self.w2 += q * q;
 
         // 4. 浮动原点：`U` 的质心归零、`V` 的加权均值归零
         self.recenter();
@@ -1134,6 +1151,21 @@ impl Tracker {
     /// 立刻重新求一次报告（不喂新样本）。
     pub fn report_now(&self) -> Option<Report> {
         self.report()
+    }
+
+    /// 只同步**可在线调整**的字段（不改 `unit_len`、半径范围、`k` 范围）。
+    /// 用于运行中开关显著性/噪声硬门限、调权重尺度。
+    pub fn sync_fit(&mut self, cfg: &FitConfig) {
+        self.cfg.tau = cfg.tau;
+        self.cfg.obs_min = cfg.obs_min;
+        self.cfg.k_prior_rel = cfg.k_prior_rel;
+        self.cfg.k_step_rel = cfg.k_step_rel;
+        self.cfg.max_sigma_rel = cfg.max_sigma_rel;
+        self.cfg.k_sigma = cfg.k_sigma;
+        self.cfg.gate_sigma_rel = cfg.gate_sigma_rel;
+        self.cfg.p2_eps = cfg.p2_eps;
+        self.cfg.r_kappa = cfg.r_kappa;
+        self.cfg.recenter_v_rel = cfg.recenter_v_rel;
     }
 
     /// 把**最新样本**搬到局部原点：`U_s -> U_s - u`、`V' -> V' - v`。
@@ -1178,6 +1210,7 @@ impl Tracker {
         self.t_last = t;
         self.started = true;
         self.m.decay(rho);
+        self.w2 *= rho * rho;
         let inv = 1.0 / self.unit_len;
         let du = delta_u.mul(inv);
         let dv = delta_v.mul(inv);
@@ -1193,6 +1226,7 @@ impl Tracker {
             1.0
         };
         self.m.add(ui, vi, q);
+        self.w2 += q * q;
 
         // 3. 最新样本搬到原点（U 与 V 各一次精确平移）
         self.recenter_latest();
@@ -1431,14 +1465,25 @@ impl Tracker {
             if w_obs <= 0.0 {
                 break;
             }
-            // 噪声不再作为门限：直接观测器只让可观性缩放步长。
-            // 旧 Kåsa 的非加权路径仍保留 sigma 硬门限（它与本观测器的设计不同）。
-            if !weighted {
-                let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
-                    / (2.0 * f0.radius.max(1.0e-12));
-                if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
-                    break;
-                }
+            // 噪声可信度软权重：`w_sigma = clamp((σ_max/σ)²,0,1)`。
+            // 可选的硬门限 `gate_sigma_rel` 与它**同时**生效（不是二选一）。
+            let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
+                / (2.0 * f0.radius.max(1.0e-12));
+            let w_sigma = if weighted {
+                (self.cfg.max_sigma_rel / sigma_rel.max(1.0e-12))
+                    .max(0.0)
+                    .powi(2)
+                    .clamp(0.0, 1.0)
+            } else if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
+                break;
+            } else {
+                1.0
+            };
+            if w_sigma <= 0.0 {
+                break;
+            }
+            if weighted && self.cfg.gate_sigma_rel && sigma_rel > self.cfg.max_sigma_rel {
+                break;
             }
 
             // 随机游走先验：等价于给法方程加阻尼。以本拍起点为参考，
@@ -1448,7 +1493,45 @@ impl Tracker {
             if !denom.is_finite() || denom <= self.cfg.p2_eps {
                 break;
             }
-            let mut step = -(f.p1 + 2.0 * prior * (self.k - k_start)) / denom * w_obs;
+            let raw_step = -(f.p1 + 2.0 * prior * (self.k - k_start)) / denom;
+            if !raw_step.is_finite() {
+                break;
+            }
+            // 统计显著性：
+            //   σ_k = sqrt(2P / ((N_eff-3)·P''))，N_eff = (Σw)²/Σw²
+            //   w_sig = δ²/(δ²+σ_k²)   （δ 是原始 Newton 步长）
+            // 权重始终生效（1σ→0.5、2σ→0.8、10σ→0.99）；`k_sigma>0` 时再叠加
+            // 一层可选硬门限 `|δ| < k_sigma·σ_k`。两者同时使用。
+            let mut sigma_k = S::INFINITY;
+            let mut w_sig = 1.0;
+            if weighted && f0.p2 > self.cfg.p2_eps {
+                let n_eff = if self.w2 > 0.0 {
+                    self.m.w * self.m.w / self.w2
+                } else {
+                    0.0
+                };
+                let dof = (n_eff - 3.0).max(1.0);
+                sigma_k = (2.0 * f0.p.max(0.0) / (dof * f0.p2)).sqrt();
+                if sigma_k.is_finite() {
+                    if sigma_k > 0.0 {
+                        let r = raw_step / sigma_k;
+                        w_sig = r * r / (1.0 + r * r);
+                    }
+                } else {
+                    // σ_k 溢出（P 极大/曲率极小）：权重取 0，避免无效大步
+                    w_sig = 0.0;
+                    sigma_k = S::INFINITY;
+                }
+            }
+            if weighted
+                && self.cfg.k_sigma > 0.0
+                && sigma_k.is_finite()
+                && sigma_k > 0.0
+                && raw_step.abs() < self.cfg.k_sigma * sigma_k
+            {
+                break;
+            }
+            let mut step = raw_step * w_obs * w_sig * w_sigma;
             if !step.is_finite() {
                 break;
             }
@@ -1538,6 +1621,18 @@ impl Tracker {
         // 罚项常数 μz² 不能混进 P/Σw，否则 `sigma_rel` 门限会失真。
         let loss = self.m.loss_at(&theta);
         let sigma_rel = (loss.max(0.0) / w).sqrt() / (2.0 * r.max(1.0e-12));
+        // 与 Newton 门限同一个量：k 的标准误（诊断/调参用）。
+        let n_eff = if self.w2 > 0.0 {
+            self.m.w * self.m.w / self.w2
+        } else {
+            0.0
+        };
+        let dof = (n_eff - 3.0).max(1.0);
+        let sigma_k = if f0.p2 > self.cfg.p2_eps {
+            (2.0 * f0.p.max(0.0) / (dof * f0.p2)).sqrt()
+        } else {
+            S::INFINITY
+        };
 
         Some((Report {
             k: self.k,
@@ -1548,6 +1643,7 @@ impl Tracker {
             radial_err: (dist - r) * l,
             loss: loss / w,
             sigma_rel,
+            sigma_k,
             weight: self.m.w,
             p1: f0.p1,
             p2: f0.p2,
@@ -1800,6 +1896,8 @@ impl KasaFluxObserver {
         tr.cfg.k_step_rel = self.fit.k_step_rel;
         tr.cfg.min_weight = self.fit.min_weight;
         tr.cfg.max_sigma_rel = self.fit.max_sigma_rel;
+        tr.cfg.k_sigma = self.fit.k_sigma;
+        tr.cfg.gate_sigma_rel = self.fit.gate_sigma_rel;
         tr.cfg.scan_rel = self.fit.scan_rel;
         tr.cfg.scan_gain = self.fit.scan_gain;
         tr.cfg.scan_points = self.fit.scan_points;

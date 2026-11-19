@@ -359,9 +359,10 @@ impl Simulation {
         direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
-            nominal_r,
+            nominal_r * 0.5,
             nominal_radius,
         );
+        direct_flux_observer.fit.tau = 10.0;
 
         Self {
             delta_time: 0.0001,
@@ -681,7 +682,7 @@ impl Simulation {
                     .clamp(-max_current, max_current);
                     let command_current = rotate(
                         [
-                            id + 0.1
+                            id + 0.0
                                 * f64::cos(
                                     use_observer.electrical_angle - self.res_tune.tune_angle,
                                 ),
@@ -1323,6 +1324,9 @@ impl Application {
                     ScopeData::new("sigma_rel", |s: &mut Simulation| {
                         s.direct_flux_observer.sigma_rel
                     }),
+                    ScopeData::new("sigma_k", |s: &mut Simulation| {
+                        s.direct_flux_observer.sigma_k
+                    }),
                 ],
             ),
             (
@@ -1592,6 +1596,8 @@ fn run_headless(args: &[String]) {
     let kasa_prior = arg_f64(args, "--kasa-prior", 0.02);
     let kasa_step = arg_f64(args, "--kasa-step", 0.02);
     let kasa_max_sigma = arg_f64(args, "--kasa-max-sigma-rel", 0.02);
+    let kasa_k_sigma = arg_f64(args, "--kasa-k-sigma", 0.0);
+    let kasa_hard_sigma = args.iter().any(|a| a == "--kasa-hard-sigma");
     let kasa_scan_gain = arg_f64(args, "--kasa-scan-gain", 0.5);
     let warmup_fraction = arg_f64(args, "--warmup", 0.5).clamp(0.0, 0.99);
     let csv = arg_value(args, "--csv").map(|s| s.to_string());
@@ -1658,6 +1664,8 @@ fn run_headless(args: &[String]) {
     sim.kasa_flux_observer.fit.k_prior_rel = kasa_prior;
     sim.kasa_flux_observer.fit.k_step_rel = kasa_step;
     sim.kasa_flux_observer.fit.max_sigma_rel = kasa_max_sigma;
+    sim.kasa_flux_observer.fit.k_sigma = kasa_k_sigma;
+    sim.kasa_flux_observer.fit.gate_sigma_rel = kasa_hard_sigma;
     sim.kasa_flux_observer.fit.scan_gain = kasa_scan_gain;
     sim.kasa_flux_observer.scan_time = kasa_scan_time;
     sim.kasa_flux_observer.min_arc = kasa_min_arc;
@@ -1670,6 +1678,8 @@ fn run_headless(args: &[String]) {
     sim.direct_flux_observer.fit.k_prior_rel = kasa_prior;
     sim.direct_flux_observer.fit.k_step_rel = kasa_step;
     sim.direct_flux_observer.fit.max_sigma_rel = kasa_max_sigma;
+    sim.direct_flux_observer.fit.k_sigma = kasa_k_sigma;
+    sim.direct_flux_observer.fit.gate_sigma_rel = kasa_hard_sigma;
     sim.direct_flux_observer
         .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
 
@@ -1864,8 +1874,8 @@ fn run_headless(args: &[String]) {
             "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
              slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
              tau={kasa_tau} obs_min={kasa_obs_min:.1e} prior={kasa_prior} step={kasa_step} \
-             sigma_rel={kasa_max_sigma:.3} fit_period={:.4} speed_kp={speed_kp} \
-             speed_ki={speed_ki} handover={handover}",
+             sigma_rel={kasa_max_sigma:.3} k_sigma={kasa_k_sigma} hard_sigma={kasa_hard_sigma} \
+             fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
             current_noise.unwrap_or(0.01),
             sim.direct_flux_observer.fit_period,
         );
@@ -1922,7 +1932,7 @@ fn run_headless(args: &[String]) {
     } else if use_direct {
         let o = &sim.direct_flux_observer;
         println!(
-            "observer: r={:.3} ({:+.2}%) r_fit={:.3} radius={:.4} ({:+.2}%) radius_fit={:.4} obs={:.3e} sigma_rel={:.3e} weight={:.0} steps={} fits={} updates={} valid={} slope_dt={:.2}us",
+            "observer: r={:.3} ({:+.2}%) r_fit={:.3} radius={:.4} ({:+.2}%) radius_fit={:.4} obs={:.3e} sigma_rel={:.3e} sigma_k={:.3e} weight={:.0} steps={} fits={} updates={} valid={} slope_dt={:.2}us",
             o.r,
             100.0 * (o.r - nominal_r) / nominal_r,
             o.r_fit,
@@ -1931,6 +1941,7 @@ fn run_headless(args: &[String]) {
             o.radius_fit,
             o.obs,
             o.sigma_rel,
+            o.sigma_k,
             o.weight,
             o.steps,
             o.fit_updates,
