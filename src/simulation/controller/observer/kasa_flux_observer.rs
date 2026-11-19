@@ -29,9 +29,10 @@
 //! * **O(1) 时间**：每拍 2~3 次 3×3 Cholesky（半径罚项触发时翻倍）；圆心和半径
 //!   **每拍**都与当前 `k` 一致（它等价于“固定当前 R 的几何拟合”），不会出现
 //!   `flux_circle_observer` 里“R 冻结但几何还是自由拟合那一套”的不一致；
-//! * **数值稳定**：历史矩始终保存在“当前 `k` 的参考系”里（剪切 `U_s = U + k_ref V`），
-//!   所以求值永远在 `κ = 0` 处进行，`A` 与 `R B` 之间那种 1e2 量级的相消被移除了；
-//!   浮动原点再把点云质心移到零，使 `|p| ~ ρ`；
+//! * **数值稳定**：浮动原点把点云质心移到零（`U` 的质心、`V` 的原点都搬走，
+//!   见 §4），所以 `|p| ~ ρ`，`A` 与 `R B` 之间的长积分不会撑大矩。可选的剪切
+//!   （`U_s = U + k_ref V`，`FitConfig::shear`）再让求值固定在 `κ = 0`；直接
+//!   观测器因为每拍都把最新样本搬到原点，实测不需要它（见 §4）；
 //! * **可观性显式化**：`P''/(4 R² Σw|V|²)` 给出一个无量纲的 `k` 可观性指数。
 //!   稳态（iq、ω 不变）时 `P(k) ≡ 0`，该指数趋于零，`k` 自动冻结；只有电流/转速
 //!   瞬态才允许更新 `R`。
@@ -84,10 +85,18 @@
 //! * **`k_step_abs`**：电机里 `k = Rs/L` 是几百 s⁻¹，`k_min/k_max`（铭牌 ±1 个
 //!   数量级）加相对信任域 `k_step_rel·(1+|k|)` 已经够；1e6 的绝对上限永不触发。
 //!
-//! **保留**内部单位、U 浮动原点、剪切与补偿求和：前两者把 `A` 的长积分挡在
-//! `|p| ~ ρ` 附近；剪切是流式递推的求值框架（矩存 `U_s = U + k_ref V`，永远在
-//! `κ = 0` 求值），每改一次 `k` 只做一次 O(1) 精确变换；补偿求和与这些长积分
-//! 配套，成本可忽略。
+//! 剪切本身也做成了 `FitConfig::shear` 开关。**直接观测器默认不剪切**：它每个
+//! 拟合周期都把最新样本搬到原点（`recenter_latest`，`U`、`V` 各一次精确平移），
+//! 矩里的 `|U|`、`|V|` 只有“一个拟合周期内增量”的量级，`κ = k` 处的三/四次展开
+//! 没有论文 §6.1 那种 1e5 对 1 的相消。实测 0.5~100 rad/s、1~10 mA、拟合周期
+//! 放大到 0.2 s，`shear = false` 与 `shear = true` 的 `R`、半径、`obs`、`P'`、
+//! 角度都逐位一致（带载 0.5 rad/s 时只差 0.001% 量级的舍入）。所以对这套
+//! “浮动原点 + 每拍重锚”的流式结构，剪切是冗余的；`shear = true` 保留下来只作
+//! 对照。论文的警告针对的是没有逐样本重锚、`U` 会停在绝对坐标里的批量实现。
+//!
+//! **保留**内部单位、U 浮动原点、V 原点管理与补偿求和：前两者把 `A` 的长积分
+//! 挡在 `|p| ~ ρ` 附近；V 原点管理把 `∫i dt` 的常数偏移搬进 `v_off`；补偿求和
+//! 与这些长积分配套，成本可忽略。
 
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::{angle_normal, clarke};
@@ -184,6 +193,24 @@ fn msc3(m: &M3, s: S) -> M3 {
         }
     }
     o
+}
+
+/// `a + s·b`（3×3，逐元素）。
+#[inline]
+fn madd3(a: &M3, b: &M3, s: S) -> M3 {
+    let mut o = *a;
+    for i in 0..3 {
+        for j in 0..3 {
+            o[i][j] += s * b[i][j];
+        }
+    }
+    o
+}
+
+/// `a + s·b`（三维向量，逐元素）。
+#[inline]
+fn vadd3(a: &[S; 3], b: &[S; 3], s: S) -> [S; 3] {
+    [a[0] + s * b[0], a[1] + s * b[1], a[2] + s * b[2]]
 }
 
 /// Cholesky 分解 `A = L Lᵀ`。非数值正定时返回 `None`。
@@ -670,7 +697,28 @@ impl Moments {
     }
 
     /// 当前参考 `k`（`κ = 0`）处的剖面 Taylor 系数。
+    #[inline]
     fn coef(&self) -> Coef {
+        self.coef_at(0.0)
+    }
+
+    /// 在 `κ = kap` 处展开的剖面 Taylor 系数。
+    ///
+    /// 剪切模式下矩被保持在当前 `k` 的参考系里，所有调用都是 `kap = 0`。
+    /// `shear = false` 时矩里存的是原始 `U`、`V'`（`k_ref = 0`），求值点在
+    /// `κ = k`，需要把
+    ///
+    /// ```text
+    ///   A(κ) = A0 + κA1 + κ²A2
+    ///   b(κ) = b0 + κb1 + κ²b2 + κ³b3
+    ///   c(κ) = c0 + κc1 + κ²c2 + κ³c3 + κ⁴c4
+    /// ```
+    ///
+    /// 展开到 `κ`。返回的 `Coef` 仍是“以 `κ` 为原点”的 Taylor 系数
+    /// （`a0 = A(κ)`、`a1 = A'(κ)`、`a2 = A''(κ)/2`，`b`、`c` 同理），
+    /// 所以 `fit_from_coef` 完全不用改。
+    fn coef_at(&self, kap: S) -> Coef {
+        let a0 = self.a_mat();
         let a1 = [
             [
                 self.ux_vx * 2.0,
@@ -689,28 +737,53 @@ impl Moments {
             [self.vx_vy, self.vy2, 0.0],
             [0.0, 0.0, 0.0],
         ];
+        let b0 = self.b_vec();
+        let b1 = [
+            self.a_vx + 2.0 * self.b_ux,
+            self.a_vy + 2.0 * self.b_uy,
+            2.0 * self.b,
+        ];
+        let b2 = [
+            self.g_ux + 2.0 * self.b_vx,
+            self.g_uy + 2.0 * self.b_vy,
+            self.g,
+        ];
+        let c0 = self.a2;
+        let c1 = 4.0 * self.a_b;
+        let c2 = 4.0 * self.b2 + 2.0 * self.a_g;
+        if kap == 0.0 {
+            return Coef {
+                a0,
+                a1,
+                a2,
+                b0,
+                b1,
+                b2,
+                c0,
+                c1,
+                c2,
+            };
+        }
+        // 只有 `b` 的三次项和 `c` 的三、四次项需要额外的高阶矩。
+        let k2 = kap * kap;
+        let b3 = [self.g_vx, self.g_vy, 0.0];
+        let c3 = 4.0 * self.b_g;
+        let c4 = self.g2;
         Coef {
-            a0: self.a_mat(),
-            a1,
+            a0: madd3(&madd3(&a0, &a1, kap), &a2, k2),
+            a1: madd3(&a1, &a2, 2.0 * kap),
             a2,
-            b0: self.b_vec(),
-            b1: [
-                self.a_vx + 2.0 * self.b_ux,
-                self.a_vy + 2.0 * self.b_uy,
-                2.0 * self.b,
-            ],
-            b2: [
-                self.g_ux + 2.0 * self.b_vx,
-                self.g_uy + 2.0 * self.b_vy,
-                self.g,
-            ],
-            c0: self.a2,
-            c1: 4.0 * self.a_b,
-            c2: 4.0 * self.b2 + 2.0 * self.a_g,
+            b0: vadd3(&vadd3(&vadd3(&b0, &b1, kap), &b2, k2), &b3, k2 * kap),
+            b1: vadd3(&vadd3(&b1, &b2, 2.0 * kap), &b3, 3.0 * k2),
+            b2: vadd3(&b2, &b3, 3.0 * kap),
+            c0: c0 + kap * (c1 + kap * (c2 + kap * (c3 + kap * c4))),
+            c1: c1 + kap * (2.0 * c2 + kap * (3.0 * c3 + kap * 4.0 * c4)),
+            c2: c2 + kap * (3.0 * c3 + kap * 6.0 * c4),
         }
     }
 
-    /// 在当前参考 `k`（`κ = 0`）处做变量投影。
+    /// 在当前参考 `k`（`κ = 0`）处做变量投影（测试用）。
+    #[cfg(test)]
     fn fit(&self) -> Option<Profile> {
         if !(self.w > 0.0) {
             return None;
@@ -719,13 +792,20 @@ impl Moments {
     }
 
     /// 给定 `θ` 在**无罚项**法方程上的残差平方和
-    /// `θᵀA₀θ + 2θᵀb₀ + c₀`。
+    /// `θᵀA₀θ + 2θᵀb₀ + c₀`（测试用）。
+    #[cfg(test)]
     fn loss_at(&self, theta: &[S; 3]) -> S {
-        let co = self.coef();
-        co.c0 + 2.0 * dot3(theta, &co.b0) + dot3(theta, &mv3(&co.a0, theta))
+        loss_from_coef(&self.coef(), theta)
     }
 }
 
+/// 给定 Taylor 系数，`θ` 在**无罚项**法方程上的残差平方和
+/// `θᵀa₀θ + 2θᵀb₀ + c₀`。
+fn loss_from_coef(co: &Coef, theta: &[S; 3]) -> S {
+    co.c0 + 2.0 * dot3(theta, &co.b0) + dot3(theta, &mv3(&co.a0, theta))
+}
+
+#[derive(Clone, Copy)]
 struct Coef {
     a0: M3,
     a1: M3,
@@ -799,16 +879,22 @@ fn fit_from_coef(co: &Coef) -> Option<Profile> {
     })
 }
 
-/// 在 `m` 的当前参考 `k` 处求剖面；`pen` 非空时把线性化半径罚项加进
-/// 法方程：`A₀ += μggᵀ`、`b₀ -= μzg`、`c₀ += μz²`。
+/// 在 `m` 的 `κ = 0` 处求带罚项剖面（测试用）。
+#[cfg(test)]
+fn fit_with_penalty(m: &Moments, pen: Option<RadiusPenalty>) -> Option<Profile> {
+    fit_with_penalty_coef(&m.coef(), pen)
+}
+
+/// 在目标 `κ` 处求剖面（系数由 [`Tracker::coef_at`] 给出）；`pen` 非空时把
+/// 线性化半径罚项加进法方程：`A₀ += μggᵀ`、`b₀ -= μzg`、`c₀ += μz²`。
 ///
 /// `g`、`z` 固定，所以 `P'`、`P''` 也是同一个带罚项剖面的导数，可以直接
 /// 拿去做 Newton 步和线搜索。
-fn fit_with_penalty(m: &Moments, pen: Option<RadiusPenalty>) -> Option<Profile> {
+fn fit_with_penalty_coef(co: &Coef, pen: Option<RadiusPenalty>) -> Option<Profile> {
     let Some(p) = pen else {
-        return m.fit();
+        return fit_from_coef(co);
     };
-    let mut co = m.coef();
+    let mut co = *co;
     for i in 0..3 {
         for j in 0..3 {
             co.a0[i][j] += p.mu * p.g[i] * p.g[j];
@@ -861,6 +947,22 @@ pub struct FitConfig {
     pub scan_obs_min: S,
     /// 每样本 Newton 步数。
     pub inner_iters: usize,
+    /// 是否把历史矩剪切到当前 `k` 的参考系（论文附录 A.1）。
+    ///
+    /// * `true`：存 `U_s = U + k_ref·V`，求值永远在 `κ = 0`；
+    /// * `false`：直接存 `U`、`V'`，每次在 `κ = k` 处把剖面展开到三/四次
+    ///   （`b` 到 `κ³`、`c` 到 `κ⁴`，这些矩本来就有，不需要额外统计量）。
+    ///
+    /// 两者**数学上严格等价**，差别只在浮点相消：`P = σ(κ) − q(κ)ᵀM(κ)⁻¹q(κ)`
+    /// 在 `κ = k` 处两项都是 `(k|V|)⁴` 量级，而 `P` 本身是 `(2R)²·σ_rel²·Σw`
+    /// 量级。但这个上界只在 `|V|` 本身很大时才有意义：直接观测器每个拟合周期
+    /// 都把最新样本搬到原点、`V` 的均值又搬进 `v_off`，矩里的 `|V|` 只有
+    /// 一个周期的增量，实测 `κ = k` 与剪切逐位一致（见模块文档 §4）。这里默认
+    /// `true` 保持通用；[`DirectFluxObserver`](super::direct_flux_observer)
+    /// 显式设为 `false`。
+    ///
+    /// 这是 A/B 实验开关；运行时切换由 [`Tracker::set_shear`] 做一次精确重投影。
+    pub shear: bool,
     /// 浮动原点阈值（内部单位）。
     pub recenter_eps: S,
     /// `V` 原点管理的触发阈值：存储 `V'` 的加权均值超过 `RMS(V')` 的这个倍数时
@@ -914,6 +1016,7 @@ impl Default for FitConfig {
             obs_min: 5.0e-3,
             scan_obs_min: 1.0e-4,
             inner_iters: 2,
+            shear: true,
             recenter_eps: 0.25,
             recenter_v_rel: 0.25,
             p2_eps: 1.0e-18,
@@ -966,8 +1069,9 @@ pub struct Report {
 
 /// 指数遗忘的流式 Kåsa 拟合器。
 ///
-/// 存储的 `(U, V)` 始终是“当前参考 `k`”下的量：`U_s = U + k_ref V`。因此
-/// 每拍求值都在 `κ = 0` 处进行，不需要组装 `Σ kʲ b_j`。
+/// 剪切开（`shear = true`）时，存储的 `(U, V)` 是“当前参考 `k`”下的量：
+/// `U_s = U + k_ref V`，每拍在 `κ = 0` 处求值。剪切断（`shear = false`）时存
+/// 原始 `U`、`V'`，在 `κ = k` 处展开；两种写法共用同一套矩和 `fit_from_coef`。
 ///
 /// `V` 另外有一个原点偏移：物理 `V = v + v_off`。`v` 存的是搬掉加权均值后
 /// 的 `V'`，所以 `U_s` 仍是物理量，剪切时要补 `dk·v_off`。
@@ -981,6 +1085,11 @@ pub struct Tracker {
     rmax_i: S,
     /// 当前估计，也是矩的参考 `k`。
     k: S,
+    /// 存储矩的 `U_s` 所处的参考 `k`：`U_s = U + k_ref·V`。
+    ///
+    /// 剪切模式在每次 `k` 变化后由 [`Tracker::reproject`] 把 `k_ref` 推到
+    /// 新的 `k`；非剪切模式恒为 `0`，求值点在 `κ = k - k_ref`。
+    k_ref: S,
     /// `set_initial` 给的初始 `k`，网格扫描围绕它展开。
     k_initial: S,
     /// 当前样本在局部参考系中的位置 `U_s`。
@@ -1023,6 +1132,7 @@ impl Tracker {
             m: Moments::default(),
             unit_len,
             k,
+            k_ref: if cfg.shear { k } else { 0.0 },
             k_initial: k,
             u: Vacc::default(),
             v: Vacc::default(),
@@ -1040,6 +1150,12 @@ impl Tracker {
     #[inline]
     pub fn k(&self) -> S {
         self.k
+    }
+
+    /// 当前存储方式是否带剪切（诊断）。
+    #[inline]
+    pub fn shear_enabled(&self) -> bool {
+        self.cfg.shear
     }
 
     #[inline]
@@ -1114,13 +1230,17 @@ impl Tracker {
         self.m.decay(rho);
         self.w2 *= rho * rho;
 
-        // 2. 积分增量（内部单位）。存储的是 U_s = U + k V，所以增量是
-        //    ΔU + k ΔV，不能只加 ΔU。
+        // 2. 积分增量（内部单位）。剪切模式存的是 U_s = U + k V，所以增量是
+        //    ΔU + k ΔV；非剪切模式存原始 U，只加 ΔU。路径长度始终用物理
+        //    Δp = ΔU + k ΔV，与存储方式无关。
         let inv = 1.0 / self.unit_len;
-        let du_s = delta_u.mul(inv).add(delta_v.mul(inv * self.k));
+        let du = delta_u.mul(inv);
+        let dv = delta_v.mul(inv);
+        let du_p = du.add(dv.mul(self.k));
+        let du_s = if self.cfg.shear { du_p } else { du };
         self.u.add(du_s);
-        self.v.add(delta_v.mul(inv));
-        self.path += du_s.norm();
+        self.v.add(dv);
+        self.path += du_p.norm();
 
         // 3. 累积矩
         let (ui, vi) = (self.u.val(), self.v.val());
@@ -1166,6 +1286,54 @@ impl Tracker {
         self.cfg.p2_eps = cfg.p2_eps;
         self.cfg.r_kappa = cfg.r_kappa;
         self.cfg.recenter_v_rel = cfg.recenter_v_rel;
+        if self.cfg.shear != cfg.shear {
+            self.set_shear(cfg.shear);
+        }
+    }
+
+    /// 打开/关闭剪切。切换本身是一次**精确重投影**，不改变剖面。
+    fn set_shear(&mut self, on: bool) {
+        if on == self.cfg.shear {
+            return;
+        }
+        let dk = if on {
+            self.k - self.k_ref
+        } else {
+            -self.k_ref
+        };
+        self.reproject(dk);
+        self.k_ref = if on { self.k } else { 0.0 };
+        self.cfg.shear = on;
+    }
+
+    /// 把存储矩从参考 `k_ref` 重投影到 `k_ref + dk`：
+    /// `U_s -> U_s + dk·V`（物理 `V = V' + v_off`，历史与当前样本都要补）。
+    fn reproject(&mut self, dk: S) {
+        if dk == 0.0 {
+            return;
+        }
+        self.m.shear(dk);
+        self.u.add(self.v.val().mul(dk));
+        if self.v_off.norm2() > 0.0 {
+            self.u.add(self.v_off.mul(dk));
+            self.m.translate_u(self.v_off.mul(-dk));
+        }
+        self.k_ref += dk;
+    }
+
+    /// 在存储矩 `m` 的 `κ = kap` 处组装剖面系数。
+    ///
+    /// 物理 `V = V' + v_off`，所以 `κ` 处等价于先把 `U` 平移 `κ·v_off`。
+    /// 剪切模式下 `kap` 恒为 0，这里就是 `m.coef()`，没有任何额外开销。
+    fn coef_at(&self, m: &Moments, kap: S) -> Coef {
+        if kap == 0.0 {
+            return m.coef();
+        }
+        let mut mm = *m;
+        if self.v_off.norm2() > 0.0 {
+            mm.translate_u(self.v_off.mul(-kap));
+        }
+        mm.coef_at(kap)
     }
 
     /// 把**最新样本**搬到局部原点：`U_s -> U_s - u`、`V' -> V' - v`。
@@ -1214,10 +1382,11 @@ impl Tracker {
         let inv = 1.0 / self.unit_len;
         let du = delta_u.mul(inv);
         let dv = delta_v.mul(inv);
-        let du_s = du.add(dv.mul(self.k));
+        let du_p = du.add(dv.mul(self.k));
+        let du_s = if self.cfg.shear { du_p } else { du };
         self.u.add(du_s);
         self.v.add(dv);
-        self.path += du_s.norm();
+        self.path += du_p.norm();
 
         let (ui, vi) = (self.u.val(), self.v.val());
         let q = if weight.is_finite() && weight > 0.0 {
@@ -1234,21 +1403,23 @@ impl Tracker {
         // 4. 恰好一次 Newton；可观性只缩放步长，不硬冻结
         self.steps = self.newton_weighted();
 
-        // 5. Newton 的剪切把样本挪到了 dk·v_off；再搬一次原点，保证下一周期
-        //    的增量从 0 开始。
+        // 5. Newton 可能改了 `k`（剪切模式下矩也被重投影）；再搬一次原点，
+        //    保证下一周期的增量从 0 开始。
         self.recenter_latest();
 
         self.report_pair()
     }
 
     /// 初始化网格扫描：在 `[k0/scan_rel, k0·scan_rel]` 上取对数网格，选剖面
-    /// 损失最小且曲率为正的点，把矩剪切过去，然后跑几步 Newton。
+    /// 损失最小且曲率为正的点，把 `k` 移过去（剪切模式下同时精确重投影矩），
+    /// 然后跑几步 Newton。
     ///
     /// 只在窗口足够长（`Σw` 与弧长由调用方把关）时调用。稳态数据上
     /// `P(k) ≡ 0`，扫描找不到显著更优的点，于是保持初始 `k` 不动并返回
     /// `false`——调用方可以稍后重试（等真正的瞬态到来）。
     pub fn initialize(&mut self) -> bool {
-        let Some((_, f_cur, _)) = self.fit_hinge(&self.m) else {
+        let kappa = self.k - self.k_ref;
+        let Some((_, f_cur, _)) = self.fit_hinge(&self.m, kappa) else {
             return false;
         };
         let lo = (self.k_initial / self.cfg.scan_rel.max(1.0)).max(self.cfg.k_min);
@@ -1281,14 +1452,19 @@ impl Tracker {
         if !(p_best < self.cfg.scan_gain * f_cur.p) {
             return false;
         }
-        let mut m = self.m.clone();
-        m.shear(k_best - self.k);
-        let Some((_, _, f0_best)) = self.fit_hinge(&m) else {
+        // 候选点的评估：剪切模式沿用原来的“先剪切到候选 k，再在 κ=0 求值”；
+        // 非剪切模式直接在 κ=k_best 展开（矩保持原始 `U`，不能再剪切一次）。
+        let (m_best, kappa_best) = if self.cfg.shear {
+            (self.moments_at(k_best), 0.0)
+        } else {
+            (self.m, k_best - self.k_ref)
+        };
+        let Some((_, _, f0_best)) = self.fit_hinge(&m_best, kappa_best) else {
             return false;
         };
         // 可辨识性与噪声门限只看**无约束**剖面：半径罚项是先验，不能替数据
         // 证明“这个 k 是数据支持的”。
-        let v2 = v_second(&m, self.v_off);
+        let v2 = v_second(&m_best, self.v_off);
         let scale = 4.0 * f0_best.radius * f0_best.radius * v2;
         let obs = if scale > 0.0 && scale.is_finite() {
             f0_best.p2 / scale
@@ -1299,18 +1475,16 @@ impl Tracker {
             return false;
         }
         // 圆模型可信度：高噪声下“更优的盆地”只是噪声，不能把 k 带跑。
-        let sigma_rel = (f0_best.p.max(0.0) / m.w.max(1.0e-300)).sqrt()
+        let sigma_rel = (f0_best.p.max(0.0) / m_best.w.max(1.0e-300)).sqrt()
             / (2.0 * f0_best.radius.max(1.0e-12));
         if !sigma_rel.is_finite() || sigma_rel > self.cfg.max_sigma_rel {
             return false;
         }
 
         let dk = k_best - self.k;
-        self.m.shear(dk);
-        self.u.add(self.v.val().mul(dk));
-        // 物理 V = V' + v_off：历史与当前样本都要补上 dk·v_off。
-        self.u.add(self.v_off.mul(dk));
-        self.m.translate_u(self.v_off.mul(-dk));
+        if self.cfg.shear {
+            self.reproject(dk);
+        }
         self.k = k_best;
         self.obs = obs;
         // 用较低的扫描门限把网格点抛光到局部极小；之后逐拍 Newton 仍用
@@ -1357,16 +1531,36 @@ impl Tracker {
         self.v_off = self.v_off.add(c);
     }
 
+    /// 把存储矩精确重投影到候选 `k`（剪切模式），供扫描/线搜索在 `κ = 0`
+    /// 处求值，保持原有的数值行为。
+    fn moments_at(&self, k: S) -> Moments {
+        let dk = k - self.k_ref;
+        let mut m = self.m;
+        if dk != 0.0 {
+            m.shear(dk);
+            if self.v_off.norm2() > 0.0 {
+                m.translate_u(self.v_off.mul(-dk));
+            }
+        }
+        m
+    }
+
     /// 在 `m` 上先做无约束拟合；半径越界时把线性化罚项加进法方程再解一次。
     ///
-    /// 返回 `(罚项, 带罚项解, 无约束解)`。两个解都在 `κ = 0` 处：可辨识性 /
-    /// 噪声门限用无约束解，Newton 步与线搜索用带罚项解。
-    fn fit_hinge(&self, m: &Moments) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
-        let f0 = m.fit()?;
+    /// `kappa = k - k_ref` 是求值点：剪切模式下恒为 0（`m` 已被剪切到当前
+    /// `k`），非剪切模式下是当前 `k` 的绝对值。返回 `(罚项, 带罚项解, 无约束解)`：
+    /// 可辨识性 / 噪声门限用无约束解，Newton 步与线搜索用带罚项解。
+    fn fit_hinge(
+        &self,
+        m: &Moments,
+        kappa: S,
+    ) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
+        let co = self.coef_at(m, kappa);
+        let f0 = fit_from_coef(&co)?;
         match self.radius_penalty(&f0, m.w) {
             None => Some((None, f0, f0)),
             Some(pen) => {
-                let f = fit_with_penalty(m, Some(pen))?;
+                let f = fit_with_penalty_coef(&co, Some(pen))?;
                 Some((Some(pen), f, f0))
             }
         }
@@ -1392,19 +1586,25 @@ impl Tracker {
         })
     }
 
-    /// 任意 `k` 处的 `fit_hinge`（拷贝矩 + 剪切 + 求值）。
+    /// 任意 `k` 处的 `fit_hinge`。剪切模式把矩剪切到该点、在 `κ = 0` 求值；
+    /// 非剪切模式直接在 `κ = k` 展开。
     fn fit_hinge_at(&self, k: S) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
-        let mut m = self.m.clone();
-        m.shear(k - self.k);
-        self.fit_hinge(&m)
+        if self.cfg.shear {
+            self.fit_hinge(&self.moments_at(k), 0.0)
+        } else {
+            self.fit_hinge(&self.m, k - self.k_ref)
+        }
     }
 
     /// 固定罚项的剖面损失。线搜索必须与 Newton 步用同一个目标，否则
     /// “`P` 下降”与“带罚项 `P` 下降”会互相打架。
     fn p_at_with_penalty(&self, k: S, pen: Option<RadiusPenalty>) -> Option<S> {
-        let mut m = self.m.clone();
-        m.shear(k - self.k);
-        fit_with_penalty(&m, pen).map(|f| f.p)
+        let co = if self.cfg.shear {
+            self.moments_at(k).coef()
+        } else {
+            self.coef_at(&self.m, k - self.k_ref)
+        };
+        fit_with_penalty_coef(&co, pen).map(|f| f.p)
     }
 
     fn newton(&mut self, iters: usize) -> u32 {
@@ -1430,7 +1630,8 @@ impl Tracker {
         for _ in 0..iters {
             // 无约束解决定门限，带罚项解决定步长：半径越界时 Newton 会把 k
             // 一起拉向可行域，而不是只把输出半径按到边界上。
-            let (pen, f, f0) = match self.fit_hinge(&self.m) {
+            let kappa = self.k - self.k_ref;
+            let (pen, f, f0) = match self.fit_hinge(&self.m, kappa) {
                 Some(x) => x,
                 None => break,
             };
@@ -1568,11 +1769,11 @@ impl Tracker {
             if dk == 0.0 {
                 break;
             }
-            // 精确地把历史重新投影到新的 k：存储的 `V'` 加上物理偏移 `v_off`。
-            self.m.shear(dk);
-            self.u.add(self.v.val().mul(dk));
-            self.u.add(self.v_off.mul(dk));
-            self.m.translate_u(self.v_off.mul(-dk));
+            // 精确地把历史重新投影到新的 k（非剪切模式下矩本来就存原始 U，
+            // 不需要动，只是在 κ=k 处求值）。
+            if self.cfg.shear {
+                self.reproject(dk);
+            }
             self.k = k_new;
             taken += 1;
             if dk.abs() < 1e-14 * (1.0 + self.k.abs()) {
@@ -1588,8 +1789,13 @@ impl Tracker {
 
     /// 报告 + **局部圆心**：后者是当前参考 `k` 下、以最新样本为原点（内部
     /// 单位）的拟合圆心，供快速环做“目标相对圆心”。
+    ///
+    /// 不剪切时 `recenter_latest` 把最新样本的局部坐标清成 `(0, 0)`，但它的
+    /// 物理位置是 `κ·v_off`，所以返回 `c - κ·v_off`；剪切模式 `κ = 0` 时就是 `c`。
     fn report_pair(&self) -> Option<(Report, V2)> {
-        let f0 = self.m.fit()?;
+        let kappa = self.k - self.k_ref;
+        let co = self.coef_at(&self.m, kappa);
+        let f0 = fit_from_coef(&co)?;
         let scale = 4.0 * f0.radius * f0.radius * v_second(&self.m, self.v_off);
         let obs = if scale > 0.0 && scale.is_finite() {
             f0.p2 / scale
@@ -1599,7 +1805,7 @@ impl Tracker {
         let pen = self.radius_penalty(&f0, self.m.w);
         let (theta, clamped) = match pen {
             None => (f0.theta, false),
-            Some(p) => match fit_with_penalty(&self.m, Some(p)) {
+            Some(p) => match fit_with_penalty_coef(&co, Some(p)) {
                 Some(f) => (f.theta, true),
                 // 罚项方程奇异时退回无约束解：宁可输出一个越界半径，
                 // 也不要丢掉这一拍的圆心 / 角度。
@@ -1612,14 +1818,23 @@ impl Tracker {
             return None;
         }
         let r = r2.sqrt();
-        let p_loc = self.u.val();
+        // 物理 `p_local = U_s + κ(V' + v_off)`：剪切模式 `κ = 0` 时就是存储
+        // 的 `U_s`；非剪切模式 `κ = k`，要补上 `k·V`。
+        let p_loc = if kappa == 0.0 {
+            self.u.val()
+        } else {
+            self.u
+                .val()
+                .add(self.v.val().mul(kappa))
+                .add(self.v_off.mul(kappa))
+        };
         let rel = p_loc.sub(c);
         let dist = rel.norm();
         let l = self.unit_len;
         let w = self.m.w.max(1.0e-300);
         // 损失与圆模型可信度都取**无罚项**残差（在约束后的 θ 上求值）：
         // 罚项常数 μz² 不能混进 P/Σw，否则 `sigma_rel` 门限会失真。
-        let loss = self.m.loss_at(&theta);
+        let loss = loss_from_coef(&co, &theta);
         let sigma_rel = (loss.max(0.0) / w).sqrt() / (2.0 * r.max(1.0e-12));
         // 与 Newton 门限同一个量：k 的标准误（诊断/调参用）。
         let n_eff = if self.w2 > 0.0 {
@@ -1650,7 +1865,7 @@ impl Tracker {
             obs,
             steps: self.steps,
             clamped,
-        }, c))
+        }, c.sub(self.v_off.mul(kappa))))
     }
 }
 
@@ -2540,6 +2755,129 @@ mod tests {
         assert!((tr.k() - k_true).abs() < 1.0e-3, "k={}", tr.k());
         assert!(tr.v_off().norm() > 0.5, "v_off 没生效: {:?}", tr.v_off());
         assert!((rep.radius - r_true).abs() < 1.0e-3, "R={}", rep.radius);
+    }
+
+    /// `coef_at(κ)` 必须与“把矩剪切到 κ 再在 κ=0 求值”给出同一个剖面。
+    #[test]
+    fn coef_at_matches_shear_round_trip() {
+        let k = 384.0;
+        let mut rng = XorShift::new(0x1234_5678);
+        let mut m = Moments::default();
+        for i in 0..300u32 {
+            let th = i as S * 0.07;
+            let target = V2::new(1.35 * th.cos(), 1.35 * th.sin());
+            let u = V2::new(1.5 * rng.sym(), 1.5 * rng.sym());
+            let noise = V2::new(0.002 * rng.sym(), 0.002 * rng.sym());
+            let v = target.add(noise).sub(u).mul(1.0 / k);
+            m.add(u, v, 1.0);
+        }
+        let rel = |x: S, y: S| (x - y).abs() / (1.0 + x.abs().max(y.abs()));
+        for &kappa in &[0.0, 0.7, 20.0, 384.0] {
+            let mut ms = m;
+            ms.shear(kappa);
+            let a = fit_from_coef(&m.coef_at(kappa)).unwrap();
+            let b = fit_from_coef(&ms.coef()).unwrap();
+            assert!(rel(a.radius, b.radius) < 1.0e-9, "κ={kappa} radius");
+            assert!(rel(a.p, b.p) < 1.0e-6, "κ={kappa} P {} vs {}", a.p, b.p);
+            assert!(rel(a.p1, b.p1) < 1.0e-6, "κ={kappa} P'");
+            assert!(rel(a.p2, b.p2) < 1.0e-6, "κ={kappa} P''");
+            for i in 0..3 {
+                assert!(
+                    (a.theta[i] - b.theta[i]).abs() < 1.0e-9,
+                    "κ={kappa} θ[{i}]"
+                );
+            }
+        }
+    }
+
+    fn run_tracker_with_shear(shear: bool, stream: &[(V2, V2, V2)], r: S, radius: S) -> (S, S) {
+        let mut cfg = FitConfig::default();
+        cfg.tau = 2.0;
+        cfg.r_min = 0.3 * radius;
+        cfg.r_max = 3.0 * radius;
+        cfg.k_min = 0.1 * r;
+        cfg.k_max = 10.0 * r;
+        cfg.obs_min = 1.0e-4;
+        cfg.shear = shear;
+        let mut tr = Tracker::new(cfg, 1.25 * r);
+        let mut scan = false;
+        for (i, (_, du, dv)) in stream.iter().enumerate() {
+            let t = i as S * 5.0e-5;
+            tr.update(*du, *dv, t, 1.0, if t >= 1.0 { 2 } else { 0 });
+            if !scan && t >= 1.0 {
+                scan = tr.initialize();
+            }
+        }
+        let rep = tr.report_now().unwrap();
+        (tr.k(), rep.radius)
+    }
+
+    /// 无噪声数据上，两种存储方式必须收敛到同一个 `k` 与半径。
+    #[test]
+    fn no_shear_tracker_matches_shear() {
+        let r = 384.0;
+        let radius = 4.04;
+        let dt = 5.0e-5;
+        let stream = synth_stream(
+            r,
+            radius,
+            100.0,
+            |t| 3.0 + 1.5 * (TAU * 0.7 * t).cos(),
+            3.0,
+            dt,
+        );
+        let (ks, rs) = run_tracker_with_shear(true, &stream, r, radius);
+        let (kn, rn) = run_tracker_with_shear(false, &stream, r, radius);
+        eprintln!("shear k={ks:.5} R={rs:.6} | no-shear k={kn:.5} R={rn:.6}");
+
+        assert!((ks - kn).abs() / r < 1.0e-5, "k: {ks} vs {kn}");
+        assert!(
+            (rs - rn).abs() / radius < 1.0e-5,
+            "radius: {rs} vs {rn}"
+        );
+    }
+
+    /// 运行中切换剪切必须是一次精确重投影：报告里的 `k`、圆心、半径、损失不变。
+    #[test]
+    fn set_shear_switch_preserves_profile() {
+        let r = 384.0;
+        let radius = 4.04;
+        let dt = 5.0e-5;
+        let stream = synth_stream(
+            r,
+            radius,
+            100.0,
+            |t| 3.0 + 1.5 * (TAU * 0.7 * t).cos(),
+            2.0,
+            dt,
+        );
+        let mut tr = tracker_for(r, radius, 1.25 * r);
+        let mut scan = false;
+        for (i, (_, du, dv)) in stream.iter().enumerate() {
+            let t = i as S * dt;
+            tr.update(*du, *dv, t, 1.0, if t >= 1.0 { 2 } else { 0 });
+            if !scan && t >= 1.0 {
+                scan = tr.initialize();
+            }
+        }
+        let a = tr.report_now().unwrap();
+        tr.set_shear(false);
+        let b = tr.report_now().unwrap();
+        tr.set_shear(true);
+        let c = tr.report_now().unwrap();
+        let rel = |x: S, y: S| (x - y).abs() / (1.0 + x.abs().max(y.abs()));
+        // 剪切是精确变换，只差舍入；|k| ~ 400，用 1e-12 的绝对尺度不现实。
+        assert!(rel(a.radius, b.radius) < 1.0e-10);
+        assert!(rel(a.radius, c.radius) < 1.0e-10);
+        assert!(rel(a.k, b.k) < 1.0e-12 && rel(a.k, c.k) < 1.0e-12);
+        assert!(rel(a.center.x, b.center.x) < 1.0e-9);
+        assert!(rel(a.center.x, c.center.x) < 1.0e-9);
+        assert!(rel(a.loss, b.loss) < 1.0e-6);
+        assert!(rel(a.loss, c.loss) < 1.0e-6);
+        eprintln!(
+            "switch: R {:.6}/{:.6}/{:.6} k {:.4}/{:.4}/{:.4}",
+            a.radius, b.radius, c.radius, a.k, b.k, c.k
+        );
     }
 
     fn assert_close(a: &Moments, b: &Moments, what: &str, tol: S) {

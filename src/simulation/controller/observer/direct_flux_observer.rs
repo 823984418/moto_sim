@@ -12,6 +12,11 @@
 //!   `w_sigma = clamp((σ_max/σ_rel)²,0,1)`、统计显著性
 //!   `w_sig = δ²/(δ²+σ_k²)`，其中 `σ_k = sqrt(2P/((N_eff-3)P''))`、
 //!   `N_eff = (Σw)²/Σw²`。`obs_min`/`σ_max` 是权重尺度，不是“过/不过”的门限。
+//! * **不需要剪切**。每个拟合周期先把最新样本搬到原点（`U`、`V` 各一次精确
+//!   平移），再更新矩，所以矩里的 `|U|`、`|V|` 只有“一个周期内增量”的量级；
+//!   `V` 的缓慢积分偏移又由 `v_off` 搬走。求值点在 `κ = k` 处也不会出现论文
+//!   §6.1 那种大数相消，实测与剪切逐位一致（见 `kasa_flux_observer` 模块 §4）。
+//!   `FitConfig::shear` 仍可打开做 A/B。
 //! * **每个拟合样本都把最新点搬到原点**（`U`、`V` 各一次精确平移），
 //!   拟合圆心因此总是相对“最新点”。
 //! * **加锁交班**：`Arc<Mutex<FastFlux>>` 内读并清零 `a`、`b`，同时
@@ -93,6 +98,9 @@ pub struct DirectFluxObserver {
     pub sigma_rel: S,
     /// `k` 的标准误（诊断/调参用）。
     pub sigma_k: S,
+    /// 剖面一阶/二阶导（诊断：无剪切时 `P'` 的绝对值会因相消而明显偏大）。
+    pub p1: S,
+    pub p2: S,
     pub steps: u32,
     pub weight: S,
     pub data_arc: S,
@@ -118,8 +126,15 @@ impl Default for DirectFluxObserver {
     fn default() -> Self {
         Self {
             // 直接观测器不需要随机游走先验：步长只由可观性加权。
+            //
+            // 也不再需要剪切：每个拟合周期都把最新样本搬到原点（`U`、`V`
+            // 各一次精确平移），矩里的 `|U|`、`|V|` 始终是“一个拟合周期内的
+            // 增量”量级，`κ = k` 处的三/四次展开没有相消问题（实测 0.5~100
+            // rad/s、1~10 mA、拟合周期放大到 0.2 s 都与剪切逐位一致）。
+            // 保留 `shear = true` 作为 A/B 开关。
             fit: FitConfig {
                 k_prior_rel: 0.0,
+                shear: false,
                 ..FitConfig::default()
             },
             fit_period: 0.01,
@@ -142,6 +157,8 @@ impl Default for DirectFluxObserver {
             obs: 0.0,
             sigma_rel: 0.0,
             sigma_k: 0.0,
+            p1: 0.0,
+            p2: 0.0,
             steps: 0,
             weight: 0.0,
             data_arc: 0.0,
@@ -209,6 +226,8 @@ impl DirectFluxObserver {
         self.obs = 0.0;
         self.sigma_rel = 0.0;
         self.sigma_k = 0.0;
+        self.p1 = 0.0;
+        self.p2 = 0.0;
         self.steps = 0;
         self.weight = 0.0;
         self.data_arc = 0.0;
@@ -308,6 +327,8 @@ impl Observer<3> for DirectFluxObserver {
                     self.obs = rep.obs;
                     self.sigma_rel = rep.sigma_rel;
                     self.sigma_k = rep.sigma_k;
+                    self.p1 = rep.p1;
+                    self.p2 = rep.p2;
                     self.steps = rep.steps;
                     self.weight = rep.weight;
                     self.center = rep.center;
@@ -551,35 +572,46 @@ mod tests {
         assert_eq!(gated.steps, 0, "gate should block the step");
     }
 
-    /// 最新样本必须位于拟合局部坐标原点（交班的前置条件）。
+    /// 最新样本必须位于拟合局部坐标原点（交班的前置条件），两种存储方式都要。
     #[test]
     fn step_once_puts_latest_sample_at_origin() {
         let (r, radius, dt) = (384.0, 4.04, 5.0e-5);
         let stream = synth_stream_profile(r, radius, |_| 20.0, |_| 3.0, 0.2, dt);
-        let mut cfg = FitConfig::default();
-        cfg.r_min = 0.3 * radius;
-        cfg.r_max = 3.0 * radius;
-        cfg.k_min = 0.1 * r;
-        cfg.k_max = 10.0 * r;
-        cfg.tau = 10.0;
-        let mut tr = Tracker::new(cfg, r);
-        let (mut a, mut b) = (V2::ZERO, V2::ZERO);
-        let (mut t, mut n, mut last) = (0.0, 0, None);
-        for (_th, du, dv) in stream {
-            a = a.add(du);
-            b = b.add(dv);
-            t += dt;
-            n += 1;
-            if n == 200 {
-                last = tr.step_once(a, b, t, 200.0);
-                a = V2::ZERO;
-                b = V2::ZERO;
-                n = 0;
+        for shear in [true, false] {
+            let mut cfg = FitConfig::default();
+            cfg.r_min = 0.3 * radius;
+            cfg.r_max = 3.0 * radius;
+            cfg.k_min = 0.1 * r;
+            cfg.k_max = 10.0 * r;
+            cfg.tau = 10.0;
+            cfg.shear = shear;
+            let mut tr = Tracker::new(cfg, r);
+            let (mut a, mut b) = (V2::ZERO, V2::ZERO);
+            let (mut t, mut n, mut last) = (0.0, 0, None);
+            for (_th, du, dv) in &stream {
+                a = a.add(*du);
+                b = b.add(*dv);
+                t += dt;
+                n += 1;
+                if n == 200 {
+                    last = tr.step_once(a, b, t, 200.0);
+                    a = V2::ZERO;
+                    b = V2::ZERO;
+                    n = 0;
+                }
             }
+            let (rep, c) = last.expect("report");
+            eprintln!(
+                "origin(shear={shear}): p_local={:?} c={:?} radius={:.4}",
+                tr.p_local(),
+                c,
+                rep.radius
+            );
+            assert!(
+                tr.p_local().norm() < 1.0e-12,
+                "latest sample not at origin (shear={shear})"
+            );
+            assert!((rep.radius - radius).abs() < 0.01, "shear={shear}");
         }
-        let (rep, c) = last.expect("report");
-        eprintln!("origin: p_local={:?} c={:?} radius={:.4}", tr.p_local(), c, rep.radius);
-        assert!(tr.p_local().norm() < 1.0e-12, "latest sample not at origin");
-        assert!((rep.radius - radius).abs() < 0.01);
     }
 }
