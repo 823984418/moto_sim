@@ -1,7 +1,5 @@
-use std::io::Write;
-
 use eframe::{App, CreationContext, Frame, NativeOptions};
-use egui::{CentralPanel, CollapsingHeader, Context, ScrollArea, Slider, Ui, Widget};
+use egui::{CentralPanel, CollapsingHeader, ScrollArea, Slider, Ui, Widget};
 use egui_plot::{Legend, Line, Plot, PlotPoint, default_label_formatter};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::model::zq10y_dead_mapping;
@@ -12,21 +10,17 @@ use moto_sim::simulation::controller::current_regulator::{
 use moto_sim::simulation::controller::inline_tune::{InductanceTune, ResTune};
 use moto_sim::simulation::controller::observer::any_observer::{AllObserver, AnyObserver};
 use moto_sim::simulation::controller::observer::base_flux_observer::BaseFluxObserver;
+use moto_sim::simulation::controller::observer::direct_flux_observer::DirectFluxObserver;
 use moto_sim::simulation::controller::observer::ds_observer::DsObserver;
 use moto_sim::simulation::controller::observer::ex_flux_observer::ExFluxObserver;
-use moto_sim::simulation::controller::observer::flux_circle_observer::FluxCircleObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
-use moto_sim::simulation::controller::observer::direct_flux_observer::DirectFluxObserver;
-use moto_sim::simulation::controller::observer::kasa_flux_observer::KasaFluxObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
 use moto_sim::simulation::controller::observer::mp_observer::MpObserver;
 use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
 use moto_sim::simulation::controller::observer::ss_observer::{SSObserver, SSample};
 use moto_sim::simulation::controller::observer::ss2_observer::{S2Sample, SS2Observer};
-use moto_sim::simulation::controller::observer::super_flux_observer::{
-    SuperFluxObserver, SuperFluxSample,
-};
+use moto_sim::simulation::controller::observer::super_flux_observer::SuperFluxObserver;
 use moto_sim::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use moto_sim::simulation::motion_load::ideal_motion_load::IdealMotionLoad;
 use moto_sim::simulation::motion_load::{MotionLoad, MotionLoadInput, MotionLoadOutput};
@@ -91,9 +85,9 @@ pub struct Simulation {
     /// 最近一次传给观测器的零矢量采样间隔（秒），0 表示无有效零矢量。
     pub last_slope_dt: f64,
     /// GUI 演示用：把电流采样噪声切到 1 mA（PAPER.md 的假设值）。
-    pub flux_circle_low_noise: bool,
-    /// GUI 演示用：闭环磁链观测器时把速度环降慢，避免与 PLL 相位滞后耦合。
-    pub flux_circle_slow_speed_loop: bool,
+    pub low_noise: bool,
+    /// GUI 演示用：闭环时把速度环降慢，避免与观测器的相位滞后耦合。
+    pub slow_speed_loop: bool,
 
     pub target_speed: f64,
     /// 速度 PI 的比例/积分增益（A/(rad/s)）。原值 0.1；闭环磁链观测器
@@ -126,8 +120,6 @@ pub struct Simulation {
     super_flux_observer_output: ObserverOutput,
     ss2_observer_output: ObserverOutput,
     all_observer_output: ObserverOutput,
-    pub flux_circle_observer_output: ObserverOutput,
-    pub kasa_flux_observer_output: ObserverOutput,
     pub direct_flux_observer_output: ObserverOutput,
 
     current_regulator_input: CurrentRegulatorInput<3>,
@@ -152,8 +144,6 @@ pub struct Simulation {
     pub super_flux_observer: SuperFluxObserver,
     pub ss2_observer: SS2Observer,
     pub all_observer: AllObserver,
-    pub flux_circle_observer: FluxCircleObserver,
-    pub kasa_flux_observer: KasaFluxObserver,
     pub direct_flux_observer: DirectFluxObserver,
 
     pub current_regulator: ThreePhasePICurrentRegulator,
@@ -333,36 +323,22 @@ impl Simulation {
         all_observer.any_observer.inductor = 9.9e-3;
         all_observer.any_observer.inductor_rate = 0.0;
 
-        // 磁链圆观测器：PAPER.md 的算法。初始角度取本仿真已知的转子位置
-        // （等价于启动前的 ALIGN），R 与半径取电机铭牌值。
+        // 直接磁链积分观测器（无 PLL，快速环反正切 + 10 ms 圆拟合）。
+        // 初始角度取本仿真已知的转子位置（等价于启动前的 ALIGN），R 与半径取
+        // 电机铭牌值。拟合参数必须在 `set_initial` 之前写入：`Tracker` 是在
+        // `set_initial` 里用这份配置构造的。
         let mean_inductance = (motor.inductance_dq[0] + motor.inductance_dq[1]) * 0.5;
         let nominal_r = motor.rs / mean_inductance;
         let nominal_radius = motor.flux / mean_inductance;
         let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
-        let mut flux_circle_observer = FluxCircleObserver::new();
-        flux_circle_observer.set_initial(initial_electrical_angle, 0.0, nominal_r, nominal_radius);
-        flux_circle_observer.pll_wn_min = 50.0;
-
-        // 流式 Kåsa 观测器：同样的启动状态，拟合换成指数遗忘的递归矩。
-        let mut kasa_flux_observer = KasaFluxObserver::new();
-        kasa_flux_observer.set_initial(
+        let mut direct_flux_observer = DirectFluxObserver::new();
+        direct_flux_observer.fit.tau = 1.0;
+        direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
             nominal_r,
             nominal_radius,
         );
-        kasa_flux_observer.pll_wn_min = 50.0;
-        kasa_flux_observer.fit.tau = 1.0;
-
-        // 直接磁链积分观测器（无 PLL，快速环反正切 + 10 ms 圆拟合）。
-        let mut direct_flux_observer = DirectFluxObserver::new();
-        direct_flux_observer.set_initial(
-            initial_electrical_angle,
-            0.0,
-            nominal_r * 0.5,
-            nominal_radius,
-        );
-        direct_flux_observer.fit.tau = 10.0;
 
         Self {
             delta_time: 0.0001,
@@ -389,8 +365,8 @@ impl Simulation {
             slope_dead_scale: 1.0,
             current_noise_std: 0.01,
             last_slope_dt: 0.0,
-            flux_circle_low_noise: false,
-            flux_circle_slow_speed_loop: false,
+            low_noise: false,
+            slow_speed_loop: false,
             output_voltage_noise: [
                 Noise::new(0.01, 4),
                 Noise::new(0.01, 5),
@@ -433,8 +409,6 @@ impl Simulation {
             super_flux_observer,
             ss2_observer,
             all_observer,
-            flux_circle_observer,
-            kasa_flux_observer,
             direct_flux_observer,
             dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
@@ -629,12 +603,6 @@ impl Simulation {
                         self.ss2_observer.update(delta_time, &self.observer_input);
                     self.all_observer_output =
                         self.all_observer.update(delta_time, &self.observer_input);
-                    self.flux_circle_observer_output = self
-                        .flux_circle_observer
-                        .update(delta_time, &self.observer_input);
-                    self.kasa_flux_observer_output = self
-                        .kasa_flux_observer
-                        .update(delta_time, &self.observer_input);
                     self.direct_flux_observer_output = self
                         .direct_flux_observer
                         .update(delta_time, &self.observer_input);
@@ -652,9 +620,7 @@ impl Simulation {
                         9 => &self.super_flux_observer_output,
                         10 => &self.ss2_observer_output,
                         11 => &self.all_observer_output,
-                        12 => &self.flux_circle_observer_output,
-                        13 => &self.kasa_flux_observer_output,
-                        14 => &self.direct_flux_observer_output,
+                        12 => &self.direct_flux_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
@@ -695,20 +661,7 @@ impl Simulation {
                         .current_regulator
                         .update(delta_time, &self.current_regulator_input);
 
-                    let mut command_voltage = self.current_regulator_output.command_voltage;
-
-                    let inject_voltage = inverse_clarke(rotate(
-                        [
-                            10.0 * f64::sin(5000.0 * self.timer.time),
-                            0.0 * f64::sin(5000.0 * self.timer.time),
-                        ],
-                        self.current_regulator_input.electrical_angle,
-                    ));
-                    let inject_voltage =
-                        inverse_clarke(rotate([0.0, 0.0], 5000.0 * self.timer.time));
-                    command_voltage[0] += inject_voltage[0];
-                    command_voltage[1] += inject_voltage[1];
-                    command_voltage[2] += inject_voltage[2];
+                    let command_voltage = self.current_regulator_output.command_voltage;
 
                     self.power_bridge_input.output_duty =
                         command_voltage.map(|i| nn(i * 2.0 / sample_bus_voltage));
@@ -866,12 +819,6 @@ impl Application {
                     // ScopeData::new("all_angle", |s: &mut Simulation| {
                     //     s.all_observer_output.electrical_angle
                     // }),
-                    ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
-                        s.flux_circle_observer_output.electrical_angle
-                    }),
-                    ScopeData::new("kasa_angle", |s: &mut Simulation| {
-                        s.kasa_flux_observer_output.electrical_angle
-                    }),
                     ScopeData::new("direct_angle", |s: &mut Simulation| {
                         s.direct_flux_observer_output.electrical_angle
                     }),
@@ -952,25 +899,6 @@ impl Application {
                     //             - s.motion_load.angle * s.motor.pole_pairs,
                     //     )
                     // }),
-                    ScopeData::new("flux_circle_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.flux_circle_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
-                    ScopeData::new("kasa_angle", |s: &mut Simulation| {
-                        angle_normal(
-                            s.kasa_flux_observer_output.electrical_angle
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
-                    // 未过 PLL 的圆上测量角误差：用来区分“几何错了”还是“PLL 滞后”。
-                    ScopeData::new("kasa_meas", |s: &mut Simulation| {
-                        angle_normal(
-                            s.kasa_flux_observer.theta_meas
-                                - s.motion_load.angle * s.motor.pole_pairs,
-                        )
-                    }),
                     // 直接磁链：输出角误差与未滤波的反正切角误差（无 PLL）。
                     ScopeData::new("direct_angle", |s: &mut Simulation| {
                         angle_normal(
@@ -1028,12 +956,6 @@ impl Application {
                     // ScopeData::new("all_speed", |s: &mut Simulation| {
                     //     s.all_observer_output.electrical_speed
                     // }),
-                    ScopeData::new("flux_circle_speed", |s: &mut Simulation| {
-                        s.flux_circle_observer_output.electrical_speed
-                    }),
-                    ScopeData::new("kasa_speed", |s: &mut Simulation| {
-                        s.kasa_flux_observer_output.electrical_speed
-                    }),
                     ScopeData::new("direct_speed", |s: &mut Simulation| {
                         s.direct_flux_observer_output.electrical_speed
                     }),
@@ -1208,71 +1130,6 @@ impl Application {
                 ],
             ),
             (
-                "flux_circle_r".to_string(),
-                vec![
-                    ScopeData::new("true_R", |s: &mut Simulation| {
-                        s.motor.rs / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
-                    }),
-                    ScopeData::new("estimated_R", |s: &mut Simulation| s.flux_circle_observer.r),
-                ],
-            ),
-            (
-                "flux_circle_radius".to_string(),
-                vec![
-                    ScopeData::new("true_radius", |s: &mut Simulation| {
-                        s.motor.flux / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
-                    }),
-                    ScopeData::new("estimated_radius", |s: &mut Simulation| {
-                        s.flux_circle_observer.radius
-                    }),
-                ],
-            ),
-            (
-                "flux_circle_observability".to_string(),
-                vec![
-                    ScopeData::new("gamma", |s: &mut Simulation| s.flux_circle_observer.gamma),
-                    ScopeData::new("fit_count", |s: &mut Simulation| {
-                        s.flux_circle_observer.fit_count as f64
-                    }),
-                    ScopeData::new("fit_fail", |s: &mut Simulation| {
-                        s.flux_circle_observer.fit_fail as f64
-                    }),
-                ],
-            ),
-            (
-                "flux_circle_valid".to_string(),
-                vec![
-                    ScopeData::new("valid", |s: &mut Simulation| {
-                        if s.flux_circle_observer.valid {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }),
-                    ScopeData::new("slope_dt_us", |s: &mut Simulation| s.last_slope_dt * 1.0e6),
-                ],
-            ),
-            (
-                "kasa_flux_r".to_string(),
-                vec![
-                    ScopeData::new("true_R", |s: &mut Simulation| {
-                        s.motor.rs / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
-                    }),
-                    ScopeData::new("estimated_R", |s: &mut Simulation| s.kasa_flux_observer.r),
-                ],
-            ),
-            (
-                "kasa_flux_radius".to_string(),
-                vec![
-                    ScopeData::new("true_radius", |s: &mut Simulation| {
-                        s.motor.flux / ((s.motor.inductance_dq[0] + s.motor.inductance_dq[1]) * 0.5)
-                    }),
-                    ScopeData::new("estimated_radius", |s: &mut Simulation| {
-                        s.kasa_flux_observer.radius
-                    }),
-                ],
-            ),
-            (
                 "direct_flux".to_string(),
                 vec![
                     ScopeData::new("true_R", |s: &mut Simulation| {
@@ -1329,65 +1186,6 @@ impl Application {
                     }),
                 ],
             ),
-            (
-                "kasa_flux_observability".to_string(),
-                vec![
-                    ScopeData::new("obs", |s: &mut Simulation| s.kasa_flux_observer.obs),
-                    ScopeData::new("sigma_rel", |s: &mut Simulation| {
-                        s.kasa_flux_observer.sigma_rel
-                    }),
-                    ScopeData::new("data_arc", |s: &mut Simulation| {
-                        s.kasa_flux_observer.data_arc
-                    }),
-                    ScopeData::new("weight", |s: &mut Simulation| s.kasa_flux_observer.weight),
-                    ScopeData::new("use_fit", |s: &mut Simulation| {
-                        if s.kasa_flux_observer.use_fit {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }),
-                    ScopeData::new("scan_done", |s: &mut Simulation| {
-                        if s.kasa_flux_observer.scan_done {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }),
-                ],
-            ),
-            (
-                "kasa_flux_newton".to_string(),
-                vec![
-                    ScopeData::new("p1", |s: &mut Simulation| s.kasa_flux_observer.p1),
-                    ScopeData::new("p2", |s: &mut Simulation| s.kasa_flux_observer.p2),
-                    ScopeData::new("steps", |s: &mut Simulation| {
-                        s.kasa_flux_observer.steps as f64
-                    }),
-                ],
-            ),
-            (
-                "kasa_flux_mag".to_string(),
-                vec![
-                    ScopeData::new("flux_mag", |s: &mut Simulation| {
-                        s.kasa_flux_observer.flux_mag
-                    }),
-                    ScopeData::new("radius", |s: &mut Simulation| s.kasa_flux_observer.radius),
-                ],
-            ),
-            (
-                "kasa_flux_valid".to_string(),
-                vec![
-                    ScopeData::new("valid", |s: &mut Simulation| {
-                        if s.kasa_flux_observer.valid {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }),
-                    ScopeData::new("slope_dt_us", |s: &mut Simulation| s.last_slope_dt * 1.0e6),
-                ],
-            ),
         ];
     }
 
@@ -1437,7 +1235,7 @@ impl App for Application {
                 ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=14).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=12).ui(ui);
                 ui.label(match self.simulation.use_observer {
                     0 => "sensor_observer",
                     1 => "grad_observer",
@@ -1451,16 +1249,14 @@ impl App for Application {
                     9 => "super_flux_observer",
                     10 => "ss2_observer",
                     11 => "all_observer",
-                    12 => "flux_circle_observer",
-                    13 => "kasa_flux_observer",
-                    14 => "direct_flux_observer",
+                    12 => "direct_flux_observer",
                     _ => "sensor_observer",
                 });
                 if ui
-                    .checkbox(&mut self.simulation.flux_circle_low_noise, "flux 1mA")
+                    .checkbox(&mut self.simulation.low_noise, "1 mA 噪声")
                     .changed()
                 {
-                    let std = if self.simulation.flux_circle_low_noise {
+                    let std = if self.simulation.low_noise {
                         0.001
                     } else {
                         0.01
@@ -1468,13 +1264,10 @@ impl App for Application {
                     self.simulation.set_current_noise(std);
                 }
                 if ui
-                    .checkbox(
-                        &mut self.simulation.flux_circle_slow_speed_loop,
-                        "flux slow loop",
-                    )
+                    .checkbox(&mut self.simulation.slow_speed_loop, "慢速环")
                     .changed()
                 {
-                    let (kp, ki) = if self.simulation.flux_circle_slow_speed_loop {
+                    let (kp, ki) = if self.simulation.slow_speed_loop {
                         (0.02, 0.02)
                     } else {
                         (0.1, 0.1)
@@ -1574,45 +1367,23 @@ fn run_headless(args: &[String]) {
     let speed_kp = arg_f64(args, "--speed-kp", 0.1);
     let speed_ki = arg_f64(args, "--speed-ki", 0.1);
     let load = arg_value(args, "--load").and_then(|s| s.parse::<f64>().ok());
-    let use_flux_circle = args.iter().any(|a| a == "--use-flux-circle");
-    let use_kasa = args.iter().any(|a| a == "--use-kasa");
-    let use_direct = args.iter().any(|a| a == "--use-direct");
     // 观测器只做旁观（电流环仍用传感器角），用来单独评价观测器。
     let observe_only = args.iter().any(|a| a == "--observe-only");
     let handover = arg_f64(args, "--handover", 0.0);
-    let no_fit = args.iter().any(|a| a == "--no-fit");
-    let wn_min = arg_f64(args, "--wn-min", 50.0);
-    let wn_min_run = arg_f64(args, "--wn-min-run", 1.0);
-    let narrow_time = arg_f64(args, "--narrow-time", 2.0);
-    let gamma_min = arg_f64(args, "--gamma-min", 0.05);
+    let tau = arg_f64(args, "--tau", 1.0);
+    let obs_min = arg_f64(args, "--obs-min", 5.0e-3);
+    let k_prior = arg_f64(args, "--k-prior", 0.02);
+    let k_step = arg_f64(args, "--k-step", 0.02);
     let max_sigma_rel = arg_f64(args, "--max-sigma-rel", 0.02);
-    let window = arg_f64(args, "--window", 1.0);
-    let no_drift = args.iter().any(|a| a == "--no-drift");
-    let kasa_tau = arg_f64(args, "--kasa-tau", 1.0);
-    let kasa_scan_time = arg_f64(args, "--kasa-scan-time", 0.2);
-    let kasa_min_arc = arg_f64(args, "--kasa-min-arc", std::f64::consts::TAU);
-    let kasa_inner = arg_f64(args, "--kasa-inner", 2.0).max(0.0) as usize;
-    let kasa_obs_min = arg_f64(args, "--kasa-obs-min", 5.0e-3);
-    let kasa_prior = arg_f64(args, "--kasa-prior", 0.02);
-    let kasa_step = arg_f64(args, "--kasa-step", 0.02);
-    let kasa_max_sigma = arg_f64(args, "--kasa-max-sigma-rel", 0.02);
-    let kasa_k_sigma = arg_f64(args, "--kasa-k-sigma", 0.0);
-    let kasa_hard_sigma = args.iter().any(|a| a == "--kasa-hard-sigma");
+    let k_sigma = arg_f64(args, "--k-sigma", 0.0);
+    let hard_sigma = args.iter().any(|a| a == "--hard-sigma");
     // A/B：`--shear` 打开剪切（U_s -> U + k_ref·V）；默认不剪切，直接在
     // κ=k 处展开三/四次剖面。
     let shear = args.iter().any(|a| a == "--shear");
     let fit_period = arg_f64(args, "--fit-period", 0.01);
-    let kasa_scan_gain = arg_f64(args, "--kasa-scan-gain", 0.5);
     let warmup_fraction = arg_f64(args, "--warmup", 0.5).clamp(0.0, 0.99);
-    let csv = arg_value(args, "--csv").map(|s| s.to_string());
     let verbose = args.iter().any(|a| a == "--verbose");
-    let closed_loop_idx = if use_direct {
-        14
-    } else if use_kasa {
-        13
-    } else {
-        12
-    };
+    let closed_loop_idx = 12;
 
     let dt = 1.0 / 20e3;
     let mut sim = Simulation::new();
@@ -1636,9 +1407,9 @@ fn run_headless(args: &[String]) {
     if let Some(torque) = load {
         sim.motion_load.static_friction_torque = torque;
     }
-    if (use_flux_circle || use_kasa || use_direct) && !observe_only {
+    if !observe_only {
         // 默认从 0 秒就闭环；--handover 可先让传感器闭环把转子带到低速，
-        // 再交班给观测器（对应 PAPER.md §7 的 RUN 阶段）。
+        // 再交班给观测器。
         sim.use_observer = if handover > 0.0 { 0 } else { closed_loop_idx };
     }
 
@@ -1646,44 +1417,16 @@ fn run_headless(args: &[String]) {
     let nominal_r = sim.motor.rs / mean_l;
     let nominal_radius = sim.motor.flux / mean_l;
     let theta0 = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
-    sim.flux_circle_observer
-        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
-    sim.flux_circle_observer.pll_wn_min = wn_min;
-    sim.flux_circle_observer.pll_wn_min_run = wn_min_run;
-    sim.flux_circle_observer.pll_narrow_time = narrow_time;
-    sim.flux_circle_observer.gamma_min = gamma_min;
-    sim.flux_circle_observer.max_sigma_rel = max_sigma_rel;
-    sim.flux_circle_observer.min_window = window;
-    sim.flux_circle_observer.fit_cfg.fit_drift = !no_drift;
-    sim.flux_circle_observer.fit_enabled = !no_fit;
-
-    sim.kasa_flux_observer
-        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
-    sim.kasa_flux_observer.pll_wn_min = wn_min;
-    sim.kasa_flux_observer.pll_wn_min_run = wn_min_run;
-    sim.kasa_flux_observer.pll_narrow_time = narrow_time;
-    sim.kasa_flux_observer.fit.tau = kasa_tau;
-    sim.kasa_flux_observer.fit.inner_iters = kasa_inner;
-    sim.kasa_flux_observer.fit.obs_min = kasa_obs_min;
-    sim.kasa_flux_observer.fit.k_prior_rel = kasa_prior;
-    sim.kasa_flux_observer.fit.k_step_rel = kasa_step;
-    sim.kasa_flux_observer.fit.max_sigma_rel = kasa_max_sigma;
-    sim.kasa_flux_observer.fit.k_sigma = kasa_k_sigma;
-    sim.kasa_flux_observer.fit.gate_sigma_rel = kasa_hard_sigma;
-    sim.kasa_flux_observer.fit.scan_gain = kasa_scan_gain;
-    sim.kasa_flux_observer.scan_time = kasa_scan_time;
-    sim.kasa_flux_observer.min_arc = kasa_min_arc;
-    sim.kasa_flux_observer.fit_enabled = !no_fit;
 
     // 先把拟合参数写进 observer，再 set_initial——Tracker 在 set_initial 里
     // 用这份配置构造，顺序反了会拿到默认 tau。
-    sim.direct_flux_observer.fit.tau = kasa_tau;
-    sim.direct_flux_observer.fit.obs_min = kasa_obs_min;
-    sim.direct_flux_observer.fit.k_prior_rel = kasa_prior;
-    sim.direct_flux_observer.fit.k_step_rel = kasa_step;
-    sim.direct_flux_observer.fit.max_sigma_rel = kasa_max_sigma;
-    sim.direct_flux_observer.fit.k_sigma = kasa_k_sigma;
-    sim.direct_flux_observer.fit.gate_sigma_rel = kasa_hard_sigma;
+    sim.direct_flux_observer.fit.tau = tau;
+    sim.direct_flux_observer.fit.obs_min = obs_min;
+    sim.direct_flux_observer.fit.k_prior_rel = k_prior;
+    sim.direct_flux_observer.fit.k_step_rel = k_step;
+    sim.direct_flux_observer.fit.max_sigma_rel = max_sigma_rel;
+    sim.direct_flux_observer.fit.k_sigma = k_sigma;
+    sim.direct_flux_observer.fit.gate_sigma_rel = hard_sigma;
     sim.direct_flux_observer.fit.shear = shear;
     sim.direct_flux_observer.fit_period = fit_period;
     sim.direct_flux_observer
@@ -1691,32 +1434,6 @@ fn run_headless(args: &[String]) {
 
     let steps = (seconds / dt).round() as usize;
     let warmup_steps = (steps as f64 * warmup_fraction) as usize;
-
-    let mut csv_writer = if use_direct {
-        if csv.is_some() {
-            eprintln!("--csv 还没有为 --use-direct 接线，忽略导岀。");
-        }
-        None
-    } else {
-        csv.as_ref().map(|path| {
-        let file = std::fs::File::create(path).expect("create csv");
-        let mut writer = std::io::BufWriter::new(file);
-        if use_kasa {
-            writeln!(
-                writer,
-                "t,true_angle,est_angle,err,theta_meas,err_meas,true_speed,est_speed,id,iq,r,radius,obs,sigma_rel,valid,slope_dt_us,p_x,p_y,c_x,c_y,scan_done,steps,weight"
-            )
-            .unwrap();
-        } else {
-            writeln!(
-                writer,
-                "t,true_angle,est_angle,err,theta_meas,err_meas,true_speed,est_speed,id,iq,r,radius,gamma,valid,slope_dt_us,u_x,u_y,c_x,c_y,fit_count,fit_fail,fit_gamma,fit_arc,fit_sigma"
-            )
-            .unwrap();
-        }
-        writer
-    })
-    };
 
     let mut startup = Metrics::default();
     let mut steady = Metrics::default();
@@ -1732,7 +1449,7 @@ fn run_headless(args: &[String]) {
         if speed3.is_finite() && t_step >= speed3_time {
             sim.cmd_speed = speed3;
         }
-        if (use_flux_circle || use_kasa || use_direct) && !observe_only && handover > 0.0 {
+        if !observe_only && handover > 0.0 {
             sim.use_observer = if (k as f64) * dt >= handover {
                 closed_loop_idx
             } else {
@@ -1744,7 +1461,7 @@ fn run_headless(args: &[String]) {
         let true_angle = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
         let true_speed = sim.motion_load.speed * sim.motor.pole_pairs;
 
-        let (out, obs_r, obs_radius, obs_index, valid, theta_meas) = if use_direct {
+        let (out, obs_r, obs_radius, obs_index, valid) = {
             let o = &sim.direct_flux_observer;
             (
                 sim.direct_flux_observer_output.clone(),
@@ -1752,27 +1469,6 @@ fn run_headless(args: &[String]) {
                 o.radius,
                 o.obs,
                 o.valid,
-                o.theta_meas,
-            )
-        } else if use_kasa {
-            let o = &sim.kasa_flux_observer;
-            (
-                sim.kasa_flux_observer_output.clone(),
-                o.r,
-                o.radius,
-                o.obs,
-                o.valid,
-                o.theta_meas,
-            )
-        } else {
-            let o = &sim.flux_circle_observer;
-            (
-                sim.flux_circle_observer_output.clone(),
-                o.r,
-                o.radius,
-                o.gamma,
-                o.valid,
-                o.theta_meas,
             )
         };
         let err = angle_normal(out.electrical_angle - true_angle);
@@ -1788,116 +1484,30 @@ fn run_headless(args: &[String]) {
             r_max = r_max.max(obs_r);
         }
 
-        if let Some(writer) = csv_writer.as_mut() {
-            if k % 10 == 0 {
-                let err_meas = angle_normal(theta_meas - true_angle);
-                if use_kasa {
-                    let o = &sim.kasa_flux_observer;
-                    let (p, c) = o.debug_state();
-                    writeln!(
-                        writer,
-                        "{t:.6},{true_angle:.6},{est:.6},{err:.6},{theta_meas:.6},{err_meas:.6},{true_speed:.6},{est_speed:.6},{id:.6},{iq:.6},{r:.6},{radius:.6},{obs:.3e},{sigma_rel:.3e},{valid},{slope_dt_us:.3e},{p_x:.6},{p_y:.6},{c_x:.6},{c_y:.6},{scan_done},{steps},{weight:.2}",
-                        est = out.electrical_angle,
-                        est_speed = out.electrical_speed,
-                        id = sim.motor.current_dq[0],
-                        iq = sim.motor.current_dq[1],
-                        r = obs_r,
-                        radius = obs_radius,
-                        obs = obs_index,
-                        sigma_rel = o.sigma_rel,
-                        valid = if valid { 1 } else { 0 },
-                        slope_dt_us = sim.last_slope_dt * 1.0e6,
-                        p_x = p.x,
-                        p_y = p.y,
-                        c_x = c.x,
-                        c_y = c.y,
-                        scan_done = if o.scan_done { 1 } else { 0 },
-                        steps = o.steps,
-                        weight = o.weight,
-                    )
-                    .unwrap();
-                } else {
-                    let fit = sim.flux_circle_observer.fit;
-                    let (fg, fa, fs) = fit.map(|f| (f.gamma, f.arc, f.sigma)).unwrap_or((
-                        f64::NAN,
-                        f64::NAN,
-                        f64::NAN,
-                    ));
-                    let (_, _, u, c) = sim.flux_circle_observer.debug_state();
-                    writeln!(
-                        writer,
-                        "{t:.6},{true_angle:.6},{est:.6},{err:.6},{theta_meas:.6},{err_meas:.6},{true_speed:.6},{est_speed:.6},{id:.6},{iq:.6},{r:.6},{radius:.6},{gamma:.3e},{valid},{slope_dt_us:.3e},{u_x:.6},{u_y:.6},{c_x:.6},{c_y:.6},{fit_count},{fit_fail},{fg:.3e},{fa:.3e},{fs:.3e}",
-                        est = out.electrical_angle,
-                        est_speed = out.electrical_speed,
-                        id = sim.motor.current_dq[0],
-                        iq = sim.motor.current_dq[1],
-                        r = obs_r,
-                        radius = obs_radius,
-                        gamma = obs_index,
-                        valid = if valid { 1 } else { 0 },
-                        slope_dt_us = sim.last_slope_dt * 1.0e6,
-                        u_x = u.x,
-                        u_y = u.y,
-                        c_x = c.x,
-                        c_y = c.y,
-                        fit_count = sim.flux_circle_observer.fit_count,
-                        fit_fail = sim.flux_circle_observer.fit_fail,
-                    )
-                    .unwrap();
-                }
-            }
-        }
-
         if verbose && t - last_print >= seconds / 20.0 {
             last_print = t;
             println!(
-                "t={t:6.3}s err={:8.3}deg r={:8.2} radius={:7.3} index={:.2e} valid={} scan={}",
+                "t={t:6.3}s err={:8.3}deg r={:8.2} radius={:7.3} obs={:.2e} valid={}",
                 err.to_degrees(),
                 obs_r,
                 obs_radius,
                 obs_index,
                 valid,
-                sim.kasa_flux_observer.scan_done,
             );
         }
     }
 
-    if use_kasa {
-        println!("=== kasa streaming observer (headless) ===");
-        println!(
-            "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
-             slope_noise={noise_scale} dead_injection={dead} dead_scale={dead_scale} \
-             current_noise={:.4} speed_ramp={speed_ramp} wn_min={wn_min}->{wn_min_run} \
-             tau={kasa_tau} scan_time={kasa_scan_time} min_arc={kasa_min_arc:.2} inner={kasa_inner} \
-             obs_min={kasa_obs_min:.1e} prior={kasa_prior} step={kasa_step} \
-             sigma_rel={kasa_max_sigma:.3} scan_gain={kasa_scan_gain:.2} \
-             narrow_time={narrow_time} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
-            current_noise.unwrap_or(0.01),
-        );
-    } else if use_direct {
-        println!("=== direct flux observer (headless) ===");
-        println!(
-            "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
-             slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
-             tau={kasa_tau} obs_min={kasa_obs_min:.1e} prior={kasa_prior} step={kasa_step} \
-             sigma_rel={kasa_max_sigma:.3} k_sigma={kasa_k_sigma} hard_sigma={kasa_hard_sigma} \
-             shear={} fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
-            current_noise.unwrap_or(0.01),
-            shear,
-            sim.direct_flux_observer.fit_period,
-        );
-    } else {
-        println!("=== flux circle observer (headless) ===");
-        println!(
-            "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
-             slope_noise={noise_scale} dead_injection={dead} dead_scale={dead_scale} \
-             current_noise={:.4} speed_ramp={speed_ramp} wn_min={wn_min}->{wn_min_run} \
-             gamma_min={gamma_min} window={window} drift={} narrow_time={narrow_time} \
-             speed_kp={speed_kp} speed_ki={speed_ki} closed_loop={use_flux_circle} handover={handover}",
-            current_noise.unwrap_or(0.01),
-            !no_drift
-        );
-    }
+    println!("=== direct flux observer (headless) ===");
+    println!(
+        "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
+         slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
+         tau={tau} obs_min={obs_min:.1e} prior={k_prior} step={k_step} \
+         sigma_rel={max_sigma_rel:.3} k_sigma={k_sigma} hard_sigma={hard_sigma} \
+         shear={} fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
+        current_noise.unwrap_or(0.01),
+        shear,
+        sim.direct_flux_observer.fit_period,
+    );
     println!("true R={nominal_r:.3} s^-1, true radius={nominal_radius:.4} A");
     println!(
         "startup: n={} valid={:.1}% rms={:.3}deg max={:.3}deg bias={:.3}deg",
@@ -1916,27 +1526,7 @@ fn run_headless(args: &[String]) {
         steady.bias().to_degrees(),
         steady.speed_rms()
     );
-    if use_kasa {
-        let o = &sim.kasa_flux_observer;
-        println!(
-            "observer: r={:.3} ({:+.2}%) radius={:.4} ({:+.2}%) obs={:.3e} sigma_rel={:.3e} weight={:.0} scan={} tries={} p2={:.2e} slope_dt={:.2}us",
-            o.r,
-            100.0 * (o.r - nominal_r) / nominal_r,
-            o.radius,
-            100.0 * (o.radius - nominal_radius) / nominal_radius,
-            o.obs,
-            o.sigma_rel,
-            o.weight,
-            o.scan_done,
-            o.scan_tries,
-            o.p2,
-            sim.last_slope_dt * 1.0e6,
-        );
-        println!(
-            "use_fit={} fit_updates={} updates={} valid={}",
-            o.use_fit, o.fit_updates, o.updates, o.valid
-        );
-    } else if use_direct {
+    {
         let o = &sim.direct_flux_observer;
         println!(
             "observer: r={:.3} ({:+.2}%) r_fit={:.3} radius={:.4} ({:+.2}%) radius_fit={:.4} obs={:.3e} sigma_rel={:.3e} sigma_k={:.3e} p1={:.2e} p2={:.2e} weight={:.0} steps={} fits={} updates={} valid={} slope_dt={:.2}us",
@@ -1958,29 +1548,8 @@ fn run_headless(args: &[String]) {
             o.valid,
             sim.last_slope_dt * 1.0e6,
         );
-    } else {
-        println!(
-            "observer: r={:.3} ({:+.2}%) radius={:.4} ({:+.2}%) gamma={:.3e} fits={} fail={} slope_dt={:.2}us",
-            sim.flux_circle_observer.r,
-            100.0 * (sim.flux_circle_observer.r - nominal_r) / nominal_r,
-            sim.flux_circle_observer.radius,
-            100.0 * (sim.flux_circle_observer.radius - nominal_radius) / nominal_radius,
-            sim.flux_circle_observer.gamma,
-            sim.flux_circle_observer.fit_count,
-            sim.flux_circle_observer.fit_fail,
-            sim.last_slope_dt * 1.0e6,
-        );
-        if let Some(f) = sim.flux_circle_observer.fit {
-            println!(
-                "last fit: r={:.3} radius={:.3} gamma={:.3e} arc={:.2}rad sigma={:.3e} inlier={:.3} n={}",
-                f.r, f.radius, f.gamma, f.arc, f.sigma, f.inlier_frac, f.n_obs
-            );
-        }
     }
     println!("R range over valid samples: {r_min:.3} .. {r_max:.3}");
-    if let Some(path) = csv {
-        println!("csv: {path}");
-    }
 }
 
 fn main() {

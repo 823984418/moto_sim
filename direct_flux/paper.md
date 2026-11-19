@@ -29,7 +29,7 @@ $$
 
 ### 1.3 与上一版的关系
 
-拟合的 36 个矩、变量投影、剪切、$V$ 的原点管理、半径伪观测都复用上一版（见 `kasa_flux_observer.rs`）；本文新增的是**观测器层的时序与交班**：`DirectFluxObserver`（`direct_flux_observer.rs`）和 `Tracker::step_once`。旧 `KasaFluxObserver`（index 13，带 PLL）原样保留做 A/B 对照。
+拟合的 36 个矩、变量投影、剪切、$V$ 的原点管理、半径伪观测都复用上一版；它们现在和观测器一起放在 `direct_flux_observer.rs` 的“拟合核心”里（旧 `KasaFluxObserver` 已删除）。本文新增的是**观测器层的时序与交班**：`DirectFluxObserver` 和 `Tracker::step_once`。
 
 ---
 
@@ -270,7 +270,7 @@ $$
 | 采样 | `fit_accum >= fit_period` | 10 ms 调度 | 不是门限 |
 | 测量 | `slope_dt <= 0` | 本拍无零矢量，不积分、`valid=false` | 无测量，不可去 |
 
-旧 `KasaFluxObserver` 的 `obs_min` 硬门限、`sigma_rel` 冻结、初始化扫描、`min_arc` 都在它自己的路径上，**不在** `DirectFluxObserver` 里。
+旧实现的 `obs_min` 硬门限、`sigma_rel` 冻结、初始化扫描、`min_arc` 都没有搬进 `DirectFluxObserver`。
 
 ---
 
@@ -293,22 +293,21 @@ $$
 
 ## 8 Rust 实现
 
-- `src/simulation/controller/observer/direct_flux_observer.rs`：`DirectFluxObserver`、`FastFlux`、`Observer<3>` 实现、3 个单测（加速/减速跟踪、$R$ 恢复、最新样本在原点）。
-- `src/simulation/controller/observer/kasa_flux_observer.rs`：新增 `Tracker::recenter_latest`、`Tracker::step_once`、`newton_weighted`、`report_pair`；旧 `KasaFluxObserver` 未改。
-- `examples/example1.rs`：`use_observer = 14`（`direct_flux_observer`），headless `--use-direct`，Scope `direct_flux` / `direct_flux_mag` / `direct_flux_valid`，以及 `angle`/`angle_error`/`speed` 里的 `direct_*` 曲线。
+- `src/simulation/controller/observer/direct_flux_observer.rs`：`DirectFluxObserver`、`FastFlux`、`Observer<3>` 实现、流式拟合核心（`Moments` / `Tracker` / `FitConfig` / `Report`）以及全部单测。旧的 `kasa_flux_observer.rs`、`flux_circle_observer.rs` 已删除。
+- `examples/example1.rs`：`use_observer = 12`（`direct_flux_observer`，也是唯一的高性能观测器），Scope `direct_flux` / `direct_flux_mag` / `direct_flux_valid`，以及 `angle`/`angle_error`/`speed` 里的 `direct_*` 曲线；headless 默认就是直接观测器，`--observe-only` 做被动评价。
 
 复现：
 
 ```powershell
 # 1 mA 被动观测
-cargo run --release --example example1 -- --headless --use-direct --observe-only `
+cargo run --release --example example1 -- --headless --observe-only `
   --seconds 8 --speed 20 --current-noise 0.001
 # 加速→减速到 20
-cargo run --release --example example1 -- --headless --use-direct --observe-only `
+cargo run --release --example example1 -- --headless --observe-only `
   --seconds 8 --speed 20 --current-noise 0.001 `
   --speed2 100 --speed2-time 1 --speed3 20 --speed3-time 3
 # 减速到 0
-cargo run --release --example example1 -- --headless --use-direct --observe-only `
+cargo run --release --example example1 -- --headless --observe-only `
   --seconds 8 --speed 20 --current-noise 0.001 `
   --speed2 100 --speed2-time 1 --speed3 0 --speed3-time 3
 ```
@@ -406,12 +405,12 @@ $$
 
 ## 附录 C 复现与选型
 
-- 旧 Kåsa（PLL）：`use_observer = 13` / `--use-kasa`；直接磁链：`use_observer = 14` / `--use-direct`。
-- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`sync_obs_weighted=false`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`。
+- 直接磁链观测器是当前唯一的磁链圆观测器：`use_observer = 12`；headless 不需要选型参数，直接跑 `example1 --headless [--observe-only]` 即可。
+- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`sync_obs_weighted=false`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`、`fit.shear=false`（`--shear` 可打开对照）。
 
 ## 参考文献
 
 1. I. Kåsa, "A circle fitting procedure and its error analysis," *IEEE Transactions on Instrumentation and Measurement*, vol. 25, no. 1, pp. 8–14, 1976.
 2. G. H. Golub and V. Pereyra, "The differentiation of pseudo-inverses and nonlinear least squares problems whose variables separate," *SIAM Journal on Numerical Analysis*, vol. 10, no. 2, pp. 413–432, 1973.
-3. `2026-11-18-kasa-streaming/paper.md`，指数遗忘 Kåsa 圆拟合与变量投影（上一版拟合层）。
-4. `kasa_flux/KASA_FLUX_REPORT.md`，moto_sim 上的 Kåsa 流式观测器实现与验证。
+3. `2026-11-18-kasa-streaming/paper.md`，指数遗忘 Kåsa 圆拟合与变量投影（拟合层的理论来源）。
+4. `direct_flux/REPORT.md`，本仓库里的实现、测试与实测记录。
