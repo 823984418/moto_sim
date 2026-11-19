@@ -162,45 +162,6 @@ impl V2 {
 type M3 = [[S; 3]; 3];
 
 #[inline]
-fn outer(a: V2, b: V2) -> [[S; 2]; 2] {
-    [[a.x * b.x, a.x * b.y], [a.y * b.x, a.y * b.y]]
-}
-
-#[inline]
-fn mv(m: &[[S; 2]; 2], v: V2) -> V2 {
-    V2::new(
-        m[0][0] * v.x + m[0][1] * v.y,
-        m[1][0] * v.x + m[1][1] * v.y,
-    )
-}
-
-#[inline]
-fn mtr(m: &[[S; 2]; 2]) -> [[S; 2]; 2] {
-    [[m[0][0], m[1][0]], [m[0][1], m[1][1]]]
-}
-
-#[inline]
-fn madd(a: &[[S; 2]; 2], b: &[[S; 2]; 2]) -> [[S; 2]; 2] {
-    [
-        [a[0][0] + b[0][0], a[0][1] + b[0][1]],
-        [a[1][0] + b[1][0], a[1][1] + b[1][1]],
-    ]
-}
-
-#[inline]
-fn msub(a: &[[S; 2]; 2], b: &[[S; 2]; 2]) -> [[S; 2]; 2] {
-    [
-        [a[0][0] - b[0][0], a[0][1] - b[0][1]],
-        [a[1][0] - b[1][0], a[1][1] - b[1][1]],
-    ]
-}
-
-#[inline]
-fn msc(a: &[[S; 2]; 2], s: S) -> [[S; 2]; 2] {
-    [[a[0][0] * s, a[0][1] * s], [a[1][0] * s, a[1][1] * s]]
-}
-
-#[inline]
 fn dot3(a: &[S; 3], b: &[S; 3]) -> S {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -343,290 +304,389 @@ impl Vacc {
 ///   c(k) = c0 + k c1 + k² c2 + k³ c3 + k⁴ c4
 /// ```
 ///
-/// 每个系数都是下面这些矩的固定线性组合。注意 `uv` 存的是完整的非对称
-/// `Σ w U Vᵀ`：平移变换里 `(ΣUVᵀ)s` 与 `(ΣVUᵀ)s` 不同。
-#[derive(Clone, Debug, Default)]
+/// 每个系数都是下面这些矩的固定线性组合。注意 `ux_vx/ux_vy/uy_vx/uy_vy`
+/// 存的是完整的非对称 `ΣwUVᵀ`：平移变换里 `(ΣUVᵀ)s` 与 `(ΣVUᵀ)s` 不同。
+#[derive(Clone, Copy, Debug, Default)]
 struct Moments {
+    // ---- 论文 §4.5 的 36 个矩；字段名与论文表格（以及论文 §9.1 的代码）逐行一致 ----
+    /// Σw
     w: S,
-    u: V2,
-    v: V2,
-    uu: [[S; 2]; 2],
-    uv: [[S; 2]; 2],
-    vv: [[S; 2]; 2],
-    a0: S,
-    au: V2,
-    av: V2,
-    b0: S,
-    bu: V2,
-    bv: V2,
-    g0: S,
-    gu: V2,
-    gv: V2,
-    /// `Σ w * (α², αβ, β², αγ, βγ, γ²)`
-    aa: S,
-    ab: S,
-    bb: S,
-    ag: S,
-    bg: S,
-    gg: S,
+    /// ΣwU_x、ΣwU_y
+    ux: S,
+    uy: S,
+    /// ΣwU_x²、ΣwU_xU_y、ΣwU_y²
+    ux2: S,
+    ux_uy: S,
+    uy2: S,
+    /// ΣwV_x、ΣwV_y
+    vx: S,
+    vy: S,
+    /// ΣwV_x²、ΣwV_xV_y、ΣwV_y²
+    vx2: S,
+    vx_vy: S,
+    vy2: S,
+    /// ΣwUVᵀ 的四个元素（非对称：U_xV_y 与 U_yV_x 是两个不同的和）
+    ux_vx: S,
+    ux_vy: S,
+    uy_vx: S,
+    uy_vy: S,
+    /// Σwα·(1, U_x, U_y, V_x, V_y)，α = |U|²
+    a: S,
+    a_ux: S,
+    a_uy: S,
+    a_vx: S,
+    a_vy: S,
+    /// Σwβ·(1, U_x, U_y, V_x, V_y)，β = U·V
+    b: S,
+    b_ux: S,
+    b_uy: S,
+    b_vx: S,
+    b_vy: S,
+    /// Σwγ·(1, U_x, U_y, V_x, V_y)，γ = |V|²
+    g: S,
+    g_ux: S,
+    g_uy: S,
+    g_vx: S,
+    g_vy: S,
+    /// Σw(α², αβ, β², αγ, βγ, γ²)
+    a2: S,
+    a_b: S,
+    b2: S,
+    a_g: S,
+    b_g: S,
+    g2: S,
 }
 
 impl Moments {
     #[inline]
     fn decay(&mut self, rho: S) {
         self.w *= rho;
-        self.u = self.u.mul(rho);
-        self.v = self.v.mul(rho);
-        self.uu = msc(&self.uu, rho);
-        self.uv = msc(&self.uv, rho);
-        self.vv = msc(&self.vv, rho);
-        self.a0 *= rho;
-        self.au = self.au.mul(rho);
-        self.av = self.av.mul(rho);
-        self.b0 *= rho;
-        self.bu = self.bu.mul(rho);
-        self.bv = self.bv.mul(rho);
-        self.g0 *= rho;
-        self.gu = self.gu.mul(rho);
-        self.gv = self.gv.mul(rho);
-        self.aa *= rho;
-        self.ab *= rho;
-        self.bb *= rho;
-        self.ag *= rho;
-        self.bg *= rho;
-        self.gg *= rho;
+        self.ux *= rho;
+        self.uy *= rho;
+        self.ux2 *= rho;
+        self.ux_uy *= rho;
+        self.uy2 *= rho;
+        self.vx *= rho;
+        self.vy *= rho;
+        self.vx2 *= rho;
+        self.vx_vy *= rho;
+        self.vy2 *= rho;
+        self.ux_vx *= rho;
+        self.ux_vy *= rho;
+        self.uy_vx *= rho;
+        self.uy_vy *= rho;
+        self.a *= rho;
+        self.a_ux *= rho;
+        self.a_uy *= rho;
+        self.a_vx *= rho;
+        self.a_vy *= rho;
+        self.b *= rho;
+        self.b_ux *= rho;
+        self.b_uy *= rho;
+        self.b_vx *= rho;
+        self.b_vy *= rho;
+        self.g *= rho;
+        self.g_ux *= rho;
+        self.g_uy *= rho;
+        self.g_vx *= rho;
+        self.g_vy *= rho;
+        self.a2 *= rho;
+        self.a_b *= rho;
+        self.b2 *= rho;
+        self.a_g *= rho;
+        self.b_g *= rho;
+        self.g2 *= rho;
     }
 
-    /// 加入一个权重为 `q` 的样本。
+    /// 加入一个权重为 `q` 的样本；36 个字段逐行对应论文 §4.5 的表。
     #[inline]
     fn add(&mut self, u: V2, v: V2, q: S) {
-        let alpha = u.norm2();
-        let beta = u.dot(v);
-        let gamma = v.norm2();
+        let alpha = u.x * u.x + u.y * u.y;
+        let beta = u.x * v.x + u.y * v.y;
+        let gamma = v.x * v.x + v.y * v.y;
 
         self.w += q;
-        self.u = self.u.add(u.mul(q));
-        self.v = self.v.add(v.mul(q));
-        self.uu = madd(&self.uu, &msc(&outer(u, u), q));
-        self.uv = madd(&self.uv, &msc(&outer(u, v), q));
-        self.vv = madd(&self.vv, &msc(&outer(v, v), q));
+        self.ux += q * u.x;
+        self.uy += q * u.y;
+        self.ux2 += q * (u.x * u.x);
+        self.ux_uy += q * (u.x * u.y);
+        self.uy2 += q * (u.y * u.y);
+        self.vx += q * v.x;
+        self.vy += q * v.y;
+        self.vx2 += q * (v.x * v.x);
+        self.vx_vy += q * (v.x * v.y);
+        self.vy2 += q * (v.y * v.y);
+        self.ux_vx += q * (u.x * v.x);
+        self.ux_vy += q * (u.x * v.y);
+        self.uy_vx += q * (u.y * v.x);
+        self.uy_vy += q * (u.y * v.y);
 
-        self.a0 += q * alpha;
-        self.au = self.au.add(u.mul(q * alpha));
-        self.av = self.av.add(v.mul(q * alpha));
+        self.a += q * alpha;
+        self.a_ux += q * (alpha * u.x);
+        self.a_uy += q * (alpha * u.y);
+        self.a_vx += q * (alpha * v.x);
+        self.a_vy += q * (alpha * v.y);
 
-        self.b0 += q * beta;
-        self.bu = self.bu.add(u.mul(q * beta));
-        self.bv = self.bv.add(v.mul(q * beta));
+        self.b += q * beta;
+        self.b_ux += q * (beta * u.x);
+        self.b_uy += q * (beta * u.y);
+        self.b_vx += q * (beta * v.x);
+        self.b_vy += q * (beta * v.y);
 
-        self.g0 += q * gamma;
-        self.gu = self.gu.add(u.mul(q * gamma));
-        self.gv = self.gv.add(v.mul(q * gamma));
+        self.g += q * gamma;
+        self.g_ux += q * (gamma * u.x);
+        self.g_uy += q * (gamma * u.y);
+        self.g_vx += q * (gamma * v.x);
+        self.g_vy += q * (gamma * v.y);
 
-        self.aa += q * alpha * alpha;
-        self.ab += q * alpha * beta;
-        self.bb += q * beta * beta;
-        self.ag += q * alpha * gamma;
-        self.bg += q * beta * gamma;
-        self.gg += q * gamma * gamma;
+        self.a2 += q * (alpha * alpha);
+        self.a_b += q * (alpha * beta);
+        self.b2 += q * (beta * beta);
+        self.a_g += q * (alpha * gamma);
+        self.b_g += q * (beta * gamma);
+        self.g2 += q * (gamma * gamma);
     }
 
-    /// 把整个历史重新投影到 `k + lam`：`U -> U + lam V`。
+    /// 剪切 `U -> U + lam V`：精确重投影，`p(κ)` 与剖面不变。
     ///
-    /// 这是精确变换：对任意 `κ`，`p(κ)` 不变。它等价于“用新的 `k` 把每个历史
-    /// 样本重新算一遍”，所以 `P(k)` 不变，但之后求值都落在 `κ = 0`。
+    /// 论文附录 A.1；`g_ux/g_uy` 必须跟着动（γ 不变但 U 变了）。
     fn shear(&mut self, lam: S) {
         if lam == 0.0 {
             return;
         }
+        let m = *self;
         let l2 = lam * lam;
         let l3 = l2 * lam;
         let l4 = l2 * l2;
 
-        let (u, v, uu, uv, vv) = (self.u, self.v, self.uu, self.uv, self.vv);
-        let (a0, au, av) = (self.a0, self.au, self.av);
-        let (b0, bu, bv) = (self.b0, self.bu, self.bv);
-        let (g0, gu, gv) = (self.g0, self.gu, self.gv);
-        let (aa, ab, bb, ag, bg, gg) = (self.aa, self.ab, self.bb, self.ag, self.bg, self.gg);
+        // α' = α + 2λη + λ²γ, β' = β + λγ, γ' = γ
+        self.ux = m.ux + lam * m.vx;
+        self.uy = m.uy + lam * m.vy;
+        self.ux2 = m.ux2 + 2.0 * lam * m.ux_vx + l2 * m.vx2;
+        self.ux_uy = m.ux_uy + lam * (m.ux_vy + m.uy_vx) + l2 * m.vx_vy;
+        self.uy2 = m.uy2 + 2.0 * lam * m.uy_vy + l2 * m.vy2;
+        self.ux_vx = m.ux_vx + lam * m.vx2;
+        self.ux_vy = m.ux_vy + lam * m.vx_vy;
+        self.uy_vx = m.uy_vx + lam * m.vx_vy;
+        self.uy_vy = m.uy_vy + lam * m.vy2;
 
-        self.u = u.add(v.mul(lam));
-        self.uu = madd(
-            &madd(&uu, &msc(&madd(&uv, &mtr(&uv)), lam)),
-            &msc(&vv, l2),
-        );
-        self.uv = madd(&uv, &msc(&vv, lam));
+        self.a = m.a + 2.0 * lam * m.b + l2 * m.g;
+        self.a_ux = m.a_ux
+            + lam * m.a_vx
+            + 2.0 * lam * m.b_ux
+            + 2.0 * l2 * m.b_vx
+            + l2 * m.g_ux
+            + l3 * m.g_vx;
+        self.a_uy = m.a_uy
+            + lam * m.a_vy
+            + 2.0 * lam * m.b_uy
+            + 2.0 * l2 * m.b_vy
+            + l2 * m.g_uy
+            + l3 * m.g_vy;
+        self.a_vx = m.a_vx + 2.0 * lam * m.b_vx + l2 * m.g_vx;
+        self.a_vy = m.a_vy + 2.0 * lam * m.b_vy + l2 * m.g_vy;
 
-        self.a0 = a0 + 2.0 * lam * b0 + l2 * g0;
-        self.au = au
-            .add(av.mul(lam))
-            .add(bu.mul(2.0 * lam))
-            .add(bv.mul(2.0 * l2))
-            .add(gu.mul(l2))
-            .add(gv.mul(l3));
-        self.av = av.add(bv.mul(2.0 * lam)).add(gv.mul(l2));
+        self.b = m.b + lam * m.g;
+        self.b_ux = m.b_ux + lam * m.b_vx + lam * m.g_ux + l2 * m.g_vx;
+        self.b_uy = m.b_uy + lam * m.b_vy + lam * m.g_uy + l2 * m.g_vy;
+        self.b_vx = m.b_vx + lam * m.g_vx;
+        self.b_vy = m.b_vy + lam * m.g_vy;
 
-        self.b0 = b0 + lam * g0;
-        self.bu = bu.add(bv.mul(lam)).add(gu.mul(lam)).add(gv.mul(l2));
-        self.bv = bv.add(gv.mul(lam));
+        // γ 不变，但 U 变了
+        self.g_ux = m.g_ux + lam * m.g_vx;
+        self.g_uy = m.g_uy + lam * m.g_vy;
 
-        // γ 不变，但 U 变了，所以 Σ w γ U 必须跟着动。
-        self.gu = gu.add(gv.mul(lam));
-
-        self.aa = aa + 4.0 * lam * ab + 2.0 * l2 * ag + 4.0 * l2 * bb + 4.0 * l3 * bg + l4 * gg;
-        self.ab = ab + lam * ag + 2.0 * lam * bb + 3.0 * l2 * bg + l3 * gg;
-        self.bb = bb + 2.0 * lam * bg + l2 * gg;
-        self.ag = ag + 2.0 * lam * bg + l2 * gg;
-        self.bg = bg + lam * gg;
-        // w, v, vv, g0, gv, gg 在剪切下不变
+        self.a2 = m.a2 + 4.0 * lam * m.a_b + 2.0 * l2 * m.a_g + 4.0 * l2 * m.b2
+            + 4.0 * l3 * m.b_g
+            + l4 * m.g2;
+        self.a_b = m.a_b + lam * m.a_g + 2.0 * lam * m.b2 + 3.0 * l2 * m.b_g + l3 * m.g2;
+        self.b2 = m.b2 + 2.0 * lam * m.b_g + l2 * m.g2;
+        self.a_g = m.a_g + 2.0 * lam * m.b_g + l2 * m.g2;
+        self.b_g = m.b_g + lam * m.g2;
+        // w、V 那一族、g、g_vx、g_vy、g2 在剪切下不变
     }
 
-    /// 坐标系平移 `U -> U - s`（`V` 不动）。精确；Kåsa 评分不变，圆心读数加回 `s`。
+    /// 平移 `U -> U - s`（`V` 不动）：精确；Kåsa 评分不变，圆心读数加回 `s`。
+    ///
+    /// 论文附录 A.2。
     fn translate_u(&mut self, s: V2) {
         if s.norm2() == 0.0 {
             return;
         }
-        let w = self.w;
-        let u = self.u;
-        let v = self.v;
-        let uu = self.uu;
-        let uv = self.uv;
-        let vv = self.vv;
-        let (a0, au, av) = (self.a0, self.au, self.av);
-        let (b0, bu, bv) = (self.b0, self.bu, self.bv);
-        let (g0, gu, gv) = (self.g0, self.gu, self.gv);
-        let (aa, ab, bb, ag, bg) = (self.aa, self.ab, self.bb, self.ag, self.bg);
+        let m = *self;
+        let (sx, sy) = (s.x, s.y);
+        let s2 = sx * sx + sy * sy;
+        let su = sx * m.ux + sy * m.uy;
+        let sv = sx * m.vx + sy * m.vy;
+        let uu_s_x = m.ux2 * sx + m.ux_uy * sy;
+        let uu_s_y = m.ux_uy * sx + m.uy2 * sy;
+        let uv_s_x = m.ux_vx * sx + m.ux_vy * sy;
+        let uv_s_y = m.uy_vx * sx + m.uy_vy * sy;
+        let vu_s_x = m.ux_vx * sx + m.uy_vx * sy;
+        let vu_s_y = m.ux_vy * sx + m.uy_vy * sy;
+        let vv_s_x = m.vx2 * sx + m.vx_vy * sy;
+        let vv_s_y = m.vx_vy * sx + m.vy2 * sy;
 
-        let s2 = s.norm2();
-        let su = s.dot(u);
-        let sv = s.dot(v);
-        let cs = mv(&uv, s); // Σ U (V·s)
-        let cts = mv(&mtr(&uv), s); // Σ V (U·s)
-        let uus = mv(&uu, s);
-        let vvs = mv(&vv, s);
+        self.ux = m.ux - sx * m.w;
+        self.uy = m.uy - sy * m.w;
+        self.ux2 = m.ux2 - 2.0 * sx * m.ux + m.w * sx * sx;
+        self.ux_uy = m.ux_uy - sx * m.uy - sy * m.ux + m.w * sx * sy;
+        self.uy2 = m.uy2 - 2.0 * sy * m.uy + m.w * sy * sy;
+        self.ux_vx = m.ux_vx - sx * m.vx;
+        self.ux_vy = m.ux_vy - sx * m.vy;
+        self.uy_vx = m.uy_vx - sy * m.vx;
+        self.uy_vy = m.uy_vy - sy * m.vy;
 
-        self.u = u.sub(s.mul(w));
-        self.uu = madd(
-            &msub(&msub(&uu, &outer(u, s)), &outer(s, u)),
-            &msc(&outer(s, s), w),
-        );
-        self.uv = msub(&uv, &outer(s, v));
+        self.a = m.a - 2.0 * su + s2 * m.w;
+        self.a_ux = m.a_ux
+            - sx * m.a
+            - 2.0 * uu_s_x
+            + m.ux * s2
+            + sx * (2.0 * su)
+            - sx * (s2 * m.w);
+        self.a_uy = m.a_uy
+            - sy * m.a
+            - 2.0 * uu_s_y
+            + m.uy * s2
+            + sy * (2.0 * su)
+            - sy * (s2 * m.w);
+        self.a_vx = m.a_vx - 2.0 * vu_s_x + m.vx * s2;
+        self.a_vy = m.a_vy - 2.0 * vu_s_y + m.vy * s2;
 
-        self.a0 = a0 - 2.0 * su + s2 * w;
-        self.au = au
-            .sub(s.mul(a0))
-            .sub(uus.mul(2.0))
-            .add(u.mul(s2))
-            .add(s.mul(2.0 * su))
-            .sub(s.mul(s2 * w));
-        self.av = av.sub(cts.mul(2.0)).add(v.mul(s2));
+        self.b = m.b - sv;
+        self.b_ux = m.b_ux - sx * m.b - uv_s_x + sx * sv;
+        self.b_uy = m.b_uy - sy * m.b - uv_s_y + sy * sv;
+        self.b_vx = m.b_vx - vv_s_x;
+        self.b_vy = m.b_vy - vv_s_y;
 
-        self.b0 = b0 - sv;
-        self.bu = bu.sub(s.mul(b0)).sub(cs).add(s.mul(sv));
-        self.bv = bv.sub(vvs);
+        self.g_ux = m.g_ux - sx * m.g;
+        self.g_uy = m.g_uy - sy * m.g;
 
-        self.gu = gu.sub(s.mul(g0));
+        let s_au = sx * m.a_ux + sy * m.a_uy;
+        let s_av = sx * m.a_vx + sy * m.a_vy;
+        let s_bu = sx * m.b_ux + sy * m.b_uy;
+        let s_bv = sx * m.b_vx + sy * m.b_vy;
+        let s_gu = sx * m.g_ux + sy * m.g_uy;
+        let s_gv = sx * m.g_vx + sy * m.g_vy;
+        let s_uu_s = sx * uu_s_x + sy * uu_s_y;
+        let s_uv_s = sx * uv_s_x + sy * uv_s_y;
+        let s_vv_s = sx * vv_s_x + sy * vv_s_y;
 
-        self.aa = aa - 4.0 * s.dot(au) + 2.0 * s2 * a0 + 4.0 * s.dot(uus) - 4.0 * s2 * su
-            + s2 * s2 * w;
-        self.ab = ab - s.dot(av) - 2.0 * s.dot(bu) + s2 * b0 + 2.0 * s.dot(cs) - s2 * sv;
-        self.bb = bb - 2.0 * s.dot(bv) + s.dot(vvs);
-        self.ag = ag - 2.0 * s.dot(gu) + s2 * g0;
-        self.bg = bg - s.dot(gv);
-        // w, v, vv, g0, gv, gg 在平移下不变
+        self.a2 = m.a2 - 4.0 * s_au + 2.0 * s2 * m.a + 4.0 * s_uu_s - 4.0 * s2 * su
+            + s2 * s2 * m.w;
+        self.a_b = m.a_b - s_av - 2.0 * s_bu + s2 * m.b + 2.0 * s_uv_s - s2 * sv;
+        self.b2 = m.b2 - 2.0 * s_bv + s_vv_s;
+        self.a_g = m.a_g - 2.0 * s_gu + s2 * m.g;
+        self.b_g = m.b_g - s_gv;
+        // w、V 那一族、g、g_vx、g_vy、g2 在 U 平移下不变
     }
 
-    /// 坐标系平移 `V -> V - s`（`U` 不动）。精确；Kåsa 评分不变（每个 `k` 的
-    /// 点云只是平移 `(k - k_ref)s`），所以 `P`、`P'`、`P''` 与圆参数都不受影响，
-    /// 但存储的 `V` 族矩会随 `s` 变小。
+    /// 平移 `V -> V - s`（`U` 不动）：纯规范，`P`、`P'`、`P''` 不变。
     ///
-    /// `V = ∫i dt` 是从 `t=0` 起的长积分，电流的直流偏置会让它线性增长；搬掉
-    /// 加权均值后，`Σw|V|²` 里只剩窗口内的变化，`M₁/M₂/q₁..q₃` 不会被一个纯
-    /// 规范的大偏移撑大（论文附录 A.3）。
-    ///
-    /// 物理 `V = V' + v_off`；因此剪切历史时必须补 `U_s += dk·v_off`
-    /// （见 `Tracker::newton`）。
+    /// 论文附录 A.3；物理 `V = V' + v_off`，剪切时要补 `U_s += dk·v_off`。
     fn translate_v(&mut self, s: V2) {
         if s.norm2() == 0.0 {
             return;
         }
-        let (w, u, v, uu, uv, vv) = (self.w, self.u, self.v, self.uu, self.uv, self.vv);
-        let (a0, au, av) = (self.a0, self.au, self.av);
-        let (b0, bu, bv) = (self.b0, self.bu, self.bv);
-        let (g0, gu, gv) = (self.g0, self.gu, self.gv);
-        let (ab, bb, ag, bg, gg) = (self.ab, self.bb, self.ag, self.bg, self.gg);
+        let m = *self;
+        let (sx, sy) = (s.x, s.y);
+        let s2 = sx * sx + sy * sy;
+        let su = sx * m.ux + sy * m.uy;
+        let sv = sx * m.vx + sy * m.vy;
+        let uu_s_x = m.ux2 * sx + m.ux_uy * sy;
+        let uu_s_y = m.ux_uy * sx + m.uy2 * sy;
+        let uv_s_x = m.ux_vx * sx + m.ux_vy * sy;
+        let uv_s_y = m.uy_vx * sx + m.uy_vy * sy;
+        let vu_s_x = m.ux_vx * sx + m.uy_vx * sy;
+        let vu_s_y = m.ux_vy * sx + m.uy_vy * sy;
+        let vv_s_x = m.vx2 * sx + m.vx_vy * sy;
+        let vv_s_y = m.vx_vy * sx + m.vy2 * sy;
 
-        let s2 = s.norm2();
-        let su = s.dot(u); // s·ΣwU
-        let sv = s.dot(v); // s·ΣwV
-        let uu_s = mv(&uu, s); // (ΣwUUᵀ)s
-        let uv_s = mv(&uv, s); // (ΣwUVᵀ)s
-        let vu_s = mv(&mtr(&uv), s); // (ΣwVUᵀ)s
-        let vv_s = mv(&vv, s); // (ΣwVVᵀ)s
+        self.vx = m.vx - sx * m.w;
+        self.vy = m.vy - sy * m.w;
+        self.vx2 = m.vx2 - 2.0 * sx * m.vx + m.w * sx * sx;
+        self.vx_vy = m.vx_vy - sx * m.vy - sy * m.vx + m.w * sx * sy;
+        self.vy2 = m.vy2 - 2.0 * sy * m.vy + m.w * sy * sy;
+        self.ux_vx = m.ux_vx - m.ux * sx;
+        self.ux_vy = m.ux_vy - m.ux * sy;
+        self.uy_vx = m.uy_vx - m.uy * sx;
+        self.uy_vy = m.uy_vy - m.uy * sy;
 
-        self.v = v.sub(s.mul(w));
-        self.vv = madd(
-            &msub(&msub(&vv, &outer(v, s)), &outer(s, v)),
-            &msc(&outer(s, s), w),
-        );
-        self.uv = msub(&uv, &outer(u, s));
+        self.a_vx = m.a_vx - sx * m.a;
+        self.a_vy = m.a_vy - sy * m.a;
+        self.b = m.b - su;
+        self.b_ux = m.b_ux - uu_s_x;
+        self.b_uy = m.b_uy - uu_s_y;
+        self.b_vx = m.b_vx - sx * m.b - vu_s_x + sx * su;
+        self.b_vy = m.b_vy - sy * m.b - vu_s_y + sy * su;
 
-        self.av = av.sub(s.mul(a0));
+        self.g = m.g - 2.0 * sv + s2 * m.w;
+        self.g_ux = m.g_ux - 2.0 * uv_s_x + m.ux * s2;
+        self.g_uy = m.g_uy - 2.0 * uv_s_y + m.uy * s2;
+        self.g_vx = m.g_vx
+            - sx * m.g
+            - 2.0 * vv_s_x
+            + m.vx * s2
+            + sx * (2.0 * sv)
+            - sx * (s2 * m.w);
+        self.g_vy = m.g_vy
+            - sy * m.g
+            - 2.0 * vv_s_y
+            + m.vy * s2
+            + sy * (2.0 * sv)
+            - sy * (s2 * m.w);
 
-        self.b0 = b0 - su;
-        self.bu = bu.sub(uu_s);
-        self.bv = bv.sub(s.mul(b0)).sub(vu_s).add(s.mul(su));
+        let s_au = sx * m.a_ux + sy * m.a_uy;
+        let s_av = sx * m.a_vx + sy * m.a_vy;
+        let s_bu = sx * m.b_ux + sy * m.b_uy;
+        let s_bv = sx * m.b_vx + sy * m.b_vy;
+        let s_gu = sx * m.g_ux + sy * m.g_uy;
+        let s_gv = sx * m.g_vx + sy * m.g_vy;
+        let s_uu_s = sx * uu_s_x + sy * uu_s_y;
+        let s_uv_s = sx * uv_s_x + sy * uv_s_y;
+        let s_vv_s = sx * vv_s_x + sy * vv_s_y;
 
-        self.g0 = g0 - 2.0 * sv + s2 * w;
-        self.gu = gu.sub(uv_s.mul(2.0)).add(u.mul(s2));
-        self.gv = gv
-            .sub(s.mul(g0))
-            .sub(vv_s.mul(2.0))
-            .add(v.mul(s2))
-            .add(s.mul(2.0 * sv))
-            .sub(s.mul(s2 * w));
-
-        self.ab = ab - s.dot(au);
-        self.bb = bb - 2.0 * s.dot(bu) + s.dot(uu_s);
-        self.ag = ag - 2.0 * s.dot(av) + s2 * a0;
-        self.bg = bg - 2.0 * s.dot(bv) - s.dot(gu) + 2.0 * s.dot(uv_s) + s2 * b0
-            - s2 * su;
-        self.gg = gg - 4.0 * s.dot(gv) + 2.0 * s2 * g0 + 4.0 * s.dot(vv_s) - 4.0 * s2 * sv
-            + s2 * s2 * w;
-        // w, u, uu, a0, au, aa 在 V 平移下不变
+        self.a_b = m.a_b - s_au;
+        self.b2 = m.b2 - 2.0 * s_bu + s_uu_s;
+        self.a_g = m.a_g - 2.0 * s_av + s2 * m.a;
+        self.b_g = m.b_g - 2.0 * s_bv - s_gu + 2.0 * s_uv_s + s2 * m.b - s2 * su;
+        self.g2 = m.g2 - 4.0 * s_gv + 2.0 * s2 * m.g + 4.0 * s_vv_s - 4.0 * s2 * sv
+            + s2 * s2 * m.w;
+        // w、U 那一族、a、a_ux、a_uy、a2 在 V 平移下不变
     }
 
     #[inline]
     fn a_mat(&self) -> M3 {
         [
-            [self.uu[0][0], self.uu[0][1], self.u.x],
-            [self.uu[1][0], self.uu[1][1], self.u.y],
-            [self.u.x, self.u.y, self.w],
+            [self.ux2, self.ux_uy, self.ux],
+            [self.ux_uy, self.uy2, self.uy],
+            [self.ux, self.uy, self.w],
         ]
     }
 
     #[inline]
     fn b_vec(&self) -> [S; 3] {
-        [self.au.x, self.au.y, self.a0]
+        [self.a_ux, self.a_uy, self.a]
     }
 
     /// 当前参考 `k`（`κ = 0`）处的剖面 Taylor 系数。
     fn coef(&self) -> Coef {
         let a1 = [
             [
-                self.uv[0][0] * 2.0,
-                self.uv[0][1] + self.uv[1][0],
-                self.v.x,
+                self.ux_vx * 2.0,
+                self.ux_vy + self.uy_vx,
+                self.vx,
             ],
             [
-                self.uv[1][0] + self.uv[0][1],
-                self.uv[1][1] * 2.0,
-                self.v.y,
+                self.ux_vy + self.uy_vx,
+                self.uy_vy * 2.0,
+                self.vy,
             ],
-            [self.v.x, self.v.y, 0.0],
+            [self.vx, self.vy, 0.0],
         ];
         let a2 = [
-            [self.vv[0][0], self.vv[0][1], 0.0],
-            [self.vv[1][0], self.vv[1][1], 0.0],
+            [self.vx2, self.vx_vy, 0.0],
+            [self.vx_vy, self.vy2, 0.0],
             [0.0, 0.0, 0.0],
         ];
         Coef {
@@ -635,23 +695,22 @@ impl Moments {
             a2,
             b0: self.b_vec(),
             b1: [
-                self.av.x + 2.0 * self.bu.x,
-                self.av.y + 2.0 * self.bu.y,
-                2.0 * self.b0,
+                self.a_vx + 2.0 * self.b_ux,
+                self.a_vy + 2.0 * self.b_uy,
+                2.0 * self.b,
             ],
             b2: [
-                self.gu.x + 2.0 * self.bv.x,
-                self.gu.y + 2.0 * self.bv.y,
-                self.g0,
+                self.g_ux + 2.0 * self.b_vx,
+                self.g_uy + 2.0 * self.b_vy,
+                self.g,
             ],
-            c0: self.aa,
-            c1: 4.0 * self.ab,
-            c2: 4.0 * self.bb + 2.0 * self.ag,
+            c0: self.a2,
+            c1: 4.0 * self.a_b,
+            c2: 4.0 * self.b2 + 2.0 * self.a_g,
         }
     }
 
-    /// 在**当前**参考 `k`（即 `κ = 0`）处做变量投影：
-    /// `P = min_θ J`、`θ* = -A⁻¹ b`，以及 `P` 的一、二阶导数。
+    /// 在当前参考 `k`（`κ = 0`）处做变量投影。
     fn fit(&self) -> Option<Profile> {
         if !(self.w > 0.0) {
             return None;
@@ -660,11 +719,7 @@ impl Moments {
     }
 
     /// 给定 `θ` 在**无罚项**法方程上的残差平方和
-    /// `θᵀA₀θ + 2θᵀb₀ + c₀`（权重已含在内）。
-    ///
-    /// 半径罚项是局部线性化，越界时会把 `μ z²` 加进剖面常数；报告里的损失
-    /// 必须来自这个量，否则 `μ = 50Σw` 量级的罚项常数会混进 `P/Σw`，
-    /// 把 `σ_rel`（圆模型可信度）彻底带偏。
+    /// `θᵀA₀θ + 2θᵀb₀ + c₀`。
     fn loss_at(&self, theta: &[S; 3]) -> S {
         let co = self.coef();
         co.c0 + 2.0 * dot3(theta, &co.b0) + dot3(theta, &mv3(&co.a0, theta))
@@ -772,7 +827,7 @@ fn fit_with_penalty(m: &Moments, pen: Option<RadiusPenalty>) -> Option<Profile> 
 /// `R` 会被噪声推到 +17%（实测），因为它同时拿掉了先验里对漂移的阻尼。
 #[inline]
 fn v_second(m: &Moments, v_off: V2) -> S {
-    m.g0 + 2.0 * v_off.dot(m.v) + m.w * v_off.norm2()
+    m.g + 2.0 * (v_off.x * m.vx + v_off.y * m.vy) + m.w * v_off.norm2()
 }
 
 // ===========================================================================
@@ -1123,8 +1178,6 @@ impl Tracker {
         self.t_last = t;
         self.started = true;
         self.m.decay(rho);
-
-        // 2. 积分增量入矩（内部单位）
         let inv = 1.0 / self.unit_len;
         let du = delta_u.mul(inv);
         let dv = delta_v.mul(inv);
@@ -1240,7 +1293,7 @@ impl Tracker {
         if !(w > 0.0) {
             return;
         }
-        let s = self.m.u.mul(1.0 / w);
+        let s = V2::new(self.m.ux, self.m.uy).mul(1.0 / w);
         if !s.finite() || s.norm() <= self.cfg.recenter_eps {
             return;
         }
@@ -1260,8 +1313,8 @@ impl Tracker {
         if !(w > 0.0) {
             return;
         }
-        let c = self.m.v.mul(1.0 / w);
-        let rms = (self.m.g0 / w).sqrt();
+        let c = V2::new(self.m.vx, self.m.vy).mul(1.0 / w);
+        let rms = (self.m.g / w).sqrt();
         if !c.finite() || !rms.is_finite() || c.norm() <= self.cfg.recenter_v_rel * rms {
             return;
         }
@@ -1977,7 +2030,7 @@ mod tests {
         }
         assert_close(&a, &b, "shear", 1e-12);
         assert!((before.w - a.w).abs() < 1e-12);
-        assert!((before.g0 - a.g0).abs() < 1e-9);
+        assert!((before.g - a.g).abs() < 1e-9);
     }
 
     #[test]
@@ -2331,8 +2384,8 @@ mod tests {
             b.add(u, v.add(c), 1.0);
         }
         let rel = |x: S, y: S| (x - y).abs() / (1.0 + x.abs().max(y.abs()));
-        // 物理 V 的二阶矩与原点拆分无关：把 b 的偏移 c 加回去应当等于 a 的 g0。
-        assert!(rel(v_second(&b, V2::new(-c.x, -c.y)), a.g0) < 1.0e-12);
+        // 物理 V 的二阶矩与原点拆分无关：把 b 的偏移 c 加回去应当等于 a 的 g。
+        assert!(rel(v_second(&b, V2::new(-c.x, -c.y)), a.g) < 1.0e-12);
         for &k in &[0.0, 0.37, 1.1] {
             let (mut ma, mut mb) = (a.clone(), b.clone());
             ma.shear(k);
@@ -2361,7 +2414,7 @@ mod tests {
             b.add(*u, v.sub(s), 1.0);
         }
         assert_close(&a, &b, "translate_v", 1e-12);
-        assert!((a.g0 - b.g0).abs() < 1e-9);
+        assert!((a.g - b.g).abs() < 1e-9);
     }
 
     /// `V = ∫i dt` 的常数偏移是规范：注入一个偏置后 `k` 仍须从 +25% 初值恢复到
@@ -2402,38 +2455,41 @@ mod tests {
             }
         };
         chk(a.w, b.w, "w");
-        chk(a.u.x, b.u.x, "u.x");
-        chk(a.u.y, b.u.y, "u.y");
-        chk(a.v.x, b.v.x, "v.x");
-        chk(a.v.y, b.v.y, "v.y");
-        for i in 0..2 {
-            for j in 0..2 {
-                chk(a.uu[i][j], b.uu[i][j], "uu");
-                chk(a.uv[i][j], b.uv[i][j], "uv");
-                chk(a.vv[i][j], b.vv[i][j], "vv");
-            }
-        }
-        chk(a.a0, b.a0, "a0");
-        chk(a.au.x, b.au.x, "au.x");
-        chk(a.au.y, b.au.y, "au.y");
-        chk(a.av.x, b.av.x, "av.x");
-        chk(a.av.y, b.av.y, "av.y");
-        chk(a.b0, b.b0, "b0");
-        chk(a.bu.x, b.bu.x, "bu.x");
-        chk(a.bu.y, b.bu.y, "bu.y");
-        chk(a.bv.x, b.bv.x, "bv.x");
-        chk(a.bv.y, b.bv.y, "bv.y");
-        chk(a.g0, b.g0, "g0");
-        chk(a.gu.x, b.gu.x, "gu.x");
-        chk(a.gu.y, b.gu.y, "gu.y");
-        chk(a.gv.x, b.gv.x, "gv.x");
-        chk(a.gv.y, b.gv.y, "gv.y");
-        chk(a.aa, b.aa, "aa");
-        chk(a.ab, b.ab, "ab");
-        chk(a.bb, b.bb, "bb");
-        chk(a.ag, b.ag, "ag");
-        chk(a.bg, b.bg, "bg");
-        chk(a.gg, b.gg, "gg");
+        chk(a.ux, b.ux, "ux");
+        chk(a.uy, b.uy, "uy");
+        chk(a.ux2, b.ux2, "ux2");
+        chk(a.ux_uy, b.ux_uy, "ux_uy");
+        chk(a.uy2, b.uy2, "uy2");
+        chk(a.vx, b.vx, "vx");
+        chk(a.vy, b.vy, "vy");
+        chk(a.vx2, b.vx2, "vx2");
+        chk(a.vx_vy, b.vx_vy, "vx_vy");
+        chk(a.vy2, b.vy2, "vy2");
+        chk(a.ux_vx, b.ux_vx, "ux_vx");
+        chk(a.ux_vy, b.ux_vy, "ux_vy");
+        chk(a.uy_vx, b.uy_vx, "uy_vx");
+        chk(a.uy_vy, b.uy_vy, "uy_vy");
+        chk(a.a, b.a, "a");
+        chk(a.a_ux, b.a_ux, "a_ux");
+        chk(a.a_uy, b.a_uy, "a_uy");
+        chk(a.a_vx, b.a_vx, "a_vx");
+        chk(a.a_vy, b.a_vy, "a_vy");
+        chk(a.b, b.b, "b");
+        chk(a.b_ux, b.b_ux, "b_ux");
+        chk(a.b_uy, b.b_uy, "b_uy");
+        chk(a.b_vx, b.b_vx, "b_vx");
+        chk(a.b_vy, b.b_vy, "b_vy");
+        chk(a.g, b.g, "g");
+        chk(a.g_ux, b.g_ux, "g_ux");
+        chk(a.g_uy, b.g_uy, "g_uy");
+        chk(a.g_vx, b.g_vx, "g_vx");
+        chk(a.g_vy, b.g_vy, "g_vy");
+        chk(a.a2, b.a2, "a2");
+        chk(a.a_b, b.a_b, "a_b");
+        chk(a.b2, b.b2, "b2");
+        chk(a.a_g, b.a_g, "a_g");
+        chk(a.b_g, b.b_g, "b_g");
+        chk(a.g2, b.g2, "g2");
         assert!(worst < tol, "{what}: worst field {who} err {worst}");
     }
 }

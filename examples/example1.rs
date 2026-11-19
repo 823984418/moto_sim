@@ -359,10 +359,9 @@ impl Simulation {
         direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
-            nominal_r * 0.2,
+            nominal_r,
             nominal_radius,
         );
-        direct_flux_observer.fit.tau = 10.0;
 
         Self {
             delta_time: 0.0001,
@@ -1664,11 +1663,15 @@ fn run_headless(args: &[String]) {
     sim.kasa_flux_observer.min_arc = kasa_min_arc;
     sim.kasa_flux_observer.fit_enabled = !no_fit;
 
-    sim.direct_flux_observer
-        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
+    // 先把拟合参数写进 observer，再 set_initial——Tracker 在 set_initial 里
+    // 用这份配置构造，顺序反了会拿到默认 tau。
     sim.direct_flux_observer.fit.tau = kasa_tau;
     sim.direct_flux_observer.fit.obs_min = kasa_obs_min;
+    sim.direct_flux_observer.fit.k_prior_rel = kasa_prior;
     sim.direct_flux_observer.fit.k_step_rel = kasa_step;
+    sim.direct_flux_observer.fit.max_sigma_rel = kasa_max_sigma;
+    sim.direct_flux_observer
+        .set_initial(theta0, 0.0, r_scale * nominal_r, nominal_radius);
 
     let steps = (seconds / dt).round() as usize;
     let warmup_steps = (steps as f64 * warmup_fraction) as usize;
