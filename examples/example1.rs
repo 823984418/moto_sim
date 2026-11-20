@@ -1,6 +1,6 @@
 use eframe::{App, CreationContext, Frame, NativeOptions};
 use egui::{CentralPanel, CollapsingHeader, ScrollArea, Slider, Ui, Widget};
-use egui_plot::{Legend, Line, Plot, PlotPoint, default_label_formatter};
+use egui_plot::{Legend, Line, Plot, PlotPoint, Points, default_label_formatter};
 use moto_sim::model::fan::{FAN_LOAD, FAN_MOTOR};
 use moto_sim::model::zq10y_dead_mapping;
 use moto_sim::simulation::controller::current_regulator::three_phase_pi_current_regulator::ThreePhasePICurrentRegulator;
@@ -332,11 +332,11 @@ impl Simulation {
         let nominal_radius = motor.flux / mean_inductance;
         let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
         let mut direct_flux_observer = DirectFluxObserver::new();
-        direct_flux_observer.fit.tau = 10.0;
+        direct_flux_observer.fit.tau = 2.0;
         direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
-            nominal_r,
+            nominal_r * 0.5,
             nominal_radius,
         );
 
@@ -759,6 +759,8 @@ pub struct Application {
     simulation: Simulation,
     run: bool,
     scope: Scope<Simulation>,
+    /// 快速环磁链向量（相对拟合圆心）的轨迹，供"磁链圆"图使用。
+    flux_trace: Vec<PlotPoint>,
 }
 
 impl Application {
@@ -768,6 +770,7 @@ impl Application {
             simulation: Simulation::new(),
             run: false,
             scope: Scope::new(),
+            flux_trace: Vec::new(),
         };
         this.reset();
         Ok(this)
@@ -775,6 +778,7 @@ impl Application {
 
     pub fn reset(&mut self) {
         self.run = false;
+        self.flux_trace.clear();
         self.simulation = Simulation::new();
         self.scope.data = vec![
             (
@@ -1193,6 +1197,57 @@ impl Application {
         self.simulation.update();
         self.scope
             .update(self.simulation.timer.time, &mut self.simulation);
+        // 快速环磁链向量（已相对拟合圆心）：画在以圆心为原点的平面上。
+        let f = self.simulation.direct_flux_observer.flux;
+        if f.x.is_finite() && f.y.is_finite() {
+            self.flux_trace.push(PlotPoint::new(f.x, f.y));
+            if self.flux_trace.len() > 4096 {
+                self.flux_trace.drain(..1024);
+            }
+        }
+    }
+
+    /// 磁链圆：快速环积分出的磁链向量，圆心（拟合圆心）作为原点。
+    fn flux_plot(&mut self, ui: &mut Ui) {
+        let (radius, current, center_fit) = {
+            let o = &self.simulation.direct_flux_observer;
+            (o.radius, o.flux, o.center_fit)
+        };
+        // 拟合半径画成参考圆。
+        let mut circle: Vec<[f64; 2]> = Vec::new();
+        if radius > 0.0 && radius.is_finite() {
+            const N: usize = 180;
+            for k in 0..=N {
+                let a = std::f64::consts::TAU * k as f64 / N as f64;
+                circle.push([radius * a.cos(), radius * a.sin()]);
+            }
+        }
+        CollapsingHeader::new("磁链圆（圆心为原点）")
+            .default_open(true)
+            .show(ui, |ui| {
+                Plot::new("flux_circle")
+                    .height(300.0)
+                    .data_aspect(1.0)
+                    .legend(Legend::default())
+                    .label_formatter(default_label_formatter)
+                    .show(ui, |ui| {
+                        ui.line(Line::new("flux", self.flux_trace.as_slice()));
+                        if !circle.is_empty() {
+                            ui.line(Line::new("radius", circle).color(egui::Color32::DARK_GRAY));
+                        }
+                        ui.points(
+                            Points::new("now", [current.x, current.y])
+                                .radius(4.0)
+                                .color(egui::Color32::RED),
+                        );
+                        // 拟合直接给出的圆心（图上坐标以快速环圆心为原点）。
+                        ui.points(
+                            Points::new("fit center", [center_fit.x, center_fit.y])
+                                .radius(5.0)
+                                .color(egui::Color32::from_rgb(30, 120, 255)),
+                        );
+                    });
+            });
     }
 }
 
@@ -1277,6 +1332,7 @@ impl App for Application {
                 }
             });
             ScrollArea::vertical().show(ui, |ui| {
+                self.flux_plot(ui);
                 self.scope.ui(ui);
             });
         });
@@ -1430,6 +1486,7 @@ fn run_headless(args: &[String]) {
 
     let steps = (seconds / dt).round() as usize;
     let warmup_steps = (steps as f64 * warmup_fraction) as usize;
+    let dump_flux = std::env::var("DUMP_FLUX").is_ok();
 
     let mut startup = Metrics::default();
     let mut steady = Metrics::default();
@@ -1469,6 +1526,14 @@ fn run_headless(args: &[String]) {
         };
         let err = angle_normal(out.electrical_angle - true_angle);
         let speed_err = out.electrical_speed - true_speed;
+
+        if dump_flux {
+            let o = &sim.direct_flux_observer;
+            eprintln!(
+                "F,{t:.7},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.4}",
+                o.flux.x, o.flux.y, o.r, o.radius, o.center_fit.x, o.center_fit.y, true_speed
+            );
+        }
 
         if k >= warmup_steps {
             steady.push(err, speed_err, valid);

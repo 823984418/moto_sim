@@ -98,7 +98,7 @@ $$
 a\leftarrow a+s_0\,\Delta t/\ell,\qquad b\leftarrow b+i\,\Delta t/\ell,
 $$
 
-其中 $\ell=(r_{\min}+r_{\max})/2$ 是内部长度单位（§6），与 §2.1 的电感 $L$ 区分。
+其中 $\ell=(r_{\min}+r_{\max})/2$ 是内部长度单位（§6），与 §2.1 的电感 $L$ 区分。注意采样在区间末端，单端矩形积分会把磁链多推半个控制周期，带来 `ω·Δt/2` 的角度偏置（100 rad/s、50 µs 时约 0.15°，实测 0.1475°）。
 
 然后
 
@@ -162,12 +162,12 @@ $$
 c_{\mathrm{tgt}}=-c_{\mathrm{local}}.
 $$
 
-$R$ 与半径直接以拟合值为目标。三者在同一把锁里写入，并用**同一个**增益 $g$（`sync_gain`，默认 0.05）滑动：
+$R$ 以拟合值为目标，但交接乘可辨识性权重 $w=\mathrm{clamp}(\mathrm{obs}/\mathrm{obs}_{\min},0,1)$；圆心与半径直接按增益 $g$（`sync_gain`，默认 0.05）滑动：
 
 $$
 \begin{aligned}
 c&\leftarrow c+g\,(c_{\mathrm{tgt}}-c),\\
-k&\leftarrow k+g\,(k_{\mathrm{fit}}-k),\\
+k&\leftarrow k+g\,w\,(k_{\mathrm{fit}}-k),\\
 \mathrm{rad}&\leftarrow \mathrm{rad}+g\,(\rho_{\mathrm{fit}}/\ell-\mathrm{rad}).
 \end{aligned}
 $$
@@ -176,9 +176,11 @@ $$
 
 $g=0.05$ 对应约 20 个拟合周期（200 ms）收敛。因为清零后 $b=0$，$k$ 的变化不会立刻改变 $p$；角度只会因 $c$ 的加权移动而平滑变化。
 
-### 4.4 为什么默认不乘可观性
+### 4.4 为什么 R 乘可观性、圆心不乘
 
-拟合的 Newton 步已经由可观性加权（§5.3），交班只是把**已经收敛的拟合值**搬到快速环。若交班再乘 $\mathrm{obs}$，稳态 $\mathrm{obs}\to0$ 时快速环会停在过时的 $R$/圆心，与拟合的圆不一致：实测 1.25× 初值时 $R$ 卡在 +10%，角度出现 $\pi$ 偏置。因此默认 `sync_obs_weighted = false`；保留该开关做 A/B。
+$\mathrm{obs}$ 描述的是 $k$ 能否被数据辨识（需要 $V$ 有变化），不是圆心/半径的估计质量：圆心与半径由圆拟合的几何决定，稳态下依然可估。所以 $R$ 的交接乘 $\mathrm{obs}$（稳态 $\mathrm{obs}\to0$ 时不把拟合 $k$ 的噪声游走带进快速环），圆心/半径不乘。
+
+也不能反过来按 $|k_{\mathrm{fit}}-k_{\mathrm{fast}}|$ 冻结圆心：$R$ 还没收敛时，用拟合的 $k$ 算出的圆心恰好是把快速环拉向更准的圆，冻结会让启动瞬态明显变差（800 rad/s、$R$ 初值 0.5×：启动角度 RMS 从 60° 变 76°，磁链中心瞬态偏移从 6.6 A 变 14 A）。
 
 ### 4.5 连续性
 
@@ -220,7 +222,7 @@ $$
 U\leftarrow U-u_{\mathrm{new}},\qquad V\leftarrow V-v_{\mathrm{new}},
 $$
 
-即 `Tracker::recenter_latest`。它是精确变换：圆拟合对平移不变，半径/圆心只是跟着平移；`off` 累加被搬走的 $U$ 偏移。$V$ 不保存偏置——给全部 $V$ 加同一个常向量只是把每个 $\kappa$ 的点集平移 $\kappa c$，$P$、$P'$、$P''$ 完全不变，所以拟合与 $V$ 偏置无关，圆心读数天然就是“相对最新样本”的圆心。之后 `p_local == 0`，下一个周期的增量从 0 起算。
+即 `Tracker::recenter_latest`。它是精确变换：圆拟合对平移不变，半径/圆心只是跟着平移；`off` 累加被搬走的 $U$ 偏移，以及按 $k$ 折算的 $V$ 偏移（$V$ 平移在 $\kappa=k$ 处等价于帧平移 $k\,v$），所以圆心读数仍在物理圆心附近。$V$ 不保存偏置——给全部 $V$ 加同一个常向量只是把每个 $\kappa$ 的点集平移 $\kappa c$，$P$、$P'$、$P''$ 完全不变，所以拟合与 $V$ 偏置无关。之后 `p_local == 0`，下一个周期的增量从 0 起算。
 
 ### 5.2 为什么不再需要剪切
 
@@ -279,7 +281,7 @@ $$
 ## 6 复用的数值措施
 
 - **内部单位** $L=(r_{\min}+r_{\max})/2$：半径 $O(1)$。
-- **最新样本搬原点**：每个样本把 $U$、$V$ 都平移到最新样本（$U$ 的偏移累进 `off`），防长积分漂移；`update` 与 `step_once` 是同一条路径。
+- **最新样本搬原点**：每个样本把 $U$、$V$ 都平移到最新样本（`off` 累加 $U$ 偏移与按 $k$ 折算的 $V$ 偏移），防长积分漂移；`update` 与 `step_once` 是同一条路径。
 - **$V$ 不保存偏置**：$V$ 的常数偏置是纯规范（给所有 $V_n$ 加 $c$ 只把每个 $\kappa$ 的点集平移 $\kappa c$，$P$、$P'$、$P''$、$k$、半径都不变）。可观性尺度取存储坐标系（最新样本 $V=0$）下的 $\sum w|V|^2$，同样对 $V$ 的常数偏置不变。
 - **不用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量；$U$ 的长积分在 `off` 里。去掉 Neumaier 累加器后 4 组工况的输出逐位不变。
 
@@ -370,7 +372,7 @@ $\omega=0$、$i$ 恒定时磁链点不动，圆拟合退化成点/线，半径�
 
 ### 10.3 交班增益与拟合周期
 
-`sync_gain=0.05` 对应 200 ms 交班；`fit_period=10 ms` 是刻意放慢的，便于把积分器留在快速环。把 `fit_period` 降到 5 ms 会让 $R$ 在瞬态内有更多 Newton 步，但矩更新与 CPU 翻倍。
+`sync_gain=0.05` 对应 200 ms 交班（`k` 的实际增益是 $g\,w$，稳态 $w\to0$ 时不跟噪声走）；`fit_period=10 ms` 是刻意放慢的，便于把积分器留在快速环。把 `fit_period` 降到 5 ms 会让 $R$ 在瞬态内有更多 Newton 步，但矩更新与 CPU 翻倍。
 
 ### 10.4 与上一版的关系
 
@@ -393,6 +395,7 @@ $\omega=0$、$i$ 恒定时磁链点不动，圆拟合退化成点/线，半径�
 | $P(k)$ | 变量投影剖面 |
 | $\mathrm{obs}$ | $P''/(4R^2\sum w|V|^2)$ |
 | $g$ | 交班增益 `sync_gain` |
+| $w$ | 交接的可辨识性权重 $\mathrm{clamp}(\mathrm{obs}/\mathrm{obs}_{\min},0,1)$ |
 | $\tau$ | 矩遗忘时间常数（1 s） |
 | $\tau_\omega$ | 测速低通（20 ms） |
 
@@ -409,7 +412,7 @@ $$
 ## 附录 C 复现与选型
 
 - 直接磁链观测器是当前唯一的磁链圆观测器：`use_observer = 12`；headless 不需要选型参数，直接跑 `example1 --headless [--observe-only]` 即可。
-- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`sync_obs_weighted=false`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`。
+- 直接观测器的参数：`fit.tau=1.0`、`fit_period=0.01`、`speed_tau=0.02`、`sync_gain=0.05`、`fit.k_prior_rel=0`、`fit.obs_min=5e-3`。
 
 ## 参考文献
 

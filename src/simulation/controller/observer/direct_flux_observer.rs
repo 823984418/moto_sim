@@ -25,8 +25,9 @@
 //!   拟合圆心因此总是相对“最新点”。
 //! * **加锁交班**：`Arc<Mutex<FastFlux>>` 内读并清零 `a`、`b`，同时
 //!   `c += a + k_cur·b` 保持磁链连续；拟合完成后写三个目标
-//!   `c_tgt = -c_local`、`k_tgt = k_fit`、`rad_tgt = radius_fit`，再让
-//!   `c`、`k`、`rad` **都**按同一个增益 `sync_gain` 向各自目标滑动。
+//!   `c_tgt = -c_local`、`k_tgt = k_fit`、`rad_tgt = radius_fit`。`R` 的交接
+//!   乘可辨识性 `w_obs`（稳态不跟噪声游走），圆心/半径直接按 `sync_gain`
+//!   交接（`obs` 描述的是 `k` 的可辨识性，不是圆心/半径的估计质量）。
 //!   这样积分器清零不会让角度跳变，三个量也不会一次写死。
 //!
 //! # 2. 拟合核心
@@ -46,8 +47,8 @@
 //! 数值措施：
 //!
 //! * 内部单位 + 最新样本搬原点（`U`、`V` 各一次精确平移）把矩挡在 `|p| ~ R`。
-//!   `u`、`v` 只在一次拟合周期内累加、随后清零，`U` 的长积分在 `off` 里；
-//!   实测去掉补偿求和后输出逐位不变，所以不再保留。
+//!   `u`、`v` 只在一次拟合周期内累加、随后清零，帧偏移（`U` 平移 + 按 `k`
+//!   折算的 `V` 平移）在 `off` 里；实测去掉补偿求和后输出逐位不变，所以不再保留。
 //! * 直接观测器每个拟合周期都把最新样本搬到原点，并在 `κ = k` 处把 `b` 展开
 //!   到三次、`c` 到四次（用的仍是已有矩 `g_vx/g_vy/b_g/g2`）。矩里的 `|U|`、
 //!   `|V|` 只有一个周期内增量的量级。
@@ -55,9 +56,9 @@
 //!   `V` 的偏置**不进拟合**：给所有 `V_n` 加同一个常向量只是把每个 `κ` 的
 //!   点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径都不变。所以只把最新样本的
 //!   `V` 归零（纯规范），不再累一个 `v_off` 并在求值处把 `κ·v_off` 补回 `U`：
-//!   拟合直接在“最新样本为原点”的小量坐标里做，报告的圆心天然就是相对最新
-//!   样本的圆心。可观性尺度同样取这个小量坐标下的 `Σw|V|² = m.g`，它对 `V`
-//!   的常数偏置不变。
+//!   拟合直接在“最新样本为原点”的小量坐标里做；`off` 把 `k·V` 折算回帧偏移，
+//!   报告的圆心因此是物理圆心（`k` 恒定时精确，否则差 `Σ(k_i − k)·v_i`）。
+//!   可观性尺度同样取这个小量坐标下的 `Σw|V|² = m.g`，它对 `V` 的常数偏置不变。
 //! * 半径越界时把线性化伪观测 `μ(gᵀθ-z)²` 加进 `A0/b0/c0`，于是 `P`、`P'`、
 //!   `P''` 一起变成带罚项剖面；Newton 步、线搜索、扫描与输出都用同一个目标，
 //!   报告的损失仍用**无罚项**残差，罚项常数不会污染 `sigma_rel`。
@@ -455,7 +456,7 @@ impl Moments {
     /// 平移 `V -> V - s`（`U` 不动）：纯规范，`P`、`P'`、`P''` 不变。
     ///
     /// 论文附录 A.3。`V` 的常数偏置是纯规范：它只把每个 `κ` 的点集平移
-    /// `κ·s`，`P`、`P'`、`P''` 完全不变，所以 `recenter_v` 搬完之后不需要
+    /// `κ·s`，`P`、`P'`、`P''` 完全不变，所以 `recenter_latest` 搬完之后不需要
     /// 在求值处补回任何东西。
     fn translate_v(&mut self, s: V2) {
         if s.norm2() == 0.0 {
@@ -793,11 +794,11 @@ pub struct Report {
     pub k: S,
     /// 圆半径（用户单位，A）。
     pub radius: S,
-    /// 圆心（用户单位；已加回 `U` 的原点 `off`，`V` 在“最新样本为 0”的规范下）。
+    /// 圆心（用户单位，物理绝对圆心的估计）。
     ///
-    /// 不保存 `V` 偏置，所以它与物理绝对圆心相差 `k·V_latest`（`V_latest` 是
-    /// 最新样本的物理 `V = ∫i dt`，单位 A·s，乘 `k` 后与圆心同量纲）。
-    /// `k`、半径、`p_rel` 都不受影响。
+    /// `off` 把每次搬原点的 `U` 平移和被 `k` 加权后的 `V` 平移都折算进去，所以
+    /// `center = c + off` 与物理圆心只差 `Σ(k_i − k)·v_i`：`k` 恒定时精确，
+    /// `k` 变化时是历史 `k` 与当前 `k` 不一致留下的残差。
     pub center: V2,
     /// 最新样本相对圆心的位置（用户单位，与坐标系无关）。
     pub p_rel: V2,
@@ -850,7 +851,8 @@ pub struct Tracker {
     u: V2,
     /// 当前样本的 `V`（已按最新样本归零，不含任何偏置）。
     v: V2,
-    /// `U` 的局部原点在绝对（用户）坐标系中的位置。
+    /// 搬原点累积的帧偏移：`stored_U + off` 追平 `U` 的绝对位置，且
+    /// `c + off` 是物理圆心（`k` 恒定时精确；见 [`Tracker::recenter_latest`]）。
     off: V2,
     t_last: S,
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
@@ -966,16 +968,18 @@ impl Tracker {
 
     /// 把**最新样本**搬到局部原点：`U -> U - u`、`V -> V - v`。
     ///
-    /// 两个平移都是精确变换；`off` 累加被搬走的 `U` 偏移，`V` 那边不留偏置
-    /// （见 [`Tracker::recenter_v`]）。之后 `p_local() == 0`，下一个周期的
-    /// 增量从 0 起算。
+    /// `V` 的平移是纯规范（只把每个 `κ` 的点集平移 `κ·v`，`P`、`P'`、`P''`
+    /// 不变），但在 `κ = k` 处它等价于把帧平移 `k·v`。`off` 同时累加 `U` 的
+    /// 平移和被 `k` 加权后的 `V` 平移，于是 `Report.center = c + off` 仍落在
+    /// 物理圆心附近：`k` 恒定时严格相等，`k` 变化时残差为 `Σ(k_i − k)·v_i`。
+    /// 之后 `p_local() == 0`，下一个周期的增量从 0 起算。
     fn recenter_latest(&mut self) {
         let (ui, vi) = (self.u, self.v);
 
         self.m.translate_u(ui);
         self.u = self.u.sub(ui);
 
-        self.off = self.off.add(ui);
+        self.off = self.off.add(ui).add(vi.mul(self.k));
 
         self.m.translate_v(vi);
         self.v = self.v.sub(vi);
@@ -987,8 +991,12 @@ impl Tracker {
     /// `delta_u` / `delta_v` 是快速环自上个周期以来对 `s0` 与 `i` 的积分（用户
     /// 单位），`weight` 是这段时间内 `Σ(slope_dt/Δt)²`。
     pub fn step_once(&mut self, delta_u: V2, delta_v: V2, t: S, weight: S) -> Option<(Report, V2)> {
-        // 1. 遗忘（按降采样时间推进）
-        let rho = (-(t - self.t_last).max(0.0) / self.cfg.tau).exp();
+        // 1. 遗忘（按降采样时间推进；`tau <= 0` 表示不遗忘）
+        let rho = if self.cfg.tau > 0.0 {
+            (-(t - self.t_last).max(0.0) / self.cfg.tau).exp()
+        } else {
+            1.0
+        };
         self.t_last = t;
         self.m.decay(rho);
         self.w2 *= rho * rho;
@@ -1429,15 +1437,13 @@ pub struct DirectFluxObserver {
     pub fit_period: S,
     /// 测速低通时间常数（秒）。
     pub speed_tau: S,
-    /// 圆心、半径、`R` 每次拟合向拟合值移动的比例。
+    /// 圆心、半径、`R` 每次拟合向拟合值移动的**基础**比例。
     ///
-    /// 三者共用同一个增益，保证交班是同一个机制；`0.05` 对应约 20 个拟合
-    /// 周期（200 ms）收敛。拟合本身的 Newton 步已经用可观性加权，所以这里
-    /// 默认不再乘 `obs`：否则 `obs→0` 时快速环会停在**过时的** `R`/圆心，
-    /// 与拟合的圆不一致（实测 1.25× 初值会卡在 +10% 并造成 π 角度偏置）。
+    /// `0.05` 对应约 20 个拟合周期（200 ms）收敛。`R` 的实际增益还要乘可辨识
+    /// 性 `w_obs`（稳态 `obs→0` 时不跟噪声游走）；圆心/半径直接用它——实测按
+    /// `|k_fit − k_fast|` 冻结圆心会让启动瞬态更差（R 没收敛时，用拟合的 `k`
+    /// 算出的圆心反而把快速环往更准的圆上拉）。
     pub sync_gain: S,
-    /// 交班是否再乘可观性权重（默认关；打开做 A/B 对照）。
-    pub sync_obs_weighted: bool,
     /// 半径范围的相对尺度（相对 `set_initial` 的 `radius`）。
     pub radius_scale: (S, S),
     /// `k` 范围的相对尺度（相对 `set_initial` 的 `r`）。
@@ -1460,6 +1466,11 @@ pub struct DirectFluxObserver {
     pub valid: bool,
     pub theta_meas: S,
     pub flux_mag: S,
+    /// 快速环的磁链向量（用户单位 A，相对拟合圆心；圆心即原点）。
+    ///
+    /// 它就是快速环的 `c + ∫s0 + R·∫i`，理想情况下落在以原点为圆心、
+    /// 半径 `radius` 的圆上，是画"磁链圆"轨迹用的。
+    pub flux: V2,
     pub obs: S,
     pub sigma_rel: S,
     /// `k` 的标准误（诊断/调参用）。
@@ -1470,11 +1481,16 @@ pub struct DirectFluxObserver {
     pub steps: u32,
     pub weight: S,
     pub data_arc: S,
-    /// 拟合圆心（用户单位；`V` 在最新样本为 0 的规范下，差一个 `k·V_latest`；
+    /// 拟合圆心（用户单位，物理绝对圆心；`k` 变化时有 `Σ(k_i − k)·v_i` 残差；
     /// 诊断用）。
     pub center: V2,
     /// 拟合圆心（内部单位，相对最新样本；交班目标就是它的相反数）。
     pub center_local: V2,
+    /// 拟合**直接给出的圆心**，画在磁链图坐标系里（用户单位）：
+    /// `C_fit − C_fast`，即以"快速环圆心"为原点时拟合圆心的位置。
+    ///
+    /// 每次拟合更新一次；它与原点的偏差就是快速环圆心与拟合圆心的差距。
+    pub center_fit: V2,
     pub r_nominal: S,
     pub radius_nominal: S,
     pub radius_clamped: bool,
@@ -1502,7 +1518,6 @@ impl Default for DirectFluxObserver {
             fit_period: 0.01,
             speed_tau: 0.02,
             sync_gain: 0.05,
-            sync_obs_weighted: false,
             radius_scale: (0.1, 10.0),
             k_scale: (0.1, 10.0),
             mag_lo: 0.3,
@@ -1516,6 +1531,7 @@ impl Default for DirectFluxObserver {
             valid: false,
             theta_meas: 0.0,
             flux_mag: 0.0,
+            flux: V2::ZERO,
             obs: 0.0,
             sigma_rel: 0.0,
             sigma_k: 0.0,
@@ -1526,6 +1542,7 @@ impl Default for DirectFluxObserver {
             data_arc: 0.0,
             center: V2::ZERO,
             center_local: V2::ZERO,
+            center_fit: V2::ZERO,
             r_nominal: 0.0,
             radius_nominal: 0.0,
             radius_clamped: false,
@@ -1595,9 +1612,13 @@ impl DirectFluxObserver {
         self.data_arc = 0.0;
         self.center = V2::new(self.theta.cos(), self.theta.sin()).mul(radius);
         self.center_local = V2::ZERO;
+        // t=0 时快速环与拟合用同一个圆心假设，图上重合于原点。
+        self.center_fit = V2::ZERO;
         self.theta_meas = self.theta;
         self.omega = omega;
         self.flux_mag = radius;
+        // t=0 时磁链点在原点、圆心在 `radius·n(θ)`，相对圆心就是 `-radius·n(θ)`。
+        self.flux = V2::new(-self.theta.cos(), -self.theta.sin()).mul(radius);
         self.last = ObserverOutput {
             electrical_angle: self.theta,
             electrical_speed: omega,
@@ -1673,16 +1694,24 @@ impl Observer<3> for DirectFluxObserver {
                 if let Some((rep, c_local)) = tr.step_once(a.mul(l), b.mul(l), self.total_time, q) {
                     let k_fit = tr.k();
                     let rad_fit = rep.radius / l;
+                    // `R` 的交接乘可辨识性：稳态 `obs→0` 时不把拟合的噪声游走带进快速环。
                     let w_obs = (rep.obs / self.fit.obs_min.max(1.0e-12)).clamp(0.0, 1.0);
-                    let w = self.sync_gain * if self.sync_obs_weighted { w_obs } else { 1.0 };
+                    let w_k = self.sync_gain * w_obs;
+                    let mut center_fit = self.center_fit;
                     if let Ok(mut f) = self.fast.lock() {
-                        // 目标圆心：让最新样本落在拟合圆上，即 c_tgt = -c_local。
-                        // 圆心、半径、R 三者用同一个权重一起滑动。
+                        // 交班前的 `f.c` = 最新样本相对快速环圆心；加上拟合圆心
+                        // （相对最新样本）就是"拟合圆心"在磁链图上的位置（原点 =
+                        // 快速环圆心）。它每次拟合更新一次。
+                        center_fit = f.c.add(c_local).mul(l);
+                        // 圆心/半径不乘 `obs`：它们不是"可辨识性"问题。注意它们也
+                        // 不能按 `|k_fit − k_fast|` 冻结——R 还没收敛时，用拟合的
+                        // k 算出的圆心恰好是把快速环往更准的圆上拉，冻结反而更偏。
                         let tgt = c_local.mul(-1.0);
-                        f.c = f.c.add(tgt.sub(f.c).mul(w));
-                        f.k += (k_fit - f.k) * w;
-                        f.rad += (rad_fit - f.rad) * w;
+                        f.c = f.c.add(tgt.sub(f.c).mul(self.sync_gain));
+                        f.k += (k_fit - f.k) * w_k;
+                        f.rad += (rad_fit - f.rad) * self.sync_gain;
                     }
+                    self.center_fit = center_fit;
                     self.r_fit = k_fit;
                     self.radius_fit = rep.radius;
                     self.obs = rep.obs;
@@ -1706,7 +1735,7 @@ impl Observer<3> for DirectFluxObserver {
         }
 
         // ---- 快速环：反正切测角 + 低通差分测速 ----
-        let (theta, omega, mag, k_now, rad_now) = {
+        let (theta, omega, mag, rel, k_now, rad_now) = {
             let mut f = match self.fast.lock() {
                 Ok(f) => f,
                 Err(_) => {
@@ -1724,7 +1753,7 @@ impl Observer<3> for DirectFluxObserver {
                 1.0
             };
             f.omega_lp += alpha * (dtheta / delta_time - f.omega_lp);
-            (theta, f.omega_lp, rel.norm(), f.k, f.rad)
+            (theta, f.omega_lp, rel.norm(), rel, f.k, f.rad)
         };
 
         self.theta = theta;
@@ -1733,6 +1762,7 @@ impl Observer<3> for DirectFluxObserver {
         self.r = k_now;
         self.radius = rad_now * self.unit_len;
         self.flux_mag = mag * self.unit_len;
+        self.flux = rel.mul(self.unit_len);
         let r_i = rad_now;
         let valid = slope_ok
             && r_i > 0.0
@@ -2033,8 +2063,8 @@ mod tests {
     }
 
     /// 给所有 `V_n` 加同一个常数只是把 `p_n(κ)` 平移 `κc`：`P`、`P'`、`P''`
-    /// 必须完全不变。拟合与可观性门限都建立在这一点上：`recenter_v` 只搬 `V`
-    /// 的原点、不保存偏置，正是因为偏置不影响剖面。
+    /// 必须完全不变。拟合与可观性门限都建立在这一点上：`recenter_latest` 只搬
+    /// `V` 的原点、不保存偏置，正是因为偏置不影响剖面。
     #[test]
     fn v_constant_offset_is_a_gauge() {
         let c = V2::new(0.9, -1.4);
@@ -2082,7 +2112,7 @@ mod tests {
     }
 
     /// `V = ∫i dt` 的常数偏移是规范：注入一个偏置后 `k` 仍须从 +25% 初值恢复到
-    /// 真值。这里不保存 `v_off`：`recenter_v` 把最新样本的 `V` 归零，偏置只
+    /// 真值。这里不保存 `v_off`：`recenter_latest` 把最新样本的 `V` 归零，偏置只
     /// 影响每个 `κ` 的平移，`P`、`P'`、`P''` 与 `k` 都不受影响。
     #[test]
     fn v_offset_does_not_break_k() {
@@ -2237,11 +2267,25 @@ mod tests {
             t += dt;
         }
         eprintln!(
-            "direct: tail={worst_tail:.4} jump={worst_jump:.4} r={:.3} r_fit={:.3} radius={:.4} obs={:.2e}",
-            ob.r, ob.r_fit, ob.radius, ob.obs
+            "direct: tail={worst_tail:.4} jump={worst_jump:.4} r={:.3} r_fit={:.3} radius={:.4} obs={:.2e} center_fit={:?}",
+            ob.r, ob.r_fit, ob.radius, ob.obs, ob.center_fit
         );
         assert!(worst_tail < 0.05, "tail error {worst_tail} rad");
         assert!(worst_jump < 0.15, "angle jump {worst_jump} rad");
+        // 磁链向量（相对拟合圆心）应当落在半径圆上，供 GUI 的"磁链圆"图使用。
+        assert!(
+            (ob.flux.norm() - ob.radius).abs() < 0.1 * ob.radius,
+            "flux {:?} 与半径 {} 不一致",
+            ob.flux,
+            ob.radius
+        );
+        // 图上"拟合圆心"应当收敛到原点附近（快速环圆心 ≈ 拟合圆心）。
+        assert!(
+            ob.center_fit.norm() < 0.2 * ob.radius,
+            "center_fit {:?} 偏离原点（radius {}）",
+            ob.center_fit,
+            ob.radius
+        );
     }
 
     /// R 初值 +25%：只能靠可观性加权 Newton 慢慢拉回；拉回后角度要恢复。
@@ -2357,13 +2401,23 @@ mod tests {
         }
         let (rep, c) = last.expect("report");
         eprintln!(
-            "origin: p_local={:?} c={:?} radius={:.4}",
+            "origin: p_local={:?} c={:?} radius={:.4} center={:?}",
             tr.p_local(),
             c,
-            rep.radius
+            rep.radius,
+            rep.center
         );
         assert!(tr.p_local().norm() < 1.0e-12, "latest sample not at origin");
         assert!((rep.radius - radius).abs() < 0.01);
+        // `off` 折算了 `k·v`，圆心读数必须落在物理圆心 `radius·n(0)` 上，
+        // 而不是随 `k·∫i dt` 漂走。
+        let c_ref = V2::new(radius, 0.0);
+        assert!(
+            rep.center.sub(c_ref).norm() < 0.02,
+            "center {:?} 偏离物理圆心 {:?}",
+            rep.center,
+            c_ref
+        );
     }
 
     /// `update()` 路径（现在就是 `step_once()`）：最新样本的 `V` 严格归零，
