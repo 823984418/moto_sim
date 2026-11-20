@@ -68,11 +68,13 @@ pub struct Simulation {
 
     angle_sensor_noise: Noise,
     current_sample_noise: [Noise; 3],
-    slope_sample_noise: [Noise; 3],
     output_voltage_noise: [Noise; 3],
     bus_voltage_sample_noise: Noise,
     sample_current_offset: [f64; 3],
     output_voltage_offset: [f64; 3],
+    /// 上一帧采样电流（αβ），给 `s0 = Δi/Δt − v/Lq` 用。
+    prev_current_ab: [f64; 2],
+    have_prev_current: bool,
 
     /// 零矢量斜率噪声倍率（0 = 理想斜率，1 = 与电流采样噪声一致）。
     pub slope_noise_scale: f64,
@@ -353,11 +355,8 @@ impl Simulation {
                 Noise::new(0.01, 2),
                 Noise::new(0.01, 3),
             ],
-            slope_sample_noise: [
-                Noise::new(1.0, 11),
-                Noise::new(1.0, 12),
-                Noise::new(1.0, 13),
-            ],
+            prev_current_ab: [0.0; 2],
+            have_prev_current: false,
             slope_noise_scale: 1.0,
             // 零矢量斜率是 v=0 时的 di/dt，死区/器件压降不进入这一测量，
             // 因此默认不注入。保留开关仅用于对照“平均模型误解”的敏感性。
@@ -511,65 +510,31 @@ impl Simulation {
                     self.observer_input.current = sample_current;
                     self.observer_input.target_speed = self.target_speed;
 
-                    // ---- 零矢量电流斜率传感器模型 ----
-                    // 本仿真的功率桥是平均模型，没有真实载波/开关状态，所以这里
-                    // 用电机 dq ODE 在 v=0 时的导数合成“双采样斜率”，再按零矢量
-                    // 时长注入噪声。它不是从真实 PWM 波形里测出来的。
-                    let duty = self.power_bridge_input.output_duty;
-                    let duty_max = duty.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                    let duty_min = duty.iter().copied().fold(f64::INFINITY, f64::min);
-                    let zero_vector_fraction = (1.0 - 0.5 * (duty_max - duty_min)).clamp(0.0, 1.0);
-                    let carrier_period = if self.power_bridge.carry_freq > 0.0 {
-                        1.0 / self.power_bridge.carry_freq
+                    // ---- 电流梯度：相邻帧电流差分/Δt − 重建电压/Lq ----
+                    // 不再用 dq ODE 合成“零矢量斜率”：直接用采样电流的一阶差分
+                    // 减去重建的端电压（指令 duty×母线/2 再叠死区修正）/Lq。
+                    // 噪声因此只来自 ADC 电流采样与重建电压（死区修正用到采样
+                    // 电流），不再额外注入斜率噪声。
+                    let i_ab = clarke(sample_current);
+                    let v_ab = clarke(sample_voltage);
+                    let lq = self.motor.inductance_dq[1];
+                    if self.have_prev_current && lq.is_finite() && lq > 0.0 {
+                        let di_ab = [
+                            (i_ab[0] - self.prev_current_ab[0]) / delta_time,
+                            (i_ab[1] - self.prev_current_ab[1]) / delta_time,
+                        ];
+                        let slope_ab = [di_ab[0] - v_ab[0] / lq, di_ab[1] - v_ab[1] / lq];
+                        self.observer_input.current_slope = inverse_clarke(slope_ab);
+                        // 每一帧都是一次差分，权重取采样周期。
+                        self.observer_input.current_slope_dt = delta_time;
+                        self.last_slope_dt = delta_time;
                     } else {
-                        delta_time
-                    };
-                    let slope_dt = zero_vector_fraction * carrier_period - 3.0e-6;
-                    if slope_dt >= 1.0e-6 {
-                        let theta_e = self.motion_load.angle * self.motor.pole_pairs;
-                        let omega_e = self.motion_load.speed * self.motor.pole_pairs;
-                        let [id, iq] = self.motor.current_dq;
-                        let ld = self.motor.inductance_dq[0];
-                        let lq = self.motor.inductance_dq[1];
-                        let l = 0.5 * (ld + lq);
-
-                        // vd = vq = 0 时的 dq 电流导数
-                        let did = (-self.motor.rs * id + omega_e * lq * iq) / ld;
-                        let diq =
-                            (-self.motor.rs * iq - omega_e * (self.motor.flux + ld * id)) / lq;
-                        let i_ab = rotate([id, iq], theta_e);
-                        let di_ab = rotate([did, diq], theta_e);
-                        // αβ 系里还要加上坐标系旋转项 ωJ·i
-                        let mut slope_ab =
-                            [di_ab[0] - omega_e * i_ab[1], di_ab[1] + omega_e * i_ab[0]];
-
-                        // 零矢量斜率是端电压为零时的 di/dt，死区/器件压降不进入
-                        // 这一测量。下面的注入仅作为“错误理解”的对照实验，
-                        // 默认关闭（--inject-dead 才打开）。
-                        if self.slope_dead_voltage {
-                            let dead_ab = clarke(self.power_bridge.dead_voltage);
-                            slope_ab[0] += self.slope_dead_scale * dead_ab[0] / l;
-                            slope_ab[1] += self.slope_dead_scale * dead_ab[1] / l;
-                        }
-
-                        let mut slope_3ph = inverse_clarke(slope_ab);
-                        let sigma_s = std::f64::consts::SQRT_2
-                            * self.current_noise_std
-                            * self.slope_noise_scale
-                            / slope_dt;
-                        for i in 0..3 {
-                            self.slope_sample_noise[i].update(delta_time);
-                            slope_3ph[i] += self.slope_sample_noise[i].value * sigma_s;
-                        }
-                        self.observer_input.current_slope = slope_3ph;
-                        self.observer_input.current_slope_dt = slope_dt;
-                        self.last_slope_dt = slope_dt;
-                    } else {
-                        // 调制度太高，零矢量不足以做双采样。
                         self.observer_input.current_slope = [0.0; 3];
                         self.observer_input.current_slope_dt = 0.0;
                         self.last_slope_dt = 0.0;
                     }
+                    self.prev_current_ab = i_ab;
+                    self.have_prev_current = true;
 
                     self.res_tune.update(delta_time, &self.observer_input);
                     self.inductance_tune
@@ -790,9 +755,9 @@ impl Application {
                     // ScopeData::new("sensor_angle", |s: &mut Simulation| {
                     //     s.sensor_observer_output.electrical_angle
                     // }),
-                    // ScopeData::new("flux_angle", |s: &mut Simulation| {
-                    //     s.flux_observer_output.electrical_angle
-                    // }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        s.flux_observer_output.electrical_angle
+                    }),
                     // ScopeData::new("grad_angle", |s: &mut Simulation| {
                     //     s.grad_observer_output.electrical_angle
                     // }),
@@ -837,12 +802,12 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    // ScopeData::new("flux_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.flux_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                     // ScopeData::new("grad_angle", |s: &mut Simulation| {
                     //     angle_normal(
                     //         s.grad_observer_output.electrical_angle
