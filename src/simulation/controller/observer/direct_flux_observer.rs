@@ -45,13 +45,19 @@
 //!
 //! 数值措施：
 //!
-//! * 内部单位 + U 浮动原点 + `V` 原点管理（物理 `V = v' + v_off`）把矩挡在
-//!   `|p| ~ R`。`u`、`v` 只在一次拟合周期内累加、随后清零，长积分在
-//!   `off`/`v_off` 里；实测去掉补偿求和后输出逐位不变，所以不再保留。
+//! * 内部单位 + U 浮动原点 + `V` 的最新样本归零把矩挡在 `|p| ~ R`。`u`、`v`
+//!   只在一次拟合周期内累加、随后清零，`U` 的长积分在 `off` 里；实测去掉补偿
+//!   求和后输出逐位不变，所以不再保留。
 //! * 直接观测器每个拟合周期都把最新样本搬到原点，并在 `κ = k` 处把 `b` 展开
 //!   到三次、`c` 到四次（用的仍是已有矩 `g_vx/g_vy/b_g/g2`）。矩里的 `|U|`、
-//!   `|V|` 只有一个周期内增量的量级，`V` 的慢漂在 `v_off` 里、求值时用
-//!   `translate_u(-κ·v_off)` 精确补回，所以没有论文 §6.1 那种大数相消。
+//!   `|V|` 只有一个周期内增量的量级。
+//!
+//!   `V` 的偏置**不进拟合**：给所有 `V_n` 加同一个常向量只是把每个 `κ` 的
+//!   点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径都不变。所以只把最新样本的
+//!   `V` 归零（纯规范），不再累一个 `v_off` 并在求值处把 `κ·v_off` 补回 `U`：
+//!   拟合直接在“最新样本为原点”的小量坐标里做，报告的圆心天然就是相对最新
+//!   样本的圆心。可观性尺度同样取这个小量坐标下的 `Σw|V|² = m.g`，它对 `V`
+//!   的常数偏置不变。
 //! * 半径越界时把线性化伪观测 `μ(gᵀθ-z)²` 加进 `A0/b0/c0`，于是 `P`、`P'`、
 //!   `P''` 一起变成带罚项剖面；Newton 步、线搜索、扫描与输出都用同一个目标，
 //!   报告的损失仍用**无罚项**残差，罚项常数不会污染 `sigma_rel`。
@@ -458,8 +464,9 @@ impl Moments {
 
     /// 平移 `V -> V - s`（`U` 不动）：纯规范，`P`、`P'`、`P''` 不变。
     ///
-    /// 论文附录 A.3；物理 `V = V' + v_off`，求值时由 `coef_at(κ)` 把
-    /// `κ·v_off` 平移回 `U`。
+    /// 论文附录 A.3。`V` 的常数偏置是纯规范：它只把每个 `κ` 的点集平移
+    /// `κ·s`，`P`、`P'`、`P''` 完全不变，所以 `recenter_v` 搬完之后不需要
+    /// 在求值处补回任何东西。
     fn translate_v(&mut self, s: V2) {
         if s.norm2() == 0.0 {
             return;
@@ -553,7 +560,7 @@ impl Moments {
 
     /// 在 `κ = kap` 处展开的剖面 Taylor 系数。
     ///
-    /// 矩里存的是原始 `U`、`V'`，求值点在 `κ = k`，需要把
+    /// 矩里存的是原始 `U`、`V`，求值点在 `κ = k`，需要把
     ///
     /// ```text
     ///   A(κ) = A0 + κA1 + κ²A2
@@ -711,7 +718,7 @@ fn fit_from_coef(co: &Coef) -> Option<Profile> {
     })
 }
 
-/// 在目标 `κ` 处求剖面（系数由 [`Tracker::coef_at`] 给出）；`pen` 非空时把
+/// 在目标 `κ` 处求剖面（系数由 [`Moments::coef_at`] 给出）；`pen` 非空时把
 /// 线性化半径罚项加进法方程：`A₀ += μggᵀ`、`b₀ -= μzg`、`c₀ += μz²`。
 ///
 /// `g`、`z` 固定，所以 `P'`、`P''` 也是同一个带罚项剖面的导数，可以直接
@@ -729,17 +736,6 @@ fn fit_with_penalty_coef(co: &Coef, pen: Option<RadiusPenalty>) -> Option<Profil
     }
     co.c0 += p.mu * p.z * p.z;
     fit_from_coef(&co)
-}
-
-/// 物理 `V = V' + v_off` 的加权二阶矩 `Σw|V|² = g0 + 2 v_off·ΣwV' + w|v_off|²`。
-///
-/// 它与 `V` 的原点规范无关（`v_off` 怎么拆分都不变），所以 `recenter_v` 不会
-/// 让可观性/先验的尺度跳变。注意：这里**不用**中心化方差
-/// `Σw|V - V̄|²`——那会把 `V` 的积分偏移也当成“没有信息”去掉，1 mA 稳态下
-/// `R` 会被噪声推到 +17%（实测），因为它同时拿掉了先验里对漂移的阻尼。
-#[inline]
-fn v_second(m: &Moments, v_off: V2) -> S {
-    m.g + 2.0 * (v_off.x * m.vx + v_off.y * m.vy) + m.w * v_off.norm2()
 }
 
 // ===========================================================================
@@ -837,7 +833,11 @@ pub struct Report {
     pub k: S,
     /// 圆半径（用户单位，A）。
     pub radius: S,
-    /// 圆心（用户单位，绝对坐标）。
+    /// 圆心（用户单位；已加回 `U` 的原点 `off`，`V` 在“最新样本为 0”的规范下）。
+    ///
+    /// 不保存 `V` 偏置，所以它与物理绝对圆心相差 `k·V_latest`（`V_latest` 是
+    /// 最新样本的物理 `V = ∫i dt`，单位 A·s，乘 `k` 后与圆心同量纲）。
+    /// `k`、半径、`p_rel` 都不受影响。
     pub center: V2,
     /// 最新样本相对圆心的位置（用户单位，与坐标系无关）。
     pub p_rel: V2,
@@ -867,12 +867,13 @@ pub struct Report {
 
 /// 指数遗忘的流式 Kåsa 拟合器。
 ///
-/// 存储原始 `U`、`V'`，在 `κ = k` 处把剖面展开到三/四次（`b` 到 `κ³`、
+/// 存储原始 `U`、`V`，在 `κ = k` 处把剖面展开到三/四次（`b` 到 `κ³`、
 /// `c` 到 `κ⁴`）。直接观测器每个拟合周期都把最新样本搬到原点，所以矩里的
 /// `|U|`、`|V|` 只有一个周期内增量的量级。
 ///
-/// `V` 有一个原点偏移：物理 `V = v + v_off`。求值点 `κ` 处等价于先把 `U`
-/// 平移 `κ·v_off`（见 [`Tracker::coef_at`]）。
+/// `V` 的常数偏置是纯规范（给所有 `V_n` 加 `c` 只把每个 `κ` 的点集平移
+/// `κc`，`P`、`P'`、`P''`、`k`、半径都不变），所以这里只把最新样本的 `V`
+/// 归零，不保存任何偏置；拟合直接在“最新样本为原点”的坐标系里求值。
 #[derive(Clone, Debug)]
 pub struct Tracker {
     cfg: FitConfig,
@@ -887,12 +888,10 @@ pub struct Tracker {
     k_initial: S,
     /// 当前样本在局部参考系中的位置 `U`。
     u: V2,
-    /// 当前样本的 `V'`（已搬掉原点；物理 `V = V' + v_off`）。
+    /// 当前样本的 `V`（已按最新样本归零，不含任何偏置）。
     v: V2,
-    /// 局部原点在绝对（用户）坐标系中的位置。
+    /// `U` 的局部原点在绝对（用户）坐标系中的位置。
     off: V2,
-    /// `V` 的原点偏移：物理 `V = v + v_off`。
-    v_off: V2,
     t_last: S,
     started: bool,
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
@@ -929,7 +928,6 @@ impl Tracker {
             u: V2::ZERO,
             v: V2::ZERO,
             off: V2::ZERO,
-            v_off: V2::ZERO,
             t_last: 0.0,
             started: false,
             path: 0.0,
@@ -962,18 +960,6 @@ impl Tracker {
     #[inline]
     pub fn off(&self) -> V2 {
         self.off
-    }
-
-    /// 物理 `V` 相对存储 `V'` 的原点偏移（内部单位）：`V = V' + v_off`。
-    #[inline]
-    pub fn v_off(&self) -> V2 {
-        self.v_off
-    }
-
-    /// 物理 `V` 的加权二阶矩 `Σw|V|²`（对 `recenter_v` 不变）。
-    #[inline]
-    fn v_second(&self) -> S {
-        v_second(&self.m, self.v_off)
     }
 
     /// 当前样本在局部参考系中的位置（内部单位）。
@@ -1069,27 +1055,11 @@ impl Tracker {
         self.cfg.r_kappa = cfg.r_kappa;
     }
 
-    /// 在存储矩 `m` 的 `κ = kap` 处组装剖面系数。
+    /// 把**最新样本**搬到局部原点：`U -> U - u`、`V -> V - v`。
     ///
-    /// 物理 `V = V' + v_off`，所以 `κ` 处等价于先把 `U` 平移 `κ·v_off`。
-    fn coef_at(&self, m: &Moments, kap: S) -> Coef {
-        if kap == 0.0 {
-            return m.coef();
-        }
-        let mut mm = *m;
-        if self.v_off.norm2() > 0.0 {
-            mm.translate_u(self.v_off.mul(-kap));
-        }
-        mm.coef_at(kap)
-    }
-
-    /// 把**最新样本**搬到局部原点：`U -> U - u`、`V' -> V' - v`。
-    ///
-    /// 两个平移都是精确变换；`off` / `v_off` 累加被搬走的偏移，绝对坐标诊断
-    /// 不受影响。之后 `p_local() == 0`，下一个周期的增量从 0 起算。
-    ///
-    /// `V` 那一半与 [`Tracker::recenter_v`] 共用同一套规则（最新样本归零），
-    /// 两处不会各自演化出不同的 `V` 规范。
+    /// 两个平移都是精确变换；`off` 累加被搬走的 `U` 偏移，`V` 那边不留偏置
+    /// （见 [`Tracker::recenter_v`]）。之后 `p_local() == 0`，下一个周期的
+    /// 增量从 0 起算。
     fn recenter_latest(&mut self) {
         let (ui, vi) = (self.u, self.v);
         if !ui.finite() || !vi.finite() || (ui.norm2() == 0.0 && vi.norm2() == 0.0) {
@@ -1199,7 +1169,7 @@ impl Tracker {
         };
         // 可辨识性与噪声门限只看**无约束**剖面：半径罚项是先验，不能替数据
         // 证明“这个 k 是数据支持的”。
-        let v2 = v_second(&self.m, self.v_off);
+        let v2 = self.m.g;
         let scale = 4.0 * f0_best.radius * f0_best.radius * v2;
         let obs = if scale > 0.0 && scale.is_finite() {
             f0_best.p2 / scale
@@ -1241,13 +1211,16 @@ impl Tracker {
         self.off = self.off.add(s);
     }
 
-    /// `V` 的原点管理：把**最新样本**的 `V'` 归零（`V' -> V' - v`，
-    /// `v_off += v`；物理 `V = V' + v_off`）。
+    /// `V` 的原点管理：把**最新样本**的 `V` 归零（`V -> V - v`）。
     ///
-    /// 这是纯规范：`P(k)`、`k`、圆心、半径都不变；作用只是不让 `V = ∫i dt` 的
-    /// 积分漂移把 `V` 那一族矩的量级撑大。与 `U` 的浮动原点（质心归零、带
-    /// 阈值）不同，这里直接锚在最新样本上：最新点本来就是拟合输出与交班使用
-    /// 的参考点，锚在它上面不需要可调阈值，且每个样本恰好平移一次。
+    /// 不给 `V` 记任何偏置。`V` 的常数偏置是纯规范：给所有 `V_n` 加同一个
+    /// `c` 只是把每个 `κ` 的点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径
+    /// 都不变，而最新样本的 `V` 在这里恒为 0，所以拟合天然与 `V` 偏置无关。
+    /// 作用只是不让 `V = ∫i dt` 的积分漂移把 `V` 那一族矩的量级撑大。
+    ///
+    /// 与 `U` 的浮动原点（质心归零、带阈值）不同，这里直接锚在最新样本上：
+    /// 最新点本来就是拟合输出与交班使用的参考点，锚在它上面不需要可调阈值，
+    /// 且每个样本恰好平移一次。
     fn recenter_v(&mut self) {
         let c = self.v;
         if !c.finite() || c.norm2() == 0.0 {
@@ -1255,7 +1228,6 @@ impl Tracker {
         }
         self.m.translate_v(c);
         self.v = self.v.sub(c);
-        self.v_off = self.v_off.add(c);
     }
 
     /// 在 `m` 上先做无约束拟合；半径越界时把线性化罚项加进法方程再解一次。
@@ -1267,7 +1239,7 @@ impl Tracker {
         m: &Moments,
         kappa: S,
     ) -> Option<(Option<RadiusPenalty>, Profile, Profile)> {
-        let co = self.coef_at(m, kappa);
+        let co = m.coef_at(kappa);
         let f0 = fit_from_coef(&co)?;
         match self.radius_penalty(&f0, m.w) {
             None => Some((None, f0, f0)),
@@ -1306,7 +1278,7 @@ impl Tracker {
     /// 固定罚项的剖面损失。线搜索必须与 Newton 步用同一个目标，否则
     /// “`P` 下降”与“带罚项 `P` 下降”会互相打架。
     fn p_at_with_penalty(&self, k: S, pen: Option<RadiusPenalty>) -> Option<S> {
-        let co = self.coef_at(&self.m, k);
+        let co = self.m.coef_at(k);
         fit_with_penalty_coef(&co, pen).map(|f| f.p)
     }
 
@@ -1338,9 +1310,12 @@ impl Tracker {
                 None => break,
             };
             // 满激励时 `P'' = 2Σw(∂r/∂k)² + ...`，而 `|∂r/∂k| <= 2R|V|`，
-            // 用 `4R²Σw|V|²` 作尺度得到无量纲可观性指数。门限一律用**无约束**
-            // 剖面：半径罚项只会增加曲率，不能拿它冒充“k 被数据辨识出来了”。
-            let scale = 4.0 * f0.radius * f0.radius * self.v_second();
+            // 用 `4R²Σw|V|²` 作尺度得到无量纲可观性指数。这里取存储坐标系
+            // （最新样本 `V = 0`）下的 `Σw|V|² = m.g`：它对 `V` 的常数偏置
+            // 不变（给所有 `V_n` 加同一个 `c`，`V_n - V_latest` 不变），所以
+            // 拟合与门限都与 `V` 偏置无关。门限一律用**无约束**剖面：半径罚项
+            // 只会增加曲率，不能拿它冒充“k 被数据辨识出来了”。
+            let scale = 4.0 * f0.radius * f0.radius * self.m.g;
             self.obs = if scale > 0.0 && scale.is_finite() {
                 f0.p2 / scale
             } else {
@@ -1487,13 +1462,16 @@ impl Tracker {
     /// 报告 + **局部圆心**：后者是以最新样本为原点（内部单位）的拟合圆心，
     /// 供快速环做“目标相对圆心”。
     ///
-    /// `recenter_latest` 把最新样本的局部坐标清成 `(0, 0)`，但它的物理位置是
-    /// `κ·v_off`，所以返回 `c - κ·v_off`。
+    /// `recenter_latest` 把最新样本的局部坐标清成 `(0, 0)`，而 `V` 不保存
+    /// 偏置，所以拟合直接在“最新样本为原点”的坐标系里进行：这里的 `c` 本身
+    /// 就是相对最新样本的圆心，不需要再加回任何 `κ·v_off`。
     fn report_pair(&self) -> Option<(Report, V2)> {
         let kappa = self.k;
-        let co = self.coef_at(&self.m, kappa);
+        let co = self.m.coef_at(kappa);
         let f0 = fit_from_coef(&co)?;
-        let scale = 4.0 * f0.radius * f0.radius * v_second(&self.m, self.v_off);
+        // 可观性尺度与 `newton_impl` 完全一致：存储坐标系的 `Σw|V|²`，
+        // 对 `V` 的常数偏置不变。
+        let scale = 4.0 * f0.radius * f0.radius * self.m.g;
         let obs = if scale > 0.0 && scale.is_finite() {
             f0.p2 / scale
         } else {
@@ -1515,11 +1493,8 @@ impl Tracker {
             return None;
         }
         let r = r2.sqrt();
-        // 物理 `p_local = U + κ(V' + v_off)`。
-        let p_loc = self
-            .u
-            .add(self.v.mul(kappa))
-            .add(self.v_off.mul(kappa));
+        // `p_local = U + κV`（最新样本处为 0，见 `recenter_latest`）。
+        let p_loc = self.u.add(self.v.mul(kappa));
         let rel = p_loc.sub(c);
         let dist = rel.norm();
         let l = self.unit_len;
@@ -1557,7 +1532,7 @@ impl Tracker {
             obs,
             steps: self.steps,
             clamped,
-        }, c.sub(self.v_off.mul(kappa))))
+        }, c))
     }
 }
 
@@ -1634,7 +1609,8 @@ pub struct DirectFluxObserver {
     pub steps: u32,
     pub weight: S,
     pub data_arc: S,
-    /// 拟合圆心（绝对坐标，诊断用）。
+    /// 拟合圆心（用户单位；`V` 在最新样本为 0 的规范下，差一个 `k·V_latest`；
+    /// 诊断用）。
     pub center: V2,
     /// 拟合圆心（内部单位，相对最新样本；交班目标就是它的相反数）。
     pub center_local: V2,
@@ -2163,7 +2139,7 @@ mod tests {
         let c = rep.center.mul(1.0 / l).sub(tight.off());
         let r = rep.radius / l;
         let theta = [-2.0 * c.x, -2.0 * c.y, c.norm2() - r * r];
-        let co = tight.coef_at(&tight.m, tight.k());
+        let co = tight.m.coef_at(tight.k());
         let unpen = loss_from_coef(&co, &theta);
         assert!(
             (unpen - rep.loss * w).abs() <= 1.0e-9 * (1.0 + unpen.abs()),
@@ -2193,8 +2169,8 @@ mod tests {
     }
 
     /// 给所有 `V_n` 加同一个常数只是把 `p_n(κ)` 平移 `κc`：`P`、`P'`、`P''`
-    /// 必须完全不变，`Σw|V - V̄|²` 也必须不变。这既是 V 原点管理（规范变换）
-    /// 的正确性依据，也是可观性指数用中心化方差的依据（模块文档 §4）。
+    /// 必须完全不变。拟合与可观性门限都建立在这一点上：`recenter_v` 只搬 `V`
+    /// 的原点、不保存偏置，正是因为偏置不影响剖面。
     #[test]
     fn v_constant_offset_is_a_gauge() {
         let c = V2::new(0.9, -1.4);
@@ -2210,8 +2186,6 @@ mod tests {
             b.add(u, v.add(c), 1.0);
         }
         let rel = |x: S, y: S| (x - y).abs() / (1.0 + x.abs().max(y.abs()));
-        // 物理 V 的二阶矩与原点拆分无关：把 b 的偏移 c 加回去应当等于 a 的 g。
-        assert!(rel(v_second(&b, V2::new(-c.x, -c.y)), a.g) < 1.0e-12);
         for &k in &[0.0, 0.37, 1.1] {
             let (fa, fb) = (
                 fit_from_coef(&a.coef_at(k)).unwrap(),
@@ -2244,8 +2218,8 @@ mod tests {
     }
 
     /// `V = ∫i dt` 的常数偏移是规范：注入一个偏置后 `k` 仍须从 +25% 初值恢复到
-    /// 真值；`v_off` 负责把这个偏移从存储的 `V'` 里搬走，`coef_at(κ)` 再把
-    /// `κ·v_off` 平移回 `U`。漏掉这步会系统性偏。
+    /// 真值。这里不保存 `v_off`：`recenter_v` 把最新样本的 `V` 归零，偏置只
+    /// 影响每个 `κ` 的平移，`P`、`P'`、`P''` 与 `k` 都不受影响。
     #[test]
     fn v_offset_does_not_break_k() {
         let k_true = 0.7;
@@ -2259,14 +2233,13 @@ mod tests {
         }
         let rep = tr.report_now().expect("report");
         eprintln!(
-            "v-offset: k={:.6} v_off={:?} R={:.4} obs={:.2e}",
+            "v-offset: k={:.6} R={:.4} obs={:.2e}",
             tr.k(),
-            tr.v_off(),
             rep.radius,
             tr.obs()
         );
+        assert_eq!(tr.v, V2::ZERO, "最新样本的 V 必须归零");
         assert!((tr.k() - k_true).abs() < 1.0e-3, "k={}", tr.k());
-        assert!(tr.v_off().norm() > 0.5, "v_off 没生效: {:?}", tr.v_off());
         assert!((rep.radius - r_true).abs() < 1.0e-3, "R={}", rep.radius);
     }
 
@@ -2530,11 +2503,10 @@ mod tests {
         assert!((rep.radius - radius).abs() < 0.01);
     }
 
-    /// `update()` 路径的 V 原点管理：最新样本的 `V'` 严格归零，被搬走的偏移
-    /// 全部累进 `v_off`（等于累计 `ΣΔV`）；`coef_at(κ)` 把它精确补回，所以
-    /// 半径仍是物理值。
+    /// `update()` 路径的 V 原点管理：最新样本的 `V` 严格归零，且不保留任何
+    /// 偏置——给流注入一个常数 `V` 偏置不会改变 `k` 与半径。
     ///
-    /// 旧规则（把 `V'` 的加权均值归零）在这里会留下非零的 `tr.v`：均值归零后
+    /// 旧规则（把 `V` 的加权均值归零）在这里会留下非零的 `tr.v`：均值归零后
     /// 最新样本落在 `v - V̄` 上，只有把最新样本本身归零才能让它严格为 0。
     #[test]
     fn update_puts_latest_v_at_origin() {
@@ -2548,11 +2520,10 @@ mod tests {
         cfg.tau = 10.0;
         let mut tr = Tracker::new(cfg, r);
         let (mut a, mut b) = (V2::ZERO, V2::ZERO);
-        let (mut t, mut n, mut v_sum, mut last) = (0.0, 0, V2::ZERO, None);
+        let (mut t, mut n, mut last) = (0.0, 0, None);
         for (_th, du, dv) in &stream {
             a = a.add(*du);
             b = b.add(*dv);
-            v_sum = v_sum.add(*dv);
             t += dt;
             n += 1;
             if n == 400 {
@@ -2560,20 +2531,15 @@ mod tests {
                 a = V2::ZERO;
                 b = V2::ZERO;
                 n = 0;
-                assert_eq!(tr.v, V2::ZERO, "最新样本的 V' 没有归零");
-                let off = tr.v_off().mul(tr.unit_len());
-                assert!(
-                    off.sub(v_sum).norm() < 1.0e-9 * (1.0 + v_sum.norm()),
-                    "v_off {off:?} 应等于 ΣΔV {v_sum:?}"
-                );
+                assert_eq!(tr.v, V2::ZERO, "最新样本的 V 没有归零");
             }
         }
         let rep = last.expect("report");
         eprintln!(
-            "update origin: k={:.4} radius={:.4} v_off={:?}",
+            "update origin: k={:.4} radius={:.4} g={:.3e}",
             tr.k(),
             rep.radius,
-            tr.v_off()
+            tr.m.g
         );
         assert!((rep.radius - radius).abs() < 0.01, "radius {}", rep.radius);
     }

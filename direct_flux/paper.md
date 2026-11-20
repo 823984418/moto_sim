@@ -217,14 +217,14 @@ $g=0.05$ 对应约 20 个拟合周期（200 ms）收敛。因为清零后 $b=0$�
 每个拟合样本加入矩之后，对全部历史做两次**精确平移**：
 
 $$
-U\leftarrow U-u_{\mathrm{new}},\qquad V'\leftarrow V'-v_{\mathrm{new}},
+U\leftarrow U-u_{\mathrm{new}},\qquad V\leftarrow V-v_{\mathrm{new}},
 $$
 
-即 `Tracker::recenter_latest`。它是精确变换：圆拟合对平移不变，半径/圆心只是跟着平移；`off`、`v_off` 累加被搬走的偏移，绝对坐标诊断不受影响。之后 `p_local == 0`，下一个周期的增量从 0 起算。
+即 `Tracker::recenter_latest`。它是精确变换：圆拟合对平移不变，半径/圆心只是跟着平移；`off` 累加被搬走的 $U$ 偏移。$V$ 不保存偏置——给全部 $V$ 加同一个常向量只是把每个 $\kappa$ 的点集平移 $\kappa c$，$P$、$P'$、$P''$ 完全不变，所以拟合与 $V$ 偏置无关，圆心读数天然就是“相对最新样本”的圆心。之后 `p_local == 0`，下一个周期的增量从 0 起算。
 
 ### 5.2 为什么不再需要剪切
 
-上一版把矩保持在 $U_s=U+k_{\mathrm{ref}}V$ 的参考系里（附录 A.1 的剪切），求值固定在 $\kappa=0$。这一版不走这条路：矩里存原始 $U$、$V'$，每次在 $\kappa=k$ 处把 $b$ 展开到 $\kappa^3$、$c$ 到 $\kappa^4$：
+上一版把矩保持在 $U_s=U+k_{\mathrm{ref}}V$ 的参考系里（附录 A.1 的剪切），求值固定在 $\kappa=0$。这一版不走这条路：矩里存原始 $U$、$V$，每次在 $\kappa=k$ 处把 $b$ 展开到 $\kappa^3$、$c$ 到 $\kappa^4$：
 
 $$
 \begin{aligned}
@@ -234,7 +234,7 @@ c(\kappa)&=c_0+\kappa c_1+\kappa^2 c_2+\kappa^3 c_3+\kappa^4 c_4.
 \end{aligned}
 $$
 
-其中 $b_3=[\sum w\gamma V_x,\ \sum w\gamma V_y,\ 0]$、$c_3=4\sum w\beta\gamma$、$c_4=\sum w\gamma^2$ 都是已有矩，不需要额外统计量。直接观测器每 10 ms 把最新样本搬到原点，矩里的 $|U|$、$|V|$ 只有一个周期增量的量级；$V$ 的慢漂在 $v_{\mathrm{off}}$ 里，`coef_at(κ)` 用 `translate_u(-κ·v_off)` 精确补回。因此 $\kappa=k$ 处不会出现论文 §6.1 的大数相消。实测 0.5~100 rad/s、1~10 mA、`fit_period` 放大到 0.2 s 都与剪切逐位一致；`FitConfig::shear` 与 `--shear` 已删除。
+其中 $b_3=[\sum w\gamma V_x,\ \sum w\gamma V_y,\ 0]$、$c_3=4\sum w\beta\gamma$、$c_4=\sum w\gamma^2$ 都是已有矩，不需要额外统计量。直接观测器每 10 ms 把最新样本搬到原点，矩里的 $|U|$、$|V|$ 只有一个周期增量的量级；拟合就在这个“最新样本为原点”的坐标系里求值，不做任何大数平移。因此 $\kappa=k$ 处不会出现论文 §6.1 的大数相消。实测 0.5~100 rad/s、1~10 mA、`fit_period` 放大到 0.2 s 都与剪切逐位一致；`FitConfig::shear` 与 `--shear` 已删除。
 
 ### 5.3 可观性加权的一步 Newton
 
@@ -280,8 +280,8 @@ $$
 
 - **内部单位** $L=(r_{\min}+r_{\max})/2$：半径 $O(1)$。
 - **$U$ 浮动原点**：质心超过 $0.25L$ 时精确平移，防长积分漂移。
-- **$V$ 原点管理**：存储 $V'=V-v_{\mathrm{off}}$，当 $|\bar V'|>0.25\,\mathrm{RMS}(V')$ 时把均值搬进 $v_{\mathrm{off}}$；可观性尺度用物理 $V$ 的二阶矩，与 $v_{\mathrm{off}}$ 的拆分无关。
-- **不用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量；长积分在 `off`/`v_off` 里。去掉 Neumaier 累加器后 4 组工况的输出逐位不变。
+- **$V$ 最新样本归零**：每个拟合样本把最新样本的 $V$ 归零，但不保存任何偏置——$V$ 的常数偏置是纯规范（给所有 $V_n$ 加 $c$ 只把每个 $\kappa$ 的点集平移 $\kappa c$，$P$、$P'$、$P''$、$k$、半径都不变）。可观性尺度取存储坐标系（最新样本 $V=0$）下的 $\sum w|V|^2$，同样对 $V$ 的常数偏置不变。
+- **不用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量；$U$ 的长积分在 `off` 里。去掉 Neumaier 累加器后 4 组工况的输出逐位不变。
 
 ---
 
