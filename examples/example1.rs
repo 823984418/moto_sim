@@ -1209,9 +1209,9 @@ impl Application {
 
     /// 磁链圆：快速环积分出的磁链向量，圆心（拟合圆心）作为原点。
     fn flux_plot(&mut self, ui: &mut Ui) {
-        let (radius, current, center_fit) = {
+        let (radius, current, center_used) = {
             let o = &self.simulation.direct_flux_observer;
-            (o.radius, o.flux, o.center_fit)
+            (o.radius, o.flux, o.center_used)
         };
         // 拟合半径画成参考圆。
         let mut circle: Vec<[f64; 2]> = Vec::new();
@@ -1240,9 +1240,9 @@ impl Application {
                                 .radius(4.0)
                                 .color(egui::Color32::RED),
                         );
-                        // 拟合直接给出的圆心（图上坐标以快速环圆心为原点）。
+                        // 交班实际使用的圆心（最新样本 + 拟合半径推出）。
                         ui.points(
-                            Points::new("fit center", [center_fit.x, center_fit.y])
+                            Points::new("center", [center_used.x, center_used.y])
                                 .radius(5.0)
                                 .color(egui::Color32::from_rgb(30, 120, 255)),
                         );
@@ -1486,7 +1486,6 @@ fn run_headless(args: &[String]) {
 
     let steps = (seconds / dt).round() as usize;
     let warmup_steps = (steps as f64 * warmup_fraction) as usize;
-    let dump_flux = std::env::var("DUMP_FLUX").is_ok();
 
     let mut startup = Metrics::default();
     let mut steady = Metrics::default();
@@ -1526,14 +1525,6 @@ fn run_headless(args: &[String]) {
         };
         let err = angle_normal(out.electrical_angle - true_angle);
         let speed_err = out.electrical_speed - true_speed;
-
-        if dump_flux {
-            let o = &sim.direct_flux_observer;
-            eprintln!(
-                "F,{t:.7},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.4}",
-                o.flux.x, o.flux.y, o.r, o.radius, o.center_fit.x, o.center_fit.y, true_speed
-            );
-        }
 
         if k >= warmup_steps {
             steady.push(err, speed_err, valid);

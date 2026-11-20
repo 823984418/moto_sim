@@ -156,11 +156,13 @@ $$
 - 拟合 $R$：$k_{\mathrm{fit}}$；
 - 拟合半径：$\rho_{\mathrm{fit}}$。
 
-最新样本相对圆心的正确位置是 $-c_{\mathrm{local}}$，所以圆心目标
+圆心目标**不直接取** $c_{\mathrm{local}}$，而是只用它的方向、长度换成拟合半径（$\ell$ 为内部长度单位）：
 
 $$
-c_{\mathrm{tgt}}=-c_{\mathrm{local}}.
+c_{\mathrm{tgt}}=-\frac{\rho_{\mathrm{fit}}}{\ell}\,\mathrm{unit}(c_{\mathrm{local}}).
 $$
+
+这样最新采样点严格落在半径 $\rho_{\mathrm{fit}}$ 的圆上，$c_{\mathrm{local}}$ 的长度误差（最新点不刚好在圆上、或 $k$ 未收敛时圆本身有偏）不会进入快速环。
 
 $R$ 以拟合值为目标，但交接乘可辨识性权重 $w=\mathrm{clamp}(\mathrm{obs}/\mathrm{obs}_{\min},0,1)$；圆心与半径直接按增益 $g$（`sync_gain`，默认 0.05）滑动：
 
@@ -390,7 +392,7 @@ $\omega=0$、$i$ 恒定时磁链点不动，圆拟合退化成点/线，半径�
 | $k=R_s/L$ | 待辨识参数 |
 | $p=c+a+k b$ | 相对圆心的磁链 |
 | $c$ | 相对圆心（快速环） |
-| $c_{\mathrm{local}}$ | 拟合圆心（以最新样本为原点） |
+| $c_{\mathrm{local}}$ | 拟合圆心（以最新样本为原点；只取方向） |
 | $R$、$\rho$ | 圆半径 / 拟合半径 |
 | $P(k)$ | 变量投影剖面 |
 | $\mathrm{obs}$ | $P''/(4R^2\sum w|V|^2)$ |
@@ -407,7 +409,7 @@ $$
 p^+=c'+a'+k_{\mathrm{cur}}b'=c+a+k_{\mathrm{cur}}b=p^-.
 $$
 
-随后目标 $c_{\mathrm{tgt}}=-c_{\mathrm{local}}$ 与 $k_{\mathrm{fit}}$、$\rho_{\mathrm{fit}}$ 写入，$c,k,\mathrm{rad}$ 各移动 $g$ 倍误差。因为 $b'=0$，$k$ 的移动不改变 $p^+$；$p$ 的变化只来自 $c$ 的 $g(c_{\mathrm{tgt}}-c)$，是人为的平滑修正。下一拍 $a,b$ 从 0 重新累积，$p$ 从同一点继续。
+随后目标 $c_{\mathrm{tgt}}=-\frac{\rho_{\mathrm{fit}}}{\ell}\mathrm{unit}(c_{\mathrm{local}})$ 与 $k_{\mathrm{fit}}$、$\rho_{\mathrm{fit}}$ 写入，$c,k,\mathrm{rad}$ 各移动 $g$ 倍误差。因为 $b'=0$，$k$ 的移动不改变 $p^+$；$p$ 的变化只来自 $c$ 的 $g(c_{\mathrm{tgt}}-c)$，是人为的平滑修正。下一拍 $a,b$ 从 0 重新累积，$p$ 从同一点继续。
 
 ## 附录 C 复现与选型
 

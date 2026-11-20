@@ -25,9 +25,11 @@
 //!   拟合圆心因此总是相对“最新点”。
 //! * **加锁交班**：`Arc<Mutex<FastFlux>>` 内读并清零 `a`、`b`，同时
 //!   `c += a + k_cur·b` 保持磁链连续；拟合完成后写三个目标
-//!   `c_tgt = -c_local`、`k_tgt = k_fit`、`rad_tgt = radius_fit`。`R` 的交接
-//!   乘可辨识性 `w_obs`（稳态不跟噪声游走），圆心/半径直接按 `sync_gain`
-//!   交接（`obs` 描述的是 `k` 的可辨识性，不是圆心/半径的估计质量）。
+//!   `c_tgt = -ρ_fit·unit(c_local)`、`k_tgt = k_fit`、`rad_tgt = ρ_fit`。
+//!   圆心目标**不直接用**拟合圆心 `c_local`：只用它的方向，长度强制成拟合
+//!   半径 ρ（最新采样点严格落在半径 ρ 的圆上）。`R` 的交接乘可辨识性
+//!   `w_obs`（稳态不跟噪声游走），圆心/半径直接按 `sync_gain` 交接（`obs`
+//!   描述的是 `k` 的可辨识性，不是圆心/半径的估计质量）。
 //!   这样积分器清零不会让角度跳变，三个量也不会一次写死。
 //!
 //! # 2. 拟合核心
@@ -1484,13 +1486,14 @@ pub struct DirectFluxObserver {
     /// 拟合圆心（用户单位，物理绝对圆心；`k` 变化时有 `Σ(k_i − k)·v_i` 残差；
     /// 诊断用）。
     pub center: V2,
-    /// 拟合圆心（内部单位，相对最新样本；交班目标就是它的相反数）。
+    /// 拟合圆心（内部单位，相对最新样本；只取它的方向，长度会被换成半径）。
     pub center_local: V2,
-    /// 拟合**直接给出的圆心**，画在磁链图坐标系里（用户单位）：
-    /// `C_fit − C_fast`，即以"快速环圆心"为原点时拟合圆心的位置。
+    /// 交班**实际使用的圆心**，画在磁链图坐标系里（用户单位）：
+    /// `C_used − C_fast`，即以"快速环圆心"为原点时该圆心的位置。
     ///
-    /// 每次拟合更新一次；它与原点的偏差就是快速环圆心与拟合圆心的差距。
-    pub center_fit: V2,
+    /// 它由"最新样本 + 拟合半径"推出（方向取 `center_local`、长度取 ρ），
+    /// 每次拟合更新一次；它与原点的偏差就是快速环圆心和这个圆心的差距。
+    pub center_used: V2,
     pub r_nominal: S,
     pub radius_nominal: S,
     pub radius_clamped: bool,
@@ -1542,7 +1545,7 @@ impl Default for DirectFluxObserver {
             data_arc: 0.0,
             center: V2::ZERO,
             center_local: V2::ZERO,
-            center_fit: V2::ZERO,
+            center_used: V2::ZERO,
             r_nominal: 0.0,
             radius_nominal: 0.0,
             radius_clamped: false,
@@ -1613,7 +1616,7 @@ impl DirectFluxObserver {
         self.center = V2::new(self.theta.cos(), self.theta.sin()).mul(radius);
         self.center_local = V2::ZERO;
         // t=0 时快速环与拟合用同一个圆心假设，图上重合于原点。
-        self.center_fit = V2::ZERO;
+        self.center_used = V2::ZERO;
         self.theta_meas = self.theta;
         self.omega = omega;
         self.flux_mag = radius;
@@ -1694,24 +1697,33 @@ impl Observer<3> for DirectFluxObserver {
                 if let Some((rep, c_local)) = tr.step_once(a.mul(l), b.mul(l), self.total_time, q) {
                     let k_fit = tr.k();
                     let rad_fit = rep.radius / l;
+                    // 拟合圆心只用来定方向：从最新采样点出发、沿拟合圆心的方向
+                    // 走一个拟合半径 ρ，得到"最新点严格落在半径 ρ 圆上"的圆心。
+                    // 直接用 `c_local` 会把它的长度误差（最新点不刚好在圆上、
+                    // 或 k 没收敛时圆本身有偏）带进快速环。
+                    let c_use = if c_local.norm2() > 0.0 {
+                        c_local.mul(rad_fit / c_local.norm())
+                    } else {
+                        c_local
+                    };
                     // `R` 的交接乘可辨识性：稳态 `obs→0` 时不把拟合的噪声游走带进快速环。
                     let w_obs = (rep.obs / self.fit.obs_min.max(1.0e-12)).clamp(0.0, 1.0);
                     let w_k = self.sync_gain * w_obs;
-                    let mut center_fit = self.center_fit;
+                    let mut center_used = self.center_used;
                     if let Ok(mut f) = self.fast.lock() {
-                        // 交班前的 `f.c` = 最新样本相对快速环圆心；加上拟合圆心
-                        // （相对最新样本）就是"拟合圆心"在磁链图上的位置（原点 =
-                        // 快速环圆心）。它每次拟合更新一次。
-                        center_fit = f.c.add(c_local).mul(l);
+                        // 交班前的 `f.c` = 最新样本相对快速环圆心；加上由半径推
+                        // 出的圆心偏移，就是它在这个磁链图上的位置（原点 = 快速
+                        // 环圆心）。它每次拟合更新一次。
+                        center_used = f.c.add(c_use).mul(l);
                         // 圆心/半径不乘 `obs`：它们不是"可辨识性"问题。注意它们也
                         // 不能按 `|k_fit − k_fast|` 冻结——R 还没收敛时，用拟合的
-                        // k 算出的圆心恰好是把快速环往更准的圆上拉，冻结反而更偏。
-                        let tgt = c_local.mul(-1.0);
+                        // k 算出的方向恰好是把快速环往更准的圆上拉，冻结反而更偏。
+                        let tgt = c_use.mul(-1.0);
                         f.c = f.c.add(tgt.sub(f.c).mul(self.sync_gain));
                         f.k += (k_fit - f.k) * w_k;
                         f.rad += (rad_fit - f.rad) * self.sync_gain;
                     }
-                    self.center_fit = center_fit;
+                    self.center_used = center_used;
                     self.r_fit = k_fit;
                     self.radius_fit = rep.radius;
                     self.obs = rep.obs;
@@ -2267,8 +2279,8 @@ mod tests {
             t += dt;
         }
         eprintln!(
-            "direct: tail={worst_tail:.4} jump={worst_jump:.4} r={:.3} r_fit={:.3} radius={:.4} obs={:.2e} center_fit={:?}",
-            ob.r, ob.r_fit, ob.radius, ob.obs, ob.center_fit
+            "direct: tail={worst_tail:.4} jump={worst_jump:.4} r={:.3} r_fit={:.3} radius={:.4} obs={:.2e} center_used={:?}",
+            ob.r, ob.r_fit, ob.radius, ob.obs, ob.center_used
         );
         assert!(worst_tail < 0.05, "tail error {worst_tail} rad");
         assert!(worst_jump < 0.15, "angle jump {worst_jump} rad");
@@ -2281,9 +2293,9 @@ mod tests {
         );
         // 图上"拟合圆心"应当收敛到原点附近（快速环圆心 ≈ 拟合圆心）。
         assert!(
-            ob.center_fit.norm() < 0.2 * ob.radius,
-            "center_fit {:?} 偏离原点（radius {}）",
-            ob.center_fit,
+            ob.center_used.norm() < 0.2 * ob.radius,
+            "center_used {:?} 偏离原点（radius {}）",
+            ob.center_used,
             ob.radius
         );
     }
