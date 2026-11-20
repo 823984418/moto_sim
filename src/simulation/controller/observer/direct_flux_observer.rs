@@ -1056,8 +1056,6 @@ impl Tracker {
         } else {
             0
         };
-        self.recenter();
-        self.recenter_v();
 
         self.report()
     }
