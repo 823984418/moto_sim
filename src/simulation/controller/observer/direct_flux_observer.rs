@@ -775,15 +775,6 @@ pub struct FitConfig {
     pub inner_iters: usize,
     /// 浮动原点阈值（内部单位）。
     pub recenter_eps: S,
-    /// `V` 原点管理的触发阈值：存储 `V'` 的加权均值超过 `RMS(V')` 的这个倍数时
-    /// 把它搬进 `v_off`。
-    ///
-    /// 论文对 U、V 共用一个长度阈值 `recenter_eps`；但 `V` 是“长度 / k”的积分，
-    /// 量纲与 `U` 不同，绝对阈值会随工况放大到几乎不可达（本仿真 8 s 时
-    /// `|V̄| ≈ 0.011`，而 `recenter_eps = 0.25`）。改用相对 RMS 的判据后：
-    /// 纯旋转的 `V`（`|V̄|/RMS ~ 1/(ωτ)`）不触发，只有直流偏置/启动偏移把均值
-    /// 推高时才触发。
-    pub recenter_v_rel: S,
     /// `P''` 的绝对下限。
     pub p2_eps: S,
     /// 半径伪观测权重（相对 `Σw`）。
@@ -826,7 +817,6 @@ impl Default for FitConfig {
             scan_obs_min: 1.0e-4,
             inner_iters: 2,
             recenter_eps: 0.25,
-            recenter_v_rel: 0.25,
             p2_eps: 1.0e-18,
             r_kappa: 50.0,
             min_weight: 8.0,
@@ -1046,7 +1036,7 @@ impl Tracker {
         self.m.add(ui, vi, q);
         self.w2 += q * q;
 
-        // 4. 浮动原点：`U` 的质心归零、`V` 的加权均值归零
+        // 4. 浮动原点：`U` 的质心归零、`V` 的最新样本归零
         self.recenter();
         self.recenter_v();
 
@@ -1077,7 +1067,6 @@ impl Tracker {
         self.cfg.gate_sigma_rel = cfg.gate_sigma_rel;
         self.cfg.p2_eps = cfg.p2_eps;
         self.cfg.r_kappa = cfg.r_kappa;
-        self.cfg.recenter_v_rel = cfg.recenter_v_rel;
     }
 
     /// 在存储矩 `m` 的 `κ = kap` 处组装剖面系数。
@@ -1098,17 +1087,18 @@ impl Tracker {
     ///
     /// 两个平移都是精确变换；`off` / `v_off` 累加被搬走的偏移，绝对坐标诊断
     /// 不受影响。之后 `p_local() == 0`，下一个周期的增量从 0 起算。
+    ///
+    /// `V` 那一半与 [`Tracker::recenter_v`] 共用同一套规则（最新样本归零），
+    /// 两处不会各自演化出不同的 `V` 规范。
     fn recenter_latest(&mut self) {
         let (ui, vi) = (self.u, self.v);
         if !ui.finite() || !vi.finite() || (ui.norm2() == 0.0 && vi.norm2() == 0.0) {
             return;
         }
         self.m.translate_u(ui);
-        self.m.translate_v(vi);
         self.u = self.u.sub(ui);
-        self.v = self.v.sub(vi);
         self.off = self.off.add(ui);
-        self.v_off = self.v_off.add(vi);
+        self.recenter_v();
     }
 
     /// 一个降采样周期：积分增量入矩 → 最新样本搬原点 → **一次**带可观性权重
@@ -1251,20 +1241,16 @@ impl Tracker {
         self.off = self.off.add(s);
     }
 
-    /// `V` 的原点管理：存储 `V'` 的加权均值超过它自身 RMS 的
-    /// `recenter_v_rel` 倍时，把均值搬进 `v_off`（物理 `V = V' + v_off`）。
+    /// `V` 的原点管理：把**最新样本**的 `V'` 归零（`V' -> V' - v`，
+    /// `v_off += v`；物理 `V = V' + v_off`）。
     ///
     /// 这是纯规范：`P(k)`、`k`、圆心、半径都不变；作用只是不让 `V = ∫i dt` 的
-    /// 积分漂移把 `M₁/M₂/q₁..q₃` 的量级撑大。阈值取相对量，纯旋转的 `V` 不会
-    /// 触发，只有积分漂移才会。
+    /// 积分漂移把 `V` 那一族矩的量级撑大。与 `U` 的浮动原点（质心归零、带
+    /// 阈值）不同，这里直接锚在最新样本上：最新点本来就是拟合输出与交班使用
+    /// 的参考点，锚在它上面不需要可调阈值，且每个样本恰好平移一次。
     fn recenter_v(&mut self) {
-        let w = self.m.w;
-        if !(w > 0.0) {
-            return;
-        }
-        let c = V2::new(self.m.vx, self.m.vy).mul(1.0 / w);
-        let rms = (self.m.g / w).sqrt();
-        if !c.finite() || !rms.is_finite() || c.norm() <= self.cfg.recenter_v_rel * rms {
+        let c = self.v;
+        if !c.finite() || c.norm2() == 0.0 {
             return;
         }
         self.m.translate_v(c);
@@ -2542,5 +2528,53 @@ mod tests {
         );
         assert!(tr.p_local().norm() < 1.0e-12, "latest sample not at origin");
         assert!((rep.radius - radius).abs() < 0.01);
+    }
+
+    /// `update()` 路径的 V 原点管理：最新样本的 `V'` 严格归零，被搬走的偏移
+    /// 全部累进 `v_off`（等于累计 `ΣΔV`）；`coef_at(κ)` 把它精确补回，所以
+    /// 半径仍是物理值。
+    ///
+    /// 旧规则（把 `V'` 的加权均值归零）在这里会留下非零的 `tr.v`：均值归零后
+    /// 最新样本落在 `v - V̄` 上，只有把最新样本本身归零才能让它严格为 0。
+    #[test]
+    fn update_puts_latest_v_at_origin() {
+        let (r, radius, dt) = (384.0, 4.04, 5.0e-5);
+        let stream = synth_stream_profile(r, radius, |_| 20.0, |_| 3.0, 0.4, dt);
+        let mut cfg = FitConfig::default();
+        cfg.r_min = 0.3 * radius;
+        cfg.r_max = 3.0 * radius;
+        cfg.k_min = 0.1 * r;
+        cfg.k_max = 10.0 * r;
+        cfg.tau = 10.0;
+        let mut tr = Tracker::new(cfg, r);
+        let (mut a, mut b) = (V2::ZERO, V2::ZERO);
+        let (mut t, mut n, mut v_sum, mut last) = (0.0, 0, V2::ZERO, None);
+        for (_th, du, dv) in &stream {
+            a = a.add(*du);
+            b = b.add(*dv);
+            v_sum = v_sum.add(*dv);
+            t += dt;
+            n += 1;
+            if n == 400 {
+                last = tr.update(a, b, t, 400.0, 2);
+                a = V2::ZERO;
+                b = V2::ZERO;
+                n = 0;
+                assert_eq!(tr.v, V2::ZERO, "最新样本的 V' 没有归零");
+                let off = tr.v_off().mul(tr.unit_len());
+                assert!(
+                    off.sub(v_sum).norm() < 1.0e-9 * (1.0 + v_sum.norm()),
+                    "v_off {off:?} 应等于 ΣΔV {v_sum:?}"
+                );
+            }
+        }
+        let rep = last.expect("report");
+        eprintln!(
+            "update origin: k={:.4} radius={:.4} v_off={:?}",
+            tr.k(),
+            rep.radius,
+            tr.v_off()
+        );
+        assert!((rep.radius - radius).abs() < 0.01, "radius {}", rep.radius);
     }
 }

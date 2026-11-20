@@ -87,8 +87,9 @@ P(k) = c(k) - b(k)ᵀ A(k)⁻¹ b(k)
 ### 3.3 浮动原点与 V 原点管理
 
 - `U = A` 的质心超过阈值时把全部矩精确平移 `U → U - s`，`s` 累进 `off`；
-- `V = B` 的加权均值超过 `RMS(V')·recenter_v_rel` 时搬进 `v_off`
-  （物理 `V = V' + v_off`）；这是纯规范，`P`、`P'`、`P''`、`k`、圆心、半径不变；
+- `V = B` 把**最新样本**归零（`V' → V' - v`），被搬走的偏移累进 `v_off`
+  （物理 `V = V' + v_off`）；这是纯规范，`P`、`P'`、`P''`、`k`、圆心、半径
+  都不变，所以不需要阈值，每个样本恰好平移一次；
 - **不再用补偿求和**：`u`、`v` 每个拟合周期清零、只累加一次增量，长积分在
   `off`/`v_off` 里；去掉 Neumaier 累加器后 4 组工况输出逐位不变。
 
@@ -169,12 +170,14 @@ step    = raw_step · w_obs · w_sig · w_sigma
 cargo test --release --lib
 ```
 
-当前 12 个测试全部通过，和本观测器相关的有：
+当前 13 个测试全部通过，和本观测器相关的有：
 
 - `direct_flux_tracks_speed_profile`：加速→减速后角度跟得上，交班不跳变；
 - `direct_flux_recovers_r_with_weighted_newton`：`R` 初值 +25% 能拉回；
 - `k_sigma_gate_can_be_switched`：显著性硬门限可开关，且软权重仍生效；
 - `step_once_puts_latest_sample_at_origin`：拟合后最新样本在局部原点；
+- `update_puts_latest_v_at_origin`：`update` 路径把最新样本的 `V'` 严格归零，
+  `v_off` 精确等于累计 `ΣΔV`；
 - `radius_penalty_enters_newton`：半径罚项进入法方程，且报告损失用无罚项残差；
 - `v_constant_offset_is_a_gauge`：`V` 的常数偏移不改变 `P`、`P'`、`P''`；
 - `v_offset_does_not_break_k`：`v_off` 非零时 `k` 仍能从 +25% 初值恢复；
