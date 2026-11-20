@@ -45,9 +45,9 @@
 //!
 //! 数值措施：
 //!
-//! * 内部单位 + U 浮动原点 + `V` 的最新样本归零把矩挡在 `|p| ~ R`。`u`、`v`
-//!   只在一次拟合周期内累加、随后清零，`U` 的长积分在 `off` 里；实测去掉补偿
-//!   求和后输出逐位不变，所以不再保留。
+//! * 内部单位 + 最新样本搬原点（`U`、`V` 各一次精确平移）把矩挡在 `|p| ~ R`。
+//!   `u`、`v` 只在一次拟合周期内累加、随后清零，`U` 的长积分在 `off` 里；
+//!   实测去掉补偿求和后输出逐位不变，所以不再保留。
 //! * 直接观测器每个拟合周期都把最新样本搬到原点，并在 `κ = k` 处把 `b` 展开
 //!   到三次、`c` 到四次（用的仍是已有矩 `g_vx/g_vy/b_g/g2`）。矩里的 `|U|`、
 //!   `|V|` 只有一个周期内增量的量级。
@@ -67,7 +67,6 @@
 //! `flux_circle_observer`（窗口批量几何拟合 + PLL）与 `KasaFluxObserver`
 //! （流式拟合 + PLL）都已删除；本文件是唯一的磁链圆观测器实现，也是唯一
 //! 使用这 36 个矩的地方。
-
 
 use crate::simulation::controller::observer::{Observer, ObserverInput, ObserverOutput};
 use crate::simulation::{angle_normal, clarke};
@@ -419,18 +418,10 @@ impl Moments {
         self.uy_vy = m.uy_vy - sy * m.vy;
 
         self.a = m.a - 2.0 * su + s2 * m.w;
-        self.a_ux = m.a_ux
-            - sx * m.a
-            - 2.0 * uu_s_x
-            + m.ux * s2
-            + sx * (2.0 * su)
-            - sx * (s2 * m.w);
-        self.a_uy = m.a_uy
-            - sy * m.a
-            - 2.0 * uu_s_y
-            + m.uy * s2
-            + sy * (2.0 * su)
-            - sy * (s2 * m.w);
+        self.a_ux =
+            m.a_ux - sx * m.a - 2.0 * uu_s_x + m.ux * s2 + sx * (2.0 * su) - sx * (s2 * m.w);
+        self.a_uy =
+            m.a_uy - sy * m.a - 2.0 * uu_s_y + m.uy * s2 + sy * (2.0 * su) - sy * (s2 * m.w);
         self.a_vx = m.a_vx - 2.0 * vu_s_x + m.vx * s2;
         self.a_vy = m.a_vy - 2.0 * vu_s_y + m.vy * s2;
 
@@ -453,8 +444,7 @@ impl Moments {
         let s_uv_s = sx * uv_s_x + sy * uv_s_y;
         let s_vv_s = sx * vv_s_x + sy * vv_s_y;
 
-        self.a2 = m.a2 - 4.0 * s_au + 2.0 * s2 * m.a + 4.0 * s_uu_s - 4.0 * s2 * su
-            + s2 * s2 * m.w;
+        self.a2 = m.a2 - 4.0 * s_au + 2.0 * s2 * m.a + 4.0 * s_uu_s - 4.0 * s2 * su + s2 * s2 * m.w;
         self.a_b = m.a_b - s_av - 2.0 * s_bu + s2 * m.b + 2.0 * s_uv_s - s2 * sv;
         self.b2 = m.b2 - 2.0 * s_bv + s_vv_s;
         self.a_g = m.a_g - 2.0 * s_gu + s2 * m.g;
@@ -506,18 +496,10 @@ impl Moments {
         self.g = m.g - 2.0 * sv + s2 * m.w;
         self.g_ux = m.g_ux - 2.0 * uv_s_x + m.ux * s2;
         self.g_uy = m.g_uy - 2.0 * uv_s_y + m.uy * s2;
-        self.g_vx = m.g_vx
-            - sx * m.g
-            - 2.0 * vv_s_x
-            + m.vx * s2
-            + sx * (2.0 * sv)
-            - sx * (s2 * m.w);
-        self.g_vy = m.g_vy
-            - sy * m.g
-            - 2.0 * vv_s_y
-            + m.vy * s2
-            + sy * (2.0 * sv)
-            - sy * (s2 * m.w);
+        self.g_vx =
+            m.g_vx - sx * m.g - 2.0 * vv_s_x + m.vx * s2 + sx * (2.0 * sv) - sx * (s2 * m.w);
+        self.g_vy =
+            m.g_vy - sy * m.g - 2.0 * vv_s_y + m.vy * s2 + sy * (2.0 * sv) - sy * (s2 * m.w);
 
         let s_au = sx * m.a_ux + sy * m.a_uy;
         let s_av = sx * m.a_vx + sy * m.a_vy;
@@ -533,8 +515,7 @@ impl Moments {
         self.b2 = m.b2 - 2.0 * s_bu + s_uu_s;
         self.a_g = m.a_g - 2.0 * s_av + s2 * m.a;
         self.b_g = m.b_g - 2.0 * s_bv - s_gu + 2.0 * s_uv_s + s2 * m.b - s2 * su;
-        self.g2 = m.g2 - 4.0 * s_gv + 2.0 * s2 * m.g + 4.0 * s_vv_s - 4.0 * s2 * sv
-            + s2 * s2 * m.w;
+        self.g2 = m.g2 - 4.0 * s_gv + 2.0 * s2 * m.g + 4.0 * s_vv_s - 4.0 * s2 * sv + s2 * s2 * m.w;
         // w、U 那一族、a、a_ux、a_uy、a2 在 V 平移下不变
     }
 
@@ -550,12 +531,6 @@ impl Moments {
     #[inline]
     fn b_vec(&self) -> [S; 3] {
         [self.a_ux, self.a_uy, self.a]
-    }
-
-    /// 当前参考 `k`（`κ = 0`）处的剖面 Taylor 系数。
-    #[inline]
-    fn coef(&self) -> Coef {
-        self.coef_at(0.0)
     }
 
     /// 在 `κ = kap` 处展开的剖面 Taylor 系数。
@@ -574,16 +549,8 @@ impl Moments {
     fn coef_at(&self, kap: S) -> Coef {
         let a0 = self.a_mat();
         let a1 = [
-            [
-                self.ux_vx * 2.0,
-                self.ux_vy + self.uy_vx,
-                self.vx,
-            ],
-            [
-                self.ux_vy + self.uy_vx,
-                self.uy_vy * 2.0,
-                self.vy,
-            ],
+            [self.ux_vx * 2.0, self.ux_vy + self.uy_vx, self.vx],
+            [self.ux_vy + self.uy_vx, self.uy_vy * 2.0, self.vy],
             [self.vx, self.vy, 0.0],
         ];
         let a2 = [
@@ -635,7 +602,6 @@ impl Moments {
             c2: c2 + kap * (3.0 * c3 + kap * 6.0 * c4),
         }
     }
-
 }
 
 /// 给定 Taylor 系数，`θ` 在**无罚项**法方程上的残差平方和
@@ -767,10 +733,6 @@ pub struct FitConfig {
     /// 减半），允许在激励开始衰减时仍把 `k` 放到正确盆地；随后的逐拍 Newton
     /// 用更严的 `obs_min` 防止噪声随机游走。
     pub scan_obs_min: S,
-    /// 每样本 Newton 步数。
-    pub inner_iters: usize,
-    /// 浮动原点阈值（内部单位）。
-    pub recenter_eps: S,
     /// `P''` 的绝对下限。
     pub p2_eps: S,
     /// 半径伪观测权重（相对 `Σw`）。
@@ -811,8 +773,6 @@ impl Default for FitConfig {
             k_prior_rel: 0.02,
             obs_min: 5.0e-3,
             scan_obs_min: 1.0e-4,
-            inner_iters: 2,
-            recenter_eps: 0.25,
             p2_eps: 1.0e-18,
             r_kappa: 50.0,
             min_weight: 8.0,
@@ -893,7 +853,6 @@ pub struct Tracker {
     /// `U` 的局部原点在绝对（用户）坐标系中的位置。
     off: V2,
     t_last: S,
-    started: bool,
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
     /// 实际覆盖了多长弧”的度量；拿 `|ω|dt` 会在 `k` 错时严重低估。
     path: S,
@@ -929,7 +888,6 @@ impl Tracker {
             v: V2::ZERO,
             off: V2::ZERO,
             t_last: 0.0,
-            started: false,
             path: 0.0,
             w2: 0.0,
             obs: 0.0,
@@ -974,66 +932,17 @@ impl Tracker {
         self.path
     }
 
-    /// 喂入一对增量 `(ΔU, ΔV)`。
+    /// 喂入一对增量 `(ΔU, ΔV)`，返回拟合报告。
     ///
     /// * `t`：样本时刻（秒），只用于指数遗忘；
-    /// * `weight`：该样本的拟合权重；
-    /// * `newton_iters`：本拍允许的 Newton 步数（0 表示冻结 `k`）。
-    pub fn update(
-        &mut self,
-        delta_u: V2,
-        delta_v: V2,
-        t: S,
-        weight: S,
-        newton_iters: usize,
-    ) -> Option<Report> {
-        // 1. 遗忘
-        let rho = if self.cfg.tau > 0.0 {
-            if self.started {
-                (-(t - self.t_last).max(0.0) / self.cfg.tau).exp()
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        };
-        self.t_last = t;
-        self.started = true;
-        self.m.decay(rho);
-        self.w2 *= rho * rho;
-
-        // 2. 积分增量（内部单位）。存原始 `U`，只加 `ΔU`；路径长度用物理
-        //    `Δp = ΔU + k ΔV`。
-        let inv = 1.0 / self.unit_len;
-        let du = delta_u.mul(inv);
-        let dv = delta_v.mul(inv);
-        let du_p = du.add(dv.mul(self.k));
-        self.u = self.u.add(du);
-        self.v = self.v.add(dv);
-        self.path += du_p.norm();
-
-        // 3. 累积矩
-        let (ui, vi) = (self.u, self.v);
-        let q = if weight.is_finite() && weight > 0.0 {
-            weight
-        } else {
-            1.0
-        };
-        self.m.add(ui, vi, q);
-        self.w2 += q * q;
-
-        // 4. 浮动原点：`U` 的质心归零、`V` 的最新样本归零
-        self.recenter();
-        self.recenter_v();
-
-        // 5. 变量投影 Newton（由调用方用 newton_iters 控制是否允许更新 k）
-        self.steps = if newton_iters > 0 {
-            self.newton(newton_iters)
-        } else {
-            0
-        };
-
-        self.report()
+    /// * `weight`：该样本的拟合权重。
+    ///
+    /// 与 [`Tracker::step_once`] 走**同一条路径**（最新样本搬到原点 + 恰好一次
+    /// 带可观性权重的 Newton），只是丢掉局部圆心；保留它作为“单样本一步”的
+    /// 便捷入口，不再另有一套均值归零 / 变步数 Newton 的实现。
+    pub fn update(&mut self, delta_u: V2, delta_v: V2, t: S, weight: S) -> Option<Report> {
+        self.step_once(delta_u, delta_v, t, weight)
+            .map(|(rep, _)| rep)
     }
 
     /// 立刻重新求一次报告（不喂新样本）。
@@ -1062,13 +971,14 @@ impl Tracker {
     /// 增量从 0 起算。
     fn recenter_latest(&mut self) {
         let (ui, vi) = (self.u, self.v);
-        if !ui.finite() || !vi.finite() || (ui.norm2() == 0.0 && vi.norm2() == 0.0) {
-            return;
-        }
+
         self.m.translate_u(ui);
         self.u = self.u.sub(ui);
+
         self.off = self.off.add(ui);
-        self.recenter_v();
+
+        self.m.translate_v(vi);
+        self.v = self.v.sub(vi);
     }
 
     /// 一个降采样周期：积分增量入矩 → 最新样本搬原点 → **一次**带可观性权重
@@ -1076,25 +986,10 @@ impl Tracker {
     ///
     /// `delta_u` / `delta_v` 是快速环自上个周期以来对 `s0` 与 `i` 的积分（用户
     /// 单位），`weight` 是这段时间内 `Σ(slope_dt/Δt)²`。
-    pub fn step_once(
-        &mut self,
-        delta_u: V2,
-        delta_v: V2,
-        t: S,
-        weight: S,
-    ) -> Option<(Report, V2)> {
+    pub fn step_once(&mut self, delta_u: V2, delta_v: V2, t: S, weight: S) -> Option<(Report, V2)> {
         // 1. 遗忘（按降采样时间推进）
-        let rho = if self.cfg.tau > 0.0 {
-            if self.started {
-                (-(t - self.t_last).max(0.0) / self.cfg.tau).exp()
-            } else {
-                1.0
-            }
-        } else {
-            1.0
-        };
+        let rho = (-(t - self.t_last).max(0.0) / self.cfg.tau).exp();
         self.t_last = t;
-        self.started = true;
         self.m.decay(rho);
         self.w2 *= rho * rho;
         let inv = 1.0 / self.unit_len;
@@ -1106,11 +1001,7 @@ impl Tracker {
         self.path += du_p.norm();
 
         let (ui, vi) = (self.u, self.v);
-        let q = if weight.is_finite() && weight > 0.0 {
-            weight
-        } else {
-            1.0
-        };
+        let q = weight;
         self.m.add(ui, vi, q);
         self.w2 += q * q;
 
@@ -1197,39 +1088,6 @@ impl Tracker {
         true
     }
 
-    fn recenter(&mut self) {
-        let w = self.m.w;
-        if !(w > 0.0) {
-            return;
-        }
-        let s = V2::new(self.m.ux, self.m.uy).mul(1.0 / w);
-        if !s.finite() || s.norm() <= self.cfg.recenter_eps {
-            return;
-        }
-        self.m.translate_u(s);
-        self.u = self.u.sub(s);
-        self.off = self.off.add(s);
-    }
-
-    /// `V` 的原点管理：把**最新样本**的 `V` 归零（`V -> V - v`）。
-    ///
-    /// 不给 `V` 记任何偏置。`V` 的常数偏置是纯规范：给所有 `V_n` 加同一个
-    /// `c` 只是把每个 `κ` 的点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径
-    /// 都不变，而最新样本的 `V` 在这里恒为 0，所以拟合天然与 `V` 偏置无关。
-    /// 作用只是不让 `V = ∫i dt` 的积分漂移把 `V` 那一族矩的量级撑大。
-    ///
-    /// 与 `U` 的浮动原点（质心归零、带阈值）不同，这里直接锚在最新样本上：
-    /// 最新点本来就是拟合输出与交班使用的参考点，锚在它上面不需要可调阈值，
-    /// 且每个样本恰好平移一次。
-    fn recenter_v(&mut self) {
-        let c = self.v;
-        if !c.finite() || c.norm2() == 0.0 {
-            return;
-        }
-        self.m.translate_v(c);
-        self.v = self.v.sub(c);
-    }
-
     /// 在 `m` 上先做无约束拟合；半径越界时把线性化罚项加进法方程再解一次。
     ///
     /// `kappa` 是求值点（本观测器恒为 `k`）。返回 `(罚项, 带罚项解, 无约束解)`：
@@ -1290,7 +1148,7 @@ impl Tracker {
     /// `w = clamp(|obs|/obs_min,0,1)²`，不设任何基于 `obs` 或 `sigma` 的冻结门限。
     ///
     /// 稳态 `obs→0` 时步长→0（近似慢冻结），瞬态 `obs≥obs_min` 时全步。
-    /// 保留 `newton()` 的旧行为（硬门限）做对照。
+    /// 硬门限的 `newton()` 只用于初始化扫描后的抛光（`initialize`）。
     fn newton_weighted(&mut self) -> u32 {
         self.newton_impl(1, true)
     }
@@ -1345,8 +1203,8 @@ impl Tracker {
             }
             // 噪声可信度软权重：`w_sigma = clamp((σ_max/σ)²,0,1)`。
             // 可选的硬门限 `gate_sigma_rel` 与它**同时**生效（不是二选一）。
-            let sigma_rel = (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt()
-                / (2.0 * f0.radius.max(1.0e-12));
+            let sigma_rel =
+                (f0.p.max(0.0) / self.m.w.max(1.0e-300)).sqrt() / (2.0 * f0.radius.max(1.0e-12));
             let w_sigma = if weighted {
                 (self.cfg.max_sigma_rel / sigma_rel.max(1.0e-12))
                     .max(0.0)
@@ -1516,23 +1374,26 @@ impl Tracker {
             S::INFINITY
         };
 
-        Some((Report {
-            k: self.k,
-            radius: r * l,
-            center: c.add(self.off).mul(l),
-            p_rel: rel.mul(l),
-            dist: dist * l,
-            radial_err: (dist - r) * l,
-            loss: loss / w,
-            sigma_rel,
-            sigma_k,
-            weight: self.m.w,
-            p1: f0.p1,
-            p2: f0.p2,
-            obs,
-            steps: self.steps,
-            clamped,
-        }, c))
+        Some((
+            Report {
+                k: self.k,
+                radius: r * l,
+                center: c.add(self.off).mul(l),
+                p_rel: rel.mul(l),
+                dist: dist * l,
+                radial_err: (dist - r) * l,
+                loss: loss / w,
+                sigma_rel,
+                sigma_k,
+                weight: self.m.w,
+                p1: f0.p1,
+                p2: f0.p2,
+                obs,
+                steps: self.steps,
+                clamped,
+            },
+            c,
+        ))
     }
 }
 
@@ -1809,8 +1670,7 @@ impl Observer<3> for DirectFluxObserver {
             if let Some(tr) = self.tracker.as_mut() {
                 // 快速环的 a、b 已经是内部单位；`step_once` 吃用户单位。
                 let l = self.unit_len;
-                if let Some((rep, c_local)) = tr.step_once(a.mul(l), b.mul(l), self.total_time, q)
-                {
+                if let Some((rep, c_local)) = tr.step_once(a.mul(l), b.mul(l), self.total_time, q) {
                     let k_fit = tr.k();
                     let rad_fit = rep.radius / l;
                     let w_obs = (rep.obs / self.fit.obs_min.max(1.0e-12)).clamp(0.0, 1.0);
@@ -1989,13 +1849,19 @@ mod tests {
         let r = 384.0;
         let radius = 4.04;
         let dt = 5.0e-5;
-        let stream = synth_stream(r, radius, 100.0, |t| 3.0 + 1.5 * (TAU * 0.7 * t).cos(), 3.0, dt);
+        let stream = synth_stream(
+            r,
+            radius,
+            100.0,
+            |t| 3.0 + 1.5 * (TAU * 0.7 * t).cos(),
+            3.0,
+            dt,
+        );
         let mut tr = tracker_for(r, radius, 1.25 * r);
         let mut scan_done = false;
         for (k, (_, du, dv)) in stream.iter().enumerate() {
             let t = k as S * dt;
-            let iters = if t >= 1.0 { 2 } else { 0 };
-            tr.update(*du, *dv, t, 1.0, iters);
+            tr.update(*du, *dv, t, 1.0);
             if !scan_done && t >= 1.0 {
                 scan_done = tr.initialize();
             }
@@ -2021,8 +1887,7 @@ mod tests {
         let mut scan_done = false;
         for (k, (_, du, dv)) in stream.iter().enumerate() {
             let t = k as S * dt;
-            let iters = if t >= 1.0 { 2 } else { 0 };
-            tr.update(*du, *dv, t, 1.0, iters);
+            tr.update(*du, *dv, t, 1.0);
             if !scan_done && t >= 1.0 {
                 scan_done = tr.initialize();
             }
@@ -2037,7 +1902,6 @@ mod tests {
         );
         assert!(rel < 0.05, "k drifted to {} (rel {rel})", tr.k());
     }
-
 
     /// 确定性的对称随机数（xorshift64），只为让“随机 U”可复现。
     struct XorShift(u64);
@@ -2101,7 +1965,7 @@ mod tests {
 
         let mut tight = Tracker::new(config_for_range(1.0, 1.2), k_true);
         for (i, (du, dv)) in stream.iter().enumerate() {
-            tight.update(*du, *dv, i as S * 0.01, 1.0, 0);
+            tight.update(*du, *dv, i as S * 0.01, 1.0);
         }
         tight.newton(8);
         let rep = tight.report_now().expect("report");
@@ -2115,7 +1979,7 @@ mod tests {
         // 同一数据、同一初值的无约束对照。
         let mut free = Tracker::new(config_for_range(0.3 * r_true, 3.0 * r_true), k_true);
         for (i, (du, dv)) in stream.iter().enumerate() {
-            free.update(*du, *dv, i as S * 0.01, 1.0, 0);
+            free.update(*du, *dv, i as S * 0.01, 1.0);
         }
         free.newton(8);
         let free_rep = free.report_now().expect("free report");
@@ -2229,7 +2093,7 @@ mod tests {
 
         let mut tr = Tracker::new(config_for_range(0.3 * r_true, 3.0 * r_true), 1.25 * k_true);
         for (i, (du, dv)) in stream.iter().enumerate() {
-            tr.update(*du, *dv, i as S * 0.01, 1.0, 2);
+            tr.update(*du, *dv, i as S * 0.01, 1.0);
         }
         let rep = tr.report_now().expect("report");
         eprintln!(
@@ -2291,7 +2155,6 @@ mod tests {
         chk(a.g2, b.g2, "g2");
         assert!(worst < tol, "{what}: worst field {who} err {worst}");
     }
-
 
     /// 合成流：`omega` 可以随时间变化；返回真实电角度。
     fn synth_stream_profile(
@@ -2503,11 +2366,11 @@ mod tests {
         assert!((rep.radius - radius).abs() < 0.01);
     }
 
-    /// `update()` 路径的 V 原点管理：最新样本的 `V` 严格归零，且不保留任何
-    /// 偏置——给流注入一个常数 `V` 偏置不会改变 `k` 与半径。
+    /// `update()` 路径（现在就是 `step_once()`）：最新样本的 `V` 严格归零，
+    /// 偏移不保留，拟合直接在“最新样本为原点”的坐标系里进行。
     ///
-    /// 旧规则（把 `V` 的加权均值归零）在这里会留下非零的 `tr.v`：均值归零后
-    /// 最新样本落在 `v - V̄` 上，只有把最新样本本身归零才能让它严格为 0。
+    /// 旧的“加权均值归零”会留下非零的 `tr.v`：均值归零后最新样本落在
+    /// `v - V̄` 上，只有把最新样本本身归零才能让它严格为 0。
     #[test]
     fn update_puts_latest_v_at_origin() {
         let (r, radius, dt) = (384.0, 4.04, 5.0e-5);
@@ -2527,7 +2390,7 @@ mod tests {
             t += dt;
             n += 1;
             if n == 400 {
-                last = tr.update(a, b, t, 400.0, 2);
+                last = tr.update(a, b, t, 400.0);
                 a = V2::ZERO;
                 b = V2::ZERO;
                 n = 0;

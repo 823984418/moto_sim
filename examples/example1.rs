@@ -332,7 +332,7 @@ impl Simulation {
         let nominal_radius = motor.flux / mean_inductance;
         let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
         let mut direct_flux_observer = DirectFluxObserver::new();
-        direct_flux_observer.fit.tau = 1.0;
+        direct_flux_observer.fit.tau = 10.0;
         direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
