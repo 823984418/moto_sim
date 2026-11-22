@@ -7,7 +7,8 @@
 磁链圆观测器只有一个：`DirectFluxObserver`
 （`src/simulation/controller/observer/direct_flux_observer.rs`）。
 
-- 没有 PLL：电流环频率上维护 `∫s0`、`∫i`，直接 `atan2` 测角；
+- 默认没有 PLL：电流环频率上维护 `∫s0`、`∫i`，直接 `atan2` 测角；可选
+  解耦 PLL（GUI “direct PLL” / `--pll`），type-2、归一化鉴相、固定带宽；
 - 圆拟合每 10 ms 跑一次、每次恰好一步 Newton，负责 `R`、圆心和半径；
 - 拟合核心（36 个指数遗忘矩、变量投影、半径伪观测）也在这个文件里。
 

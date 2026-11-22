@@ -9,10 +9,14 @@
 //!
 //! # 1. 直接观测器
 //!
-//! * **没有 PLL**。角度就是快速环的 `rel = c + ∫s0 + R·∫i`、
-//!   `θ = atan2(-rel.y, -rel.x)`；转速只对 `Δθ/Δt` 做一阶低通。上一版把拟合
-//!   相位送进二阶 PLL，加速/减速后 `ω̇/wn²` 的稳态滞后会把角度拖出几 rad，
-//!   减速到停机甚至丢锁；直接反正切没有这个滞后。
+//! * **默认没有 PLL，可选解耦 PLL**。默认角度就是快速环的
+//!   `rel = c + ∫s0 + R·∫i`、`θ = atan2(-rel.y, -rel.x)`，转速只对
+//!   `Δθ/Δt` 做一阶低通。上一版把拟合相位送进二阶 PLL，并在低速把带宽压到
+//!   `max(0.2|ω|,1)`，加速/减速后 `ω̇/wn²` 的稳态滞后会把角度拖出几 rad、
+//!   甚至丢锁；直接反正切没有这个滞后。现在提供一个**可选**的解耦 PLL
+//!   （`pll_enable`）：对单位磁链向量做归一化鉴相 `(rel × n̂)/|rel|`，
+//!   type-2 环路对频率斜坡稳态无角度滞后，带宽固定、不随低速收窄；输出
+//!   速度再经 `speed_tau` 低通。默认关，GUI/`--pll` 可开。
 //! * **双速率**。`∫s0`、`∫i` 与测角在每次 `update`（电流环频率，20 kHz）；
 //!   圆拟合每 `fit_period`（默认 10 ms）才取一次快速积分器的增量。
 //! * **每次拟合恰好一次 Newton**。门限都做成权重，不硬冻结：
@@ -1294,6 +1298,14 @@ struct FastFlux {
     theta_prev: S,
     /// 低通后的电角速度。
     omega_lp: S,
+    /// 解耦 PLL 的估计角。
+    theta_pll: S,
+    /// 解耦 PLL 的估计角速度（VCO 频率）。
+    omega_pll: S,
+    /// PLL 速度输出的一阶低通（VCO 用未滤波的 `omega_pll`）。
+    omega_pll_lp: S,
+    /// 解耦 PLL 的相位误差积分。
+    pll_integ: S,
     /// 本拟合周期内累积的 `Σ(slope_dt/Δt)²`。
     q_acc: S,
 }
@@ -1309,6 +1321,12 @@ pub struct DirectFluxObserver {
     pub fit_period: S,
     /// 测速低通时间常数（秒）。
     pub speed_tau: S,
+    /// 是否用解耦 PLL 的输出角/速度（而不是直接反正切 + 一阶测速低通）。
+    pub pll_enable: bool,
+    /// PLL 自然频率（rad/s）。type-2 环路对频率斜坡稳态无角度滞后。
+    pub pll_wn: S,
+    /// PLL 阻尼比。
+    pub pll_zeta: S,
     /// 圆心、半径、`R` 每次拟合向拟合值移动的**基础**比例。
     ///
     /// `0.05` 对应约 20 个拟合周期（200 ms）收敛。`R` 的实际增益还要乘可辨识
@@ -1390,6 +1408,9 @@ impl Default for DirectFluxObserver {
             },
             fit_period: 0.01,
             speed_tau: 0.02,
+            pll_enable: false,
+            pll_wn: std::f64::consts::TAU * 50.0,
+            pll_zeta: 1.0,
             sync_gain: 0.05,
             radius_scale: (0.1, 10.0),
             k_scale: (0.1, 10.0),
@@ -1465,12 +1486,21 @@ impl DirectFluxObserver {
             tr.seed_frame(c0);
         }
         if let Ok(mut f) = self.fast.lock() {
+            let pll_integ = if self.pll_wn > 0.0 {
+                omega / (self.pll_wn * self.pll_wn)
+            } else {
+                0.0
+            };
             *f = FastFlux {
                 c: c0,
                 k: self.r,
                 rad: self.radius / self.unit_len,
                 theta_prev: self.theta,
                 omega_lp: omega,
+                theta_pll: self.theta,
+                omega_pll: omega,
+                omega_pll_lp: omega,
+                pll_integ,
                 ..Default::default()
             };
         }
@@ -1622,7 +1652,7 @@ impl Observer<3> for DirectFluxObserver {
         }
 
         // ---- 快速环：反正切测角 + 低通差分测速 ----
-        let (theta, omega, mag, rel, k_now, rad_now) = {
+        let (theta, theta_meas, omega, mag, rel, k_now, rad_now) = {
             let mut f = match self.fast.lock() {
                 Ok(f) => f,
                 Err(_) => {
@@ -1631,20 +1661,47 @@ impl Observer<3> for DirectFluxObserver {
                 }
             };
             let rel = f.c.add(f.a).add(f.b.mul(f.k));
-            let theta = (-rel.y).atan2(-rel.x);
-            let dtheta = wrap_pi(theta - f.theta_prev);
-            f.theta_prev = theta;
+            let theta_meas = (-rel.y).atan2(-rel.x);
+            let dtheta = wrap_pi(theta_meas - f.theta_prev);
+            f.theta_prev = theta_meas;
             let alpha = if self.speed_tau > 0.0 {
                 (delta_time / self.speed_tau).clamp(0.0, 1.0)
             } else {
                 1.0
             };
             f.omega_lp += alpha * (dtheta / delta_time - f.omega_lp);
-            (theta, f.omega_lp, rel.norm(), rel, f.k, f.rad)
+
+            // 解耦 PLL：用单位磁链向量的叉积做鉴相（与 |rel| 无关）。
+            // 误差 = sin(θ - θ̂) = (rel × n̂)/|rel|。type-2 PI + VCO 积分。
+            let mag = rel.norm();
+            // 输出角是 atan2(-rel.y, -rel.x)，所以单位向量 u = -rel/|rel|；
+            // sin(θ - θ̂) = (u.y·cosθ̂ - u.x·sinθ̂)
+            //            = (rel.x·sinθ̂ - rel.y·cosθ̂)/|rel|。
+            let err = if mag > 1.0e-12 {
+                (rel.x * f.theta_pll.sin() - rel.y * f.theta_pll.cos()) / mag
+            } else {
+                0.0
+            };
+            let wn = self.pll_wn.max(1.0e-6);
+            let kp = 2.0 * self.pll_zeta * wn;
+            let ki = wn * wn;
+            f.pll_integ += err * delta_time;
+            f.omega_pll = kp * err + ki * f.pll_integ;
+            f.theta_pll = wrap_pi(f.theta_pll + f.omega_pll * delta_time);
+            // VCO 用未滤波的 omega_pll；对外速度再低通一次，避免 kp·err 的
+            // 相位噪声直接进速度环。
+            f.omega_pll_lp += alpha * (f.omega_pll - f.omega_pll_lp);
+
+            let (theta, omega) = if self.pll_enable {
+                (f.theta_pll, f.omega_pll_lp)
+            } else {
+                (theta_meas, f.omega_lp)
+            };
+            (theta, theta_meas, omega, mag, rel, f.k, f.rad)
         };
 
         self.theta = theta;
-        self.theta_meas = theta;
+        self.theta_meas = theta_meas;
         self.omega = omega;
         self.r = k_now;
         self.radius = rad_now * self.unit_len;
@@ -2083,6 +2140,49 @@ mod tests {
             ob.center_used,
             ob.radius
         );
+    }
+
+    /// 解耦 PLL（type-2）在同样的加速→减速 profile 下跟踪角度。
+    #[test]
+    fn direct_flux_pll_tracks_speed_profile() {
+        let r = 384.0;
+        let radius = 4.04;
+        let dt = 5.0e-5;
+        let (lo, hi, ramp) = (20.0, 100.0, 1000.0);
+        let omega = move |t: S| {
+            let up = (hi - lo) / ramp;
+            if t < 1.0 {
+                lo
+            } else if t < 1.0 + up {
+                lo + ramp * (t - 1.0)
+            } else if t < 3.0 {
+                hi
+            } else if t < 3.0 + up {
+                hi - ramp * (t - 3.0)
+            } else {
+                lo
+            }
+        };
+        let stream = synth_stream_profile(r, radius, omega, |_| 3.0, 6.0, dt);
+
+        let mut ob = DirectFluxObserver::new();
+        ob.pll_enable = true;
+        ob.pll_wn = TAU * 50.0;
+        ob.set_initial(0.0, 0.0, r, radius);
+        let mut worst_tail: S = 0.0;
+        let mut t = 0.0;
+        for (th, du, dv) in stream {
+            let out = ob.update(dt, &direct_input(du, dv, dt));
+            if t > 5.0 {
+                worst_tail = worst_tail.max(wrap_pi(out.electrical_angle - th).abs());
+            }
+            t += dt;
+        }
+        eprintln!(
+            "pll: tail={worst_tail:.4} r={:.3} r_fit={:.3}",
+            ob.r, ob.r_fit
+        );
+        assert!(worst_tail < 0.05, "PLL tail {worst_tail} rad");
     }
 
     /// R 初值 +25%：只能靠可观性加权 Newton 慢慢拉回；拉回后角度要恢复。
