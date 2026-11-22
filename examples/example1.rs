@@ -39,6 +39,9 @@ use rand::rngs::StdRng;
 /// GUI 里高阻观测器的编号（滑块 0..=13 的最后一项）。
 const HIGH_Z_OBSERVER: usize = 13;
 
+/// 斜率采样两个电流采样点的默认低通带宽（Hz），GUI 可调。
+const SLOPE_LPF_DEFAULT_HZ: f64 = 2200.0;
+
 pub fn zq10y_dead_mapping_with_error() -> BoxedFunction {
     let iq14_base: f64 = 2.0f64.powi(-14);
     LinearInterpolation::new(vec![
@@ -72,7 +75,15 @@ pub struct Simulation {
 
     angle_sensor_noise: Noise,
     current_sample_noise: [Noise; 3],
-    slope_sample_noise: [Noise; 3],
+    /// 斜率采样两个时刻各自的电流采样噪声（单位正态，使用时乘 σ_i）。
+    slope_sample_noise_a: [Noise; 3],
+    slope_sample_noise_b: [Noise; 3],
+    /// 两个采样点各自的固定一阶低通状态（3 相）。
+    slope_lpf_a: [f64; 3],
+    slope_lpf_b: [f64; 3],
+    /// 用于斜率分母的 dt 也过同一个带宽的滤波器。
+    slope_dt_lpf: f64,
+    slope_lpf_ready: bool,
     output_voltage_noise: [Noise; 3],
     bus_voltage_sample_noise: Noise,
     sample_current_offset: [f64; 3],
@@ -92,6 +103,11 @@ pub struct Simulation {
     ///
     /// 高阻时把它给到零矢量窗口：`slope_dt = high_z_duty/carry_freq - 3 µs`。
     pub high_z_duty: f64,
+    /// 斜率采样两个电流采样点的一阶低通带宽（Hz）。
+    ///
+    /// 两个采样点用同一个带宽；每控制拍 `α = 1 - exp(-2π·f·Δt)`，忽略两点
+    /// 之间 dt 造成的相位差。GUI 可调。
+    pub slope_lpf_hz: f64,
     /// GUI 演示用：把电流采样噪声切到 1 mA（PAPER.md 的假设值）。
     pub low_noise: bool,
     /// GUI 演示用：闭环时把速度环降慢，避免与观测器的相位滞后耦合。
@@ -344,7 +360,7 @@ impl Simulation {
         let nominal_radius = motor.flux / mean_inductance;
         let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
         let mut direct_flux_observer = DirectFluxObserver::new();
-        direct_flux_observer.fit.tau = 2.0;
+        direct_flux_observer.fit.tau = 1.0;
         direct_flux_observer.fit.hp_rel = 2.0;
         direct_flux_observer.set_initial(
             initial_electrical_angle,
@@ -356,7 +372,7 @@ impl Simulation {
         // 高阻观测器：内部长度单位取额定半径 ψf/L，先验半径 = 1；电流恒为 0，
         // 只积分零矢量斜率并做二维 Kåsa 圆拟合。
         let mut high_z_flux_observer = HighZFluxObserver::new(nominal_radius, 1.0);
-        high_z_flux_observer.tau = 2.0;
+        high_z_flux_observer.tau = 1.0;
         high_z_flux_observer.hp_rel = 2.0;
 
         Self {
@@ -372,11 +388,20 @@ impl Simulation {
                 Noise::new(0.01, 2),
                 Noise::new(0.01, 3),
             ],
-            slope_sample_noise: [
-                Noise::new(1.0, 11),
-                Noise::new(1.0, 12),
-                Noise::new(1.0, 13),
+            slope_sample_noise_a: [
+                Noise::new(1.0, 21),
+                Noise::new(1.0, 22),
+                Noise::new(1.0, 23),
             ],
+            slope_sample_noise_b: [
+                Noise::new(1.0, 24),
+                Noise::new(1.0, 25),
+                Noise::new(1.0, 26),
+            ],
+            slope_lpf_a: [0.0; 3],
+            slope_lpf_b: [0.0; 3],
+            slope_dt_lpf: 0.0,
+            slope_lpf_ready: false,
             slope_noise_scale: 1.0,
             // 零矢量斜率是 v=0 时的 di/dt，死区/器件压降不进入这一测量，
             // 因此默认不注入。保留开关仅用于对照“平均模型误解”的敏感性。
@@ -385,6 +410,7 @@ impl Simulation {
             current_noise_std: 0.01,
             last_slope_dt: 0.0,
             high_z_duty: 0.2,
+            slope_lpf_hz: SLOPE_LPF_DEFAULT_HZ,
             low_noise: false,
             slow_speed_loop: false,
             output_voltage_noise: [
@@ -615,14 +641,40 @@ impl Simulation {
                             slope_ab[1] += self.slope_dead_scale * dead_ab[1] / l;
                         }
 
-                        let mut slope_3ph = inverse_clarke(slope_ab);
-                        let sigma_s = std::f64::consts::SQRT_2
-                            * self.current_noise_std
-                            * self.slope_noise_scale
-                            / slope_dt;
+                        // 两个采样点：t0 和 t0+dt 各采一次电流，各自加独立
+                        // 采样噪声，再各自过同一个固定带宽的一阶低通，最后
+                        // slope = (i2_f - i1_f)/dt。
+                        let i_3ph = inverse_clarke(i_ab);
+                        let s_3ph = inverse_clarke(slope_ab);
+                        let sigma_i = self.current_noise_std * self.slope_noise_scale;
+                        let mut i_a = [0.0; 3];
+                        let mut i_b = [0.0; 3];
                         for i in 0..3 {
-                            self.slope_sample_noise[i].update(delta_time);
-                            slope_3ph[i] += self.slope_sample_noise[i].value * sigma_s;
+                            self.slope_sample_noise_a[i].update(delta_time);
+                            self.slope_sample_noise_b[i].update(delta_time);
+                            i_a[i] = i_3ph[i]
+                                + self.slope_sample_noise_a[i].value * sigma_i;
+                            i_b[i] = i_3ph[i]
+                                + s_3ph[i] * slope_dt
+                                + self.slope_sample_noise_b[i].value * sigma_i;
+                        }
+                        if !self.slope_lpf_ready {
+                            self.slope_lpf_a = i_a;
+                            self.slope_lpf_b = i_b;
+                            self.slope_dt_lpf = slope_dt;
+                            self.slope_lpf_ready = true;
+                        }
+                        let alpha = (1.0
+                            - (-std::f64::consts::TAU * self.slope_lpf_hz * delta_time).exp())
+                        .clamp(0.0, 1.0);
+                        // 分母 dt 也过同一个带宽的滤波器。
+                        self.slope_dt_lpf += alpha * (slope_dt - self.slope_dt_lpf);
+                        let mut slope_3ph = [0.0; 3];
+                        for i in 0..3 {
+                            self.slope_lpf_a[i] += alpha * (i_a[i] - self.slope_lpf_a[i]);
+                            self.slope_lpf_b[i] += alpha * (i_b[i] - self.slope_lpf_b[i]);
+                            slope_3ph[i] = (self.slope_lpf_b[i] - self.slope_lpf_a[i])
+                                / self.slope_dt_lpf;
                         }
                         self.observer_input.current_slope = slope_3ph;
                         self.observer_input.current_slope_dt = slope_dt;
@@ -939,24 +991,24 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
-                    // ScopeData::new("flux_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.flux_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
-                    // ScopeData::new("grad_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.grad_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
-                    // ScopeData::new("mix_angle", |s: &mut Simulation| {
-                    //     angle_normal(
-                    //         s.mix_observer_output.electrical_angle
-                    //             - s.motion_load.angle * s.motor.pole_pairs,
-                    //     )
-                    // }),
+                    ScopeData::new("flux_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("grad_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.grad_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
+                    ScopeData::new("mix_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.mix_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    }),
                     // ScopeData::new("mp_angle", |s: &mut Simulation| {
                     //     angle_normal(
                     //         s.mp_observer_output.electrical_angle
@@ -1528,6 +1580,13 @@ impl App for Application {
                     self.simulation.speed_kp = kp;
                     self.simulation.speed_ki = ki;
                 }
+            });
+            ui.horizontal(|ui| {
+                ui.label("斜率滤波带宽");
+                Slider::new(&mut self.simulation.slope_lpf_hz, 100.0..=1000.0)
+                    .logarithmic(true)
+                    .suffix(" Hz")
+                    .ui(ui);
             });
             ScrollArea::vertical().show(ui, |ui| {
                 self.flux_plot(ui);
