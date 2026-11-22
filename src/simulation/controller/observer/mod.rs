@@ -5,6 +5,7 @@ pub mod ds_observer;
 pub mod ex_flux_observer;
 pub mod flux_observer;
 pub mod grad_observer;
+pub mod high_z_flux_observer;
 pub mod mix_observer;
 pub mod mp_observer;
 pub mod sensor_observer;

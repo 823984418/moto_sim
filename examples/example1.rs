@@ -15,6 +15,7 @@ use moto_sim::simulation::controller::observer::ds_observer::DsObserver;
 use moto_sim::simulation::controller::observer::ex_flux_observer::ExFluxObserver;
 use moto_sim::simulation::controller::observer::flux_observer::FluxObserver;
 use moto_sim::simulation::controller::observer::grad_observer::GradObserver;
+use moto_sim::simulation::controller::observer::high_z_flux_observer::HighZFluxObserver;
 use moto_sim::simulation::controller::observer::mix_observer::MixObserver;
 use moto_sim::simulation::controller::observer::mp_observer::MpObserver;
 use moto_sim::simulation::controller::observer::sensor_observer::SensorObserver;
@@ -34,6 +35,9 @@ use moto_sim::ui::font::load_chinese_font;
 use moto_sim::util::{BoxedFunction, LinearInterpolation, Timer};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+
+/// GUI 里高阻观测器的编号（滑块 0..=13 的最后一项）。
+const HIGH_Z_OBSERVER: usize = 13;
 
 pub fn zq10y_dead_mapping_with_error() -> BoxedFunction {
     let iq14_base: f64 = 2.0f64.powi(-14);
@@ -84,6 +88,10 @@ pub struct Simulation {
     pub current_noise_std: f64,
     /// 最近一次传给观测器的零矢量采样间隔（秒），0 表示无有效零矢量。
     pub last_slope_dt: f64,
+    /// 高阻模式每个载波周期导通下管的比例（采样斜率/给自举电容充电）。
+    ///
+    /// 高阻时把它给到零矢量窗口：`slope_dt = high_z_duty/carry_freq - 3 µs`。
+    pub high_z_duty: f64,
     /// GUI 演示用：把电流采样噪声切到 1 mA（PAPER.md 的假设值）。
     pub low_noise: bool,
     /// GUI 演示用：闭环时把速度环降慢，避免与观测器的相位滞后耦合。
@@ -121,6 +129,9 @@ pub struct Simulation {
     ss2_observer_output: ObserverOutput,
     all_observer_output: ObserverOutput,
     pub direct_flux_observer_output: ObserverOutput,
+    pub high_z_flux_observer_output: ObserverOutput,
+    /// 上一次的观测器选择，用于“切到高阻观测器时清零其状态”。
+    prev_use_observer: usize,
 
     current_regulator_input: CurrentRegulatorInput<3>,
     current_regulator_output: CurrentRegulatorOutput<3>,
@@ -145,6 +156,7 @@ pub struct Simulation {
     pub ss2_observer: SS2Observer,
     pub all_observer: AllObserver,
     pub direct_flux_observer: DirectFluxObserver,
+    pub high_z_flux_observer: HighZFluxObserver,
 
     pub current_regulator: ThreePhasePICurrentRegulator,
 }
@@ -333,12 +345,19 @@ impl Simulation {
         let initial_electrical_angle = angle_normal(std::f64::consts::PI * 0.5 * motor.pole_pairs);
         let mut direct_flux_observer = DirectFluxObserver::new();
         direct_flux_observer.fit.tau = 2.0;
+        direct_flux_observer.fit.hp_rel = 2.0;
         direct_flux_observer.set_initial(
             initial_electrical_angle,
             0.0,
             nominal_r * 0.5,
             nominal_radius,
         );
+
+        // 高阻观测器：内部长度单位取额定半径 ψf/L，先验半径 = 1；电流恒为 0，
+        // 只积分零矢量斜率并做二维 Kåsa 圆拟合。
+        let mut high_z_flux_observer = HighZFluxObserver::new(nominal_radius, 1.0);
+        high_z_flux_observer.tau = 2.0;
+        high_z_flux_observer.hp_rel = 2.0;
 
         Self {
             delta_time: 0.0001,
@@ -365,6 +384,7 @@ impl Simulation {
             slope_dead_scale: 1.0,
             current_noise_std: 0.01,
             last_slope_dt: 0.0,
+            high_z_duty: 0.2,
             low_noise: false,
             slow_speed_loop: false,
             output_voltage_noise: [
@@ -410,6 +430,9 @@ impl Simulation {
             ss2_observer,
             all_observer,
             direct_flux_observer,
+            high_z_flux_observer,
+            high_z_flux_observer_output: ObserverOutput::default(),
+            prev_use_observer: 0,
             dead_fix: zq10y_dead_mapping(),
             current_regulator: ThreePhasePICurrentRegulator {
                 kp: [
@@ -431,6 +454,15 @@ impl Simulation {
     }
 
     pub fn update(&mut self) {
+        // 切换观测器：切到高阻观测器时清空它的积分器/矩/圆心，从当前斜率重新
+        // 积分。其它观测器是持续运行的，不需要在这里动。
+        if self.use_observer != self.prev_use_observer {
+            if self.use_observer == HIGH_Z_OBSERVER {
+                self.high_z_flux_observer.reset();
+                self.high_z_flux_observer_output = ObserverOutput::default();
+            }
+            self.prev_use_observer = self.use_observer;
+        }
         self.timer.time += self.delta_time;
         while let Some(i) = self.timer.check_time() {
             let delta_time = self.timer.event_step[i];
@@ -448,6 +480,15 @@ impl Simulation {
                     self.motor_input.speed = self.motion_load_output.speed;
                     self.motor_input.angle = self.motion_load_output.angle;
                     self.motor_input.voltage = self.power_bridge_output.output_voltage;
+                    if self.use_observer == HIGH_Z_OBSERVER {
+                        // 高阻：三相开路，电流强制为 0，端电压 = 反电势。
+                        let theta_e = self.motion_load_output.angle * self.motor.pole_pairs;
+                        let omega_e = self.motion_load_output.speed * self.motor.pole_pairs;
+                        let e_abc =
+                            inverse_clarke(rotate([0.0, omega_e * self.motor.flux], theta_e));
+                        self.motor.current_dq = [0.0, 0.0];
+                        self.motor_input.voltage = e_abc;
+                    }
                     self.motion_load_input.torque = self.motor_output.torque;
                     self.power_bridge_input.output_current = self.motor_output.current;
 
@@ -510,6 +551,22 @@ impl Simulation {
                     self.observer_input.voltage = sample_voltage;
                     self.observer_input.current = sample_current;
                     self.observer_input.target_speed = self.target_speed;
+                    if self.use_observer == HIGH_Z_OBSERVER {
+                        // 高阻态端电压的物理值是反电势（高阻观测器本身不用电压，
+                        // 它积分的是下面零矢量窗口的电流斜率；这里保留给其它
+                        // 旁观观测器和电压 scope）。
+                        let theta_e = self.motion_load_output.angle * self.motor.pole_pairs;
+                        let omega_e = self.motion_load_output.speed * self.motor.pole_pairs;
+                        let mut voltage =
+                            inverse_clarke(rotate([0.0, omega_e * self.motor.flux], theta_e));
+                        for i in 0..3 {
+                            voltage[i] +=
+                                self.output_voltage_offset[i] + self.output_voltage_noise[i].value;
+                        }
+                        self.observer_input.voltage = voltage;
+                        // 电流仍取采样值（0 + 偏置/噪声）。
+                        self.observer_input.current = sample_current;
+                    }
 
                     // ---- 零矢量电流斜率传感器模型 ----
                     // 本仿真的功率桥是平均模型，没有真实载波/开关状态，所以这里
@@ -518,7 +575,13 @@ impl Simulation {
                     let duty = self.power_bridge_input.output_duty;
                     let duty_max = duty.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let duty_min = duty.iter().copied().fold(f64::INFINITY, f64::min);
-                    let zero_vector_fraction = (1.0 - 0.5 * (duty_max - duty_min)).clamp(0.0, 1.0);
+                    // 高阻模式硬件：每个载波约 20% 时间导通下管采样斜率，其余高阻。
+                    // 这里不做载波级波形，只把斜率窗口设为 20% 来产生相应的噪声。
+                    let zero_vector_fraction = if self.use_observer == HIGH_Z_OBSERVER {
+                        self.high_z_duty.clamp(0.01, 1.0)
+                    } else {
+                        (1.0 - 0.5 * (duty_max - duty_min)).clamp(0.0, 1.0)
+                    };
                     let carrier_period = if self.power_bridge.carry_freq > 0.0 {
                         1.0 / self.power_bridge.carry_freq
                     } else {
@@ -606,6 +669,9 @@ impl Simulation {
                     self.direct_flux_observer_output = self
                         .direct_flux_observer
                         .update(delta_time, &self.observer_input);
+                    self.high_z_flux_observer_output = self
+                        .high_z_flux_observer
+                        .update(delta_time, &self.observer_input);
 
                     let use_observer = match self.use_observer {
                         0 => &self.sensor_observer_output,
@@ -621,6 +687,7 @@ impl Simulation {
                         10 => &self.ss2_observer_output,
                         11 => &self.all_observer_output,
                         12 => &self.direct_flux_observer_output,
+                        13 => &self.high_z_flux_observer_output,
                         _ => &self.sensor_observer_output,
                     };
                     self.current_regulator_input.electrical_speed = use_observer.electrical_speed;
@@ -628,43 +695,53 @@ impl Simulation {
                     self.current_regulator_input.continuous_speed = use_observer.continuous_speed;
                     self.current_regulator_input.current = sample_current;
 
-                    let max_current = 2.0;
-                    let speed_error =
-                        self.target_speed - self.current_regulator_input.electrical_speed;
-                    let speed_p = speed_error * self.speed_kp;
-                    self.speed_i += speed_error * self.speed_ki * delta_time;
-                    self.speed_i = self.speed_i.clamp(-max_current, max_current);
-                    let output_torque = (self.speed_i + speed_p).clamp(-max_current, max_current);
-                    let id = if self.set_id {
-                        self.id
+                    if self.use_observer == HIGH_Z_OBSERVER {
+                        // 高阻态：速度环/电流环不参与，桥臂全关，电流强制为 0
+                        // （电机端电压在 plant 事件里被设为反电势）。
+                        self.speed_i = 0.0;
+                        self.current_regulator_input.command_current = [0.0; 3];
+                        self.power_bridge_input.output_duty = [0.0; 3];
                     } else {
-                        mtpa_id(
-                            output_torque,
-                            self.motor.flux,
-                            self.motor.inductance_dq[0],
-                            self.motor.inductance_dq[1],
-                        )
+                        let max_current = 2.0;
+                        let speed_error =
+                            self.target_speed - self.current_regulator_input.electrical_speed;
+                        let speed_p = speed_error * self.speed_kp;
+                        self.speed_i += speed_error * self.speed_ki * delta_time;
+                        self.speed_i = self.speed_i.clamp(-max_current, max_current);
+                        let output_torque =
+                            (self.speed_i + speed_p).clamp(-max_current, max_current);
+                        let id = if self.set_id {
+                            self.id
+                        } else {
+                            mtpa_id(
+                                output_torque,
+                                self.motor.flux,
+                                self.motor.inductance_dq[0],
+                                self.motor.inductance_dq[1],
+                            )
+                        }
+                        .clamp(-max_current, max_current);
+                        let command_current = rotate(
+                            [
+                                id + 0.0
+                                    * f64::cos(
+                                        use_observer.electrical_angle - self.res_tune.tune_angle,
+                                    ),
+                                output_torque,
+                            ],
+                            use_observer.electrical_angle,
+                        );
+                        self.current_regulator_input.command_current =
+                            inverse_clarke(command_current);
+                        self.current_regulator_output = self
+                            .current_regulator
+                            .update(delta_time, &self.current_regulator_input);
+
+                        let command_voltage = self.current_regulator_output.command_voltage;
+
+                        self.power_bridge_input.output_duty =
+                            command_voltage.map(|i| nn(i * 2.0 / sample_bus_voltage));
                     }
-                    .clamp(-max_current, max_current);
-                    let command_current = rotate(
-                        [
-                            id + 0.0
-                                * f64::cos(
-                                    use_observer.electrical_angle - self.res_tune.tune_angle,
-                                ),
-                            output_torque,
-                        ],
-                        use_observer.electrical_angle,
-                    );
-                    self.current_regulator_input.command_current = inverse_clarke(command_current);
-                    self.current_regulator_output = self
-                        .current_regulator
-                        .update(delta_time, &self.current_regulator_input);
-
-                    let command_voltage = self.current_regulator_output.command_voltage;
-
-                    self.power_bridge_input.output_duty =
-                        command_voltage.map(|i| nn(i * 2.0 / sample_bus_voltage));
                 }
                 _ => unreachable!(),
             }
@@ -676,6 +753,8 @@ pub struct ScopeData<S> {
     name: String,
     data: Vec<PlotPoint>,
     update: Box<dyn FnMut(&mut S) -> f64>,
+    /// 可选可见性：返回 false 时不采样并清空已有轨迹（切换观测器时用）。
+    visible: Option<Box<dyn FnMut(&mut S) -> bool>>,
 }
 
 impl<S> ScopeData<S> {
@@ -684,7 +763,14 @@ impl<S> ScopeData<S> {
             name: name.to_string(),
             data: Vec::new(),
             update: Box::new(f),
+            visible: None,
         }
+    }
+
+    /// 只在 `f` 为真时采样；为假时清空已有数据，曲线上不留下切换前的残影。
+    pub fn visible_if<F: FnMut(&mut S) -> bool + 'static>(mut self, f: F) -> Self {
+        self.visible = Some(Box::new(f));
+        self
     }
 }
 
@@ -704,6 +790,12 @@ impl<S> Scope<S> {
     pub fn update(&mut self, time: f64, source: &mut S) {
         for (_, datas) in &mut self.data {
             for d in datas {
+                if let Some(visible) = &mut d.visible {
+                    if !visible(source) {
+                        d.data.clear();
+                        continue;
+                    }
+                }
                 d.data.push(PlotPoint::new(time, (d.update)(source)));
             }
         }
@@ -746,7 +838,9 @@ impl<S> Scope<S> {
                             auto_bounds.y |= auto_y;
                             ui.set_auto_bounds(auto_bounds);
                             for d in datas {
-                                ui.line(Line::new(&d.name, d.data.as_slice()));
+                                if !d.data.is_empty() {
+                                    ui.line(Line::new(&d.name, d.data.as_slice()));
+                                }
                             }
                         });
                 });
@@ -761,6 +855,8 @@ pub struct Application {
     scope: Scope<Simulation>,
     /// 快速环磁链向量（相对拟合圆心）的轨迹，供"磁链圆"图使用。
     flux_trace: Vec<PlotPoint>,
+    /// 上一次绘图用的观测器编号；切换时清空轨迹，避免两个观测器的点混在一起。
+    last_plot_observer: usize,
 }
 
 impl Application {
@@ -771,6 +867,7 @@ impl Application {
             run: false,
             scope: Scope::new(),
             flux_trace: Vec::new(),
+            last_plot_observer: 0,
         };
         this.reset();
         Ok(this)
@@ -779,6 +876,7 @@ impl Application {
     pub fn reset(&mut self) {
         self.run = false;
         self.flux_trace.clear();
+        self.last_plot_observer = 0;
         self.simulation = Simulation::new();
         self.scope.data = vec![
             (
@@ -826,6 +924,10 @@ impl Application {
                     ScopeData::new("direct_angle", |s: &mut Simulation| {
                         s.direct_flux_observer_output.electrical_angle
                     }),
+                    ScopeData::new("high_z_angle", |s: &mut Simulation| {
+                        s.high_z_flux_observer_output.electrical_angle
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
                 ],
             ),
             (
@@ -916,6 +1018,13 @@ impl Application {
                                 - s.motion_load.angle * s.motor.pole_pairs,
                         )
                     }),
+                    ScopeData::new("high_z_angle", |s: &mut Simulation| {
+                        angle_normal(
+                            s.high_z_flux_observer_output.electrical_angle
+                                - s.motion_load.angle * s.motor.pole_pairs,
+                        )
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
                 ],
             ),
             (
@@ -963,6 +1072,10 @@ impl Application {
                     ScopeData::new("direct_speed", |s: &mut Simulation| {
                         s.direct_flux_observer_output.electrical_speed
                     }),
+                    ScopeData::new("high_z_speed", |s: &mut Simulation| {
+                        s.high_z_flux_observer_output.electrical_speed
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
                 ],
             ),
             (
@@ -1190,6 +1303,42 @@ impl Application {
                     }),
                 ],
             ),
+            (
+                "high_z_flux".to_string(),
+                vec![
+                    ScopeData::new("radius", |s: &mut Simulation| {
+                        s.high_z_flux_observer.radius * s.high_z_flux_observer.unit_len
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                    ScopeData::new("flux_mag", |s: &mut Simulation| {
+                        let o = &s.high_z_flux_observer;
+                        o.flux().sub(o.center()).norm() * o.unit_len
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                    ScopeData::new("center", |s: &mut Simulation| {
+                        let o = &s.high_z_flux_observer;
+                        o.center().norm() * o.unit_len
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                    ScopeData::new("center_local", |s: &mut Simulation| {
+                        let o = &s.high_z_flux_observer;
+                        o.center_local.norm() * o.unit_len
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                    ScopeData::new("weight", |s: &mut Simulation| {
+                        s.high_z_flux_observer.weight
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                    ScopeData::new("valid", |s: &mut Simulation| {
+                        if s.high_z_flux_observer.valid {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .visible_if(|s: &mut Simulation| s.use_observer == HIGH_Z_OBSERVER),
+                ],
+            ),
         ];
     }
 
@@ -1197,32 +1346,71 @@ impl Application {
         self.simulation.update();
         self.scope
             .update(self.simulation.timer.time, &mut self.simulation);
-        // 快速环磁链向量（已相对拟合圆心）：画在以圆心为原点的平面上。
-        let f = self.simulation.direct_flux_observer.flux;
-        if f.x.is_finite() && f.y.is_finite() {
-            self.flux_trace.push(PlotPoint::new(f.x, f.y));
+        // 切换观测器时清空轨迹：两个观测器的磁链不在同一帧里。
+        if self.simulation.use_observer != self.last_plot_observer {
+            self.last_plot_observer = self.simulation.use_observer;
+            self.flux_trace.clear();
+        }
+        // 磁链圆轨迹：直接观测器用“相对快速环圆心”的 flux；高阻观测器用
+        // 积分磁链 p 的绝对值（帧固定为积分起点，避免圆心更新时轨迹跳变）。
+        let f = if self.simulation.use_observer == HIGH_Z_OBSERVER {
+            let o = &self.simulation.high_z_flux_observer;
+            let p = o.flux().mul(o.unit_len);
+            [p.x, p.y]
+        } else {
+            let o = &self.simulation.direct_flux_observer;
+            [o.flux.x, o.flux.y]
+        };
+        if f[0].is_finite() && f[1].is_finite() {
+            self.flux_trace.push(PlotPoint::new(f[0], f[1]));
             if self.flux_trace.len() > 4096 {
                 self.flux_trace.drain(..1024);
             }
         }
     }
 
-    /// 磁链圆：快速环积分出的磁链向量，圆心（拟合圆心）作为原点。
+    /// 磁链圆。
+    ///
+    /// * `direct_flux_observer`：快速环积分出的磁链向量，拟合圆心为原点；
+    /// * `high_z_flux_observer`：电压积分 `p`（固定帧），参考圆以拟合圆心
+    ///   `center` 为圆心、半径 `radius`（先验或拟合范围）× `unit_len`。
     fn flux_plot(&mut self, ui: &mut Ui) {
-        let (radius, current, center_used) = {
-            let o = &self.simulation.direct_flux_observer;
-            (o.radius, o.flux, o.center_used)
-        };
+        let (radius, current, center_used, circle_center, title) =
+            if self.simulation.use_observer == HIGH_Z_OBSERVER {
+                let o = &self.simulation.high_z_flux_observer;
+                let unit = o.unit_len;
+                let p = o.flux().mul(unit);
+                let c = o.center().mul(unit);
+                (
+                    o.radius * unit,
+                    [p.x, p.y],
+                    [c.x, c.y],
+                    [c.x, c.y],
+                    "磁链圆（高阻观测器）",
+                )
+            } else {
+                let o = &self.simulation.direct_flux_observer;
+                (
+                    o.radius,
+                    [o.flux.x, o.flux.y],
+                    [o.center_used.x, o.center_used.y],
+                    [0.0, 0.0],
+                    "磁链圆（圆心为原点）",
+                )
+            };
         // 拟合半径画成参考圆。
         let mut circle: Vec<[f64; 2]> = Vec::new();
         if radius > 0.0 && radius.is_finite() {
             const N: usize = 180;
             for k in 0..=N {
                 let a = std::f64::consts::TAU * k as f64 / N as f64;
-                circle.push([radius * a.cos(), radius * a.sin()]);
+                circle.push([
+                    circle_center[0] + radius * a.cos(),
+                    circle_center[1] + radius * a.sin(),
+                ]);
             }
         }
-        CollapsingHeader::new("磁链圆（圆心为原点）")
+        CollapsingHeader::new(title)
             .default_open(true)
             .show(ui, |ui| {
                 Plot::new("flux_circle")
@@ -1236,13 +1424,14 @@ impl Application {
                             ui.line(Line::new("radius", circle).color(egui::Color32::DARK_GRAY));
                         }
                         ui.points(
-                            Points::new("now", [current.x, current.y])
+                            Points::new("now", current)
                                 .radius(4.0)
                                 .color(egui::Color32::RED),
                         );
-                        // 交班实际使用的圆心（最新样本 + 拟合半径推出）。
+                        // 直接观测器：交班实际使用的圆心（最新样本 + 拟合半径推出）；
+                        // 高阻观测器：拟合圆心。
                         ui.points(
-                            Points::new("center", [center_used.x, center_used.y])
+                            Points::new("center", center_used)
                                 .radius(5.0)
                                 .color(egui::Color32::from_rgb(30, 120, 255)),
                         );
@@ -1289,8 +1478,10 @@ impl App for Application {
                 Slider::new(&mut self.simulation.cmd_speed, -5000.0..=5000.0).ui(ui);
                 ui.checkbox(&mut self.simulation.set_id, "id");
                 Slider::new(&mut self.simulation.id, -2.0..=2.0).ui(ui);
+            });
+            ui.horizontal(|ui| {
                 ui.label("use_observer");
-                Slider::new(&mut self.simulation.use_observer, 0..=12).ui(ui);
+                Slider::new(&mut self.simulation.use_observer, 0..=13).ui(ui);
                 ui.label(match self.simulation.use_observer {
                     0 => "sensor_observer",
                     1 => "grad_observer",
@@ -1305,8 +1496,15 @@ impl App for Application {
                     10 => "ss2_observer",
                     11 => "all_observer",
                     12 => "direct_flux_observer",
+                    13 => "high_z_flux_observer",
                     _ => "sensor_observer",
                 });
+                ui.checkbox(
+                    &mut self.simulation.high_z_flux_observer.use_prior_radius,
+                    "高阻：先验半径",
+                );
+                ui.label("高阻占空比");
+                Slider::new(&mut self.simulation.high_z_duty, 0.05..=0.5).ui(ui);
                 if ui
                     .checkbox(&mut self.simulation.low_noise, "1 mA 噪声")
                     .changed()
@@ -1427,6 +1625,7 @@ fn run_headless(args: &[String]) {
     let observe_only = args.iter().any(|a| a == "--observe-only");
     let handover = arg_f64(args, "--handover", 0.0);
     let tau = arg_f64(args, "--tau", 1.0);
+    let hp_rel = arg_f64(args, "--hp-rel", 200.0);
     let obs_min = arg_f64(args, "--obs-min", 5.0e-3);
     let k_prior = arg_f64(args, "--k-prior", 0.02);
     let k_step = arg_f64(args, "--k-step", 0.02);
@@ -1474,6 +1673,7 @@ fn run_headless(args: &[String]) {
     // 先把拟合参数写进 observer，再 set_initial——Tracker 在 set_initial 里
     // 用这份配置构造，顺序反了会拿到默认 tau。
     sim.direct_flux_observer.fit.tau = tau;
+    sim.direct_flux_observer.fit.hp_rel = hp_rel;
     sim.direct_flux_observer.fit.obs_min = obs_min;
     sim.direct_flux_observer.fit.k_prior_rel = k_prior;
     sim.direct_flux_observer.fit.k_step_rel = k_step;
@@ -1553,7 +1753,7 @@ fn run_headless(args: &[String]) {
     println!(
         "seconds={seconds} speed={speed} r0_scale={r_scale} plant_step={plant_step:.1e} \
          slope_noise={noise_scale} current_noise={:.4} speed_ramp={speed_ramp} \
-         tau={tau} obs_min={obs_min:.1e} prior={k_prior} step={k_step} \
+         tau={tau} hp_rel={hp_rel} obs_min={obs_min:.1e} prior={k_prior} step={k_step} \
          sigma_rel={max_sigma_rel:.3} k_sigma={k_sigma} hard_sigma={hard_sigma} \
          fit_period={:.4} speed_kp={speed_kp} speed_ki={speed_ki} handover={handover}",
         current_noise.unwrap_or(0.01),
@@ -1618,4 +1818,47 @@ fn main() {
         Box::new(|cc| Ok(Box::new(Application::new(cc)?))),
     )
     .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 高阻模式：电流强制为 0、端电压为反电势，观测器靠积分电压跟角度；
+    /// 切换时 `update` 会调用 `high_z_flux_observer.reset()`。
+    #[test]
+    fn high_z_mode_forces_zero_current_and_tracks_angle() {
+        let mut sim = Simulation::new();
+        // 1 mA：高阻的斜率窗口只有 9.5 µs，10 mA 下角度噪声本来就大；
+        // 这个测试验证的是接线/零电流/角度，不是噪声性能。
+        sim.set_current_noise(0.001);
+        sim.motion_load.speed = 100.0 / sim.motor.pole_pairs;
+        sim.use_observer = HIGH_Z_OBSERVER;
+
+        // 0.5 s：5000 次 100 µs 的 update（控制环 20 kHz）。
+        for _ in 0..5000 {
+            sim.update();
+        }
+
+        let i_max = sim
+            .motor
+            .current_dq
+            .iter()
+            .fold(0.0_f64, |m, i| m.max(i.abs()));
+        let theta_true = angle_normal(sim.motion_load.angle * sim.motor.pole_pairs);
+        let theta_est = sim.high_z_flux_observer_output.electrical_angle;
+        let err = angle_normal(theta_est - theta_true).abs();
+        eprintln!(
+            "high-z test: i_max={i_max:.3e} theta={theta_est:.4} true={theta_true:.4} \
+             err={:.3}deg radius={:.4} valid={} w={:.0}",
+            err.to_degrees(),
+            sim.high_z_flux_observer.radius,
+            sim.high_z_flux_observer.valid,
+            sim.high_z_flux_observer.weight
+        );
+        assert!(i_max < 1.0e-9, "高阻下电流必须为 0，实际 {i_max}");
+        assert!(sim.high_z_flux_observer.valid);
+        assert!(err < 0.05, "angle error {err} rad");
+        assert!((sim.high_z_flux_observer.radius - 1.0).abs() < 1.0e-9);
+    }
 }

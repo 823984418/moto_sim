@@ -21,16 +21,20 @@
 //!   `w_sig = δ²/(δ²+σ_k²)`，其中 `σ_k = sqrt(2P/((N_eff-3)P''))`、
 //!   `N_eff = (Σw)²/Σw²`。`k_sigma` / `gate_sigma_rel` 是可选的硬门限，
 //!   默认关。
-//! * **每个拟合样本都把最新点搬到原点**（`U`、`V` 各一次精确平移），
-//!   拟合圆心因此总是相对“最新点”。
+//! * **拟合侧用泄漏积分器**：`u`、`v` 不再每个拟合周期被搬原点，而是**各自**
+//!   以 `T_hp = hp_rel·tau` 的时间常数向零泄漏（等效一阶高通）。泄漏掉的量
+//!   不保存：`u + k·v` 收敛到相对物理圆心的位置，局部帧原点本身就是圆心；
+//!   36 个矩在稳态不再需要任何平移（旧实现每周期把 36 个矩平移两次，约 60 ns）。
 //! * **加锁交班**：`Arc<Mutex<FastFlux>>` 内读并清零 `a`、`b`，同时
 //!   `c += a + k_cur·b` 保持磁链连续；拟合完成后写三个目标
 //!   `c_tgt = -ρ_fit·unit(c_local)`、`k_tgt = k_fit`、`rad_tgt = ρ_fit`。
-//!   圆心目标**不直接用**拟合圆心 `c_local`：只用它的方向，长度强制成拟合
-//!   半径 ρ（最新采样点严格落在半径 ρ 的圆上）。`R` 的交接乘可辨识性
-//!   `w_obs`（稳态不跟噪声游走），圆心/半径直接按 `sync_gain` 交接（`obs`
-//!   描述的是 `k` 的可辨识性，不是圆心/半径的估计质量）。
-//!   这样积分器清零不会让角度跳变，三个量也不会一次写死。
+//!   `c_local = c - (U + k·V)` 是拟合圆心相对**最新样本**的向量（泄漏积分器
+//!   下最新样本不在原点，必须减掉 `p_local`）；交班只设定这个目标圆心，
+//!   不再从拟合积分器里取值 / 清零。圆心目标**不直接用**拟合圆心 `c_local`：
+//!   只用它的方向，长度强制成拟合半径 ρ（最新采样点严格落在半径 ρ 的圆上）。
+//!   `R` 的交接乘可辨识性 `w_obs`（稳态不跟噪声游走），圆心/半径直接按
+//!   `sync_gain` 交接（`obs` 描述的是 `k` 的可辨识性，不是圆心/半径的估计
+//!   质量）。这样积分器清零不会让角度跳变，三个量也不会一次写死。
 //!
 //! # 2. 拟合核心
 //!
@@ -48,19 +52,16 @@
 //!
 //! 数值措施：
 //!
-//! * 内部单位 + 最新样本搬原点（`U`、`V` 各一次精确平移）把矩挡在 `|p| ~ R`。
-//!   `u`、`v` 只在一次拟合周期内累加、随后清零，帧偏移（`U` 平移 + 按 `k`
-//!   折算的 `V` 平移）在 `off` 里；实测去掉补偿求和后输出逐位不变，所以不再保留。
-//! * 直接观测器每个拟合周期都把最新样本搬到原点，并在 `κ = k` 处把 `b` 展开
-//!   到三次、`c` 到四次（用的仍是已有矩 `g_vx/g_vy/b_g/g2`）。矩里的 `|U|`、
-//!   `|V|` 只有一个周期内增量的量级。
+//! * 内部单位 + 泄漏积分器：`u`、`v` **分别**做 `u ← e^{-Δt/T_hp}(u+Δu)`、
+//!   `v ← e^{-Δt/T_hp}(v+Δv)`，矩只在这组有界坐标里累加，稳态不再平移
+//!   36 个矩。
+//! * 在 `κ = k` 处把 `b` 展开到三次、`c` 到四次（用的仍是已有矩
+//!   `g_vx/g_vy/b_g/g2`）。
 //!
 //!   `V` 的偏置**不进拟合**：给所有 `V_n` 加同一个常向量只是把每个 `κ` 的
-//!   点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径都不变。所以只把最新样本的
-//!   `V` 归零（纯规范），不再累一个 `v_off` 并在求值处把 `κ·v_off` 补回 `U`：
-//!   拟合直接在“最新样本为原点”的小量坐标里做；`off` 把 `k·V` 折算回帧偏移，
-//!   报告的圆心因此是物理圆心（`k` 恒定时精确，否则差 `Σ(k_i − k)·v_i`）。
-//!   可观性尺度同样取这个小量坐标下的 `Σw|V|² = m.g`，它对 `V` 的常数偏置不变。
+//!   点集平移 `κc`，`P(k)`、`P'`、`P''`、`k`、半径都不变，所以 `V` 不需要单独
+//!   保存偏置。可观性尺度取 `Σw|V|² = m.g`，
+//!   它对 `V` 的常数偏置不变。
 //! * 半径越界时把线性化伪观测 `μ(gᵀθ-z)²` 加进 `A0/b0/c0`，于是 `P`、`P'`、
 //!   `P''` 一起变成带罚项剖面；Newton 步、线搜索、扫描与输出都用同一个目标，
 //!   报告的损失仍用**无罚项**残差，罚项常数不会污染 `sigma_rel`。
@@ -389,139 +390,6 @@ impl Moments {
         self.g2 += q * (gamma * gamma);
     }
 
-    /// 平移 `U -> U - s`（`V` 不动）：精确；Kåsa 评分不变，圆心读数加回 `s`。
-    ///
-    /// 论文附录 A.2。
-    fn translate_u(&mut self, s: V2) {
-        if s.norm2() == 0.0 {
-            return;
-        }
-        let m = *self;
-        let (sx, sy) = (s.x, s.y);
-        let s2 = sx * sx + sy * sy;
-        let su = sx * m.ux + sy * m.uy;
-        let sv = sx * m.vx + sy * m.vy;
-        let uu_s_x = m.ux2 * sx + m.ux_uy * sy;
-        let uu_s_y = m.ux_uy * sx + m.uy2 * sy;
-        let uv_s_x = m.ux_vx * sx + m.ux_vy * sy;
-        let uv_s_y = m.uy_vx * sx + m.uy_vy * sy;
-        let vu_s_x = m.ux_vx * sx + m.uy_vx * sy;
-        let vu_s_y = m.ux_vy * sx + m.uy_vy * sy;
-        let vv_s_x = m.vx2 * sx + m.vx_vy * sy;
-        let vv_s_y = m.vx_vy * sx + m.vy2 * sy;
-
-        self.ux = m.ux - sx * m.w;
-        self.uy = m.uy - sy * m.w;
-        self.ux2 = m.ux2 - 2.0 * sx * m.ux + m.w * sx * sx;
-        self.ux_uy = m.ux_uy - sx * m.uy - sy * m.ux + m.w * sx * sy;
-        self.uy2 = m.uy2 - 2.0 * sy * m.uy + m.w * sy * sy;
-        self.ux_vx = m.ux_vx - sx * m.vx;
-        self.ux_vy = m.ux_vy - sx * m.vy;
-        self.uy_vx = m.uy_vx - sy * m.vx;
-        self.uy_vy = m.uy_vy - sy * m.vy;
-
-        self.a = m.a - 2.0 * su + s2 * m.w;
-        self.a_ux =
-            m.a_ux - sx * m.a - 2.0 * uu_s_x + m.ux * s2 + sx * (2.0 * su) - sx * (s2 * m.w);
-        self.a_uy =
-            m.a_uy - sy * m.a - 2.0 * uu_s_y + m.uy * s2 + sy * (2.0 * su) - sy * (s2 * m.w);
-        self.a_vx = m.a_vx - 2.0 * vu_s_x + m.vx * s2;
-        self.a_vy = m.a_vy - 2.0 * vu_s_y + m.vy * s2;
-
-        self.b = m.b - sv;
-        self.b_ux = m.b_ux - sx * m.b - uv_s_x + sx * sv;
-        self.b_uy = m.b_uy - sy * m.b - uv_s_y + sy * sv;
-        self.b_vx = m.b_vx - vv_s_x;
-        self.b_vy = m.b_vy - vv_s_y;
-
-        self.g_ux = m.g_ux - sx * m.g;
-        self.g_uy = m.g_uy - sy * m.g;
-
-        let s_au = sx * m.a_ux + sy * m.a_uy;
-        let s_av = sx * m.a_vx + sy * m.a_vy;
-        let s_bu = sx * m.b_ux + sy * m.b_uy;
-        let s_bv = sx * m.b_vx + sy * m.b_vy;
-        let s_gu = sx * m.g_ux + sy * m.g_uy;
-        let s_gv = sx * m.g_vx + sy * m.g_vy;
-        let s_uu_s = sx * uu_s_x + sy * uu_s_y;
-        let s_uv_s = sx * uv_s_x + sy * uv_s_y;
-        let s_vv_s = sx * vv_s_x + sy * vv_s_y;
-
-        self.a2 = m.a2 - 4.0 * s_au + 2.0 * s2 * m.a + 4.0 * s_uu_s - 4.0 * s2 * su + s2 * s2 * m.w;
-        self.a_b = m.a_b - s_av - 2.0 * s_bu + s2 * m.b + 2.0 * s_uv_s - s2 * sv;
-        self.b2 = m.b2 - 2.0 * s_bv + s_vv_s;
-        self.a_g = m.a_g - 2.0 * s_gu + s2 * m.g;
-        self.b_g = m.b_g - s_gv;
-        // w、V 那一族、g、g_vx、g_vy、g2 在 U 平移下不变
-    }
-
-    /// 平移 `V -> V - s`（`U` 不动）：纯规范，`P`、`P'`、`P''` 不变。
-    ///
-    /// 论文附录 A.3。`V` 的常数偏置是纯规范：它只把每个 `κ` 的点集平移
-    /// `κ·s`，`P`、`P'`、`P''` 完全不变，所以 `recenter_latest` 搬完之后不需要
-    /// 在求值处补回任何东西。
-    fn translate_v(&mut self, s: V2) {
-        if s.norm2() == 0.0 {
-            return;
-        }
-        let m = *self;
-        let (sx, sy) = (s.x, s.y);
-        let s2 = sx * sx + sy * sy;
-        let su = sx * m.ux + sy * m.uy;
-        let sv = sx * m.vx + sy * m.vy;
-        let uu_s_x = m.ux2 * sx + m.ux_uy * sy;
-        let uu_s_y = m.ux_uy * sx + m.uy2 * sy;
-        let uv_s_x = m.ux_vx * sx + m.ux_vy * sy;
-        let uv_s_y = m.uy_vx * sx + m.uy_vy * sy;
-        let vu_s_x = m.ux_vx * sx + m.uy_vx * sy;
-        let vu_s_y = m.ux_vy * sx + m.uy_vy * sy;
-        let vv_s_x = m.vx2 * sx + m.vx_vy * sy;
-        let vv_s_y = m.vx_vy * sx + m.vy2 * sy;
-
-        self.vx = m.vx - sx * m.w;
-        self.vy = m.vy - sy * m.w;
-        self.vx2 = m.vx2 - 2.0 * sx * m.vx + m.w * sx * sx;
-        self.vx_vy = m.vx_vy - sx * m.vy - sy * m.vx + m.w * sx * sy;
-        self.vy2 = m.vy2 - 2.0 * sy * m.vy + m.w * sy * sy;
-        self.ux_vx = m.ux_vx - m.ux * sx;
-        self.ux_vy = m.ux_vy - m.ux * sy;
-        self.uy_vx = m.uy_vx - m.uy * sx;
-        self.uy_vy = m.uy_vy - m.uy * sy;
-
-        self.a_vx = m.a_vx - sx * m.a;
-        self.a_vy = m.a_vy - sy * m.a;
-        self.b = m.b - su;
-        self.b_ux = m.b_ux - uu_s_x;
-        self.b_uy = m.b_uy - uu_s_y;
-        self.b_vx = m.b_vx - sx * m.b - vu_s_x + sx * su;
-        self.b_vy = m.b_vy - sy * m.b - vu_s_y + sy * su;
-
-        self.g = m.g - 2.0 * sv + s2 * m.w;
-        self.g_ux = m.g_ux - 2.0 * uv_s_x + m.ux * s2;
-        self.g_uy = m.g_uy - 2.0 * uv_s_y + m.uy * s2;
-        self.g_vx =
-            m.g_vx - sx * m.g - 2.0 * vv_s_x + m.vx * s2 + sx * (2.0 * sv) - sx * (s2 * m.w);
-        self.g_vy =
-            m.g_vy - sy * m.g - 2.0 * vv_s_y + m.vy * s2 + sy * (2.0 * sv) - sy * (s2 * m.w);
-
-        let s_au = sx * m.a_ux + sy * m.a_uy;
-        let s_av = sx * m.a_vx + sy * m.a_vy;
-        let s_bu = sx * m.b_ux + sy * m.b_uy;
-        let s_bv = sx * m.b_vx + sy * m.b_vy;
-        let s_gu = sx * m.g_ux + sy * m.g_uy;
-        let s_gv = sx * m.g_vx + sy * m.g_vy;
-        let s_uu_s = sx * uu_s_x + sy * uu_s_y;
-        let s_uv_s = sx * uv_s_x + sy * uv_s_y;
-        let s_vv_s = sx * vv_s_x + sy * vv_s_y;
-
-        self.a_b = m.a_b - s_au;
-        self.b2 = m.b2 - 2.0 * s_bu + s_uu_s;
-        self.a_g = m.a_g - 2.0 * s_av + s2 * m.a;
-        self.b_g = m.b_g - 2.0 * s_bv - s_gu + 2.0 * s_uv_s + s2 * m.b - s2 * su;
-        self.g2 = m.g2 - 4.0 * s_gv + 2.0 * s2 * m.g + 4.0 * s_vv_s - 4.0 * s2 * sv + s2 * s2 * m.w;
-        // w、U 那一族、a、a_ux、a_uy、a2 在 V 平移下不变
-    }
-
     #[inline]
     fn a_mat(&self) -> M3 {
         [
@@ -716,6 +584,17 @@ fn fit_with_penalty_coef(co: &Coef, pen: Option<RadiusPenalty>) -> Option<Profil
 pub struct FitConfig {
     /// 指数遗忘时间常数（秒）。`<= 0` 表示不遗忘。
     pub tau: S,
+    /// 拟合侧泄漏积分器的时间常数系数：`T_hp = hp_rel · tau`。
+    ///
+    /// `u`、`v` **分别**做 `u ← exp(-Δt/T_hp)·(u + Δu)`，等效一阶高通：
+    /// 直流以 `T_hp` 衰减，交流只乘 `jωT_hp/(1+jωT_hp)`。它替代“每周期把
+    /// 36 个矩搬原点”；泄漏掉的量不保存。`T_hp` 必须远大于权重衰减 `tau`
+    /// 和数据窗口，否则帧原点在一个窗口内的移动会把圆拉成螺旋、偏置 `k`。
+    /// 实测（含 `Tracker::seed_frame`）：`hp_rel` = 20/50/100/200 时
+    /// 100 rad/s、1 mA、8 s 的 `R` 偏 +1.5% / +0.29% / +0.11% / +0.07%，
+    /// 所以默认 200。`<= 0` 或 `tau <= 0` 表示不泄漏（纯积分，只靠遗忘
+    /// 保证有界）。
+    pub hp_rel: S,
     /// 半径有效范围（用户单位，A）。
     pub r_min: S,
     pub r_max: S,
@@ -768,6 +647,7 @@ impl Default for FitConfig {
     fn default() -> Self {
         Self {
             tau: 1.0,
+            hp_rel: 200.0,
             r_min: 1.0,
             r_max: 3.0,
             k_min: -1.0e6,
@@ -796,11 +676,11 @@ pub struct Report {
     pub k: S,
     /// 圆半径（用户单位，A）。
     pub radius: S,
-    /// 圆心（用户单位，物理绝对圆心的估计）。
+    /// 圆心（用户单位，**泄漏积分器局部帧**里的圆心）。
     ///
-    /// `off` 把每次搬原点的 `U` 平移和被 `k` 加权后的 `V` 平移都折算进去，所以
-    /// `center = c + off` 与物理圆心只差 `Σ(k_i − k)·v_i`：`k` 恒定时精确，
-    /// `k` 变化时是历史 `k` 与当前 `k` 不一致留下的残差。
+    /// 泄漏积分器不再保存绝对位置，所以这里不是物理绝对圆心：局部帧原点
+    /// 以 `T_hp` 收敛到物理圆心，稳态时 `center ≈ 0`（启动阶段会从
+    /// `radius·n(0)` 慢慢衰减到 0）。交班只用 `p_rel` / 局部圆心，不用它。
     pub center: V2,
     /// 最新样本相对圆心的位置（用户单位，与坐标系无关）。
     pub p_rel: V2,
@@ -831,12 +711,12 @@ pub struct Report {
 /// 指数遗忘的流式 Kåsa 拟合器。
 ///
 /// 存储原始 `U`、`V`，在 `κ = k` 处把剖面展开到三/四次（`b` 到 `κ³`、
-/// `c` 到 `κ⁴`）。直接观测器每个拟合周期都把最新样本搬到原点，所以矩里的
-/// `|U|`、`|V|` 只有一个周期内增量的量级。
+/// `c` 到 `κ⁴`）。`u`、`v` 是**分别**泄漏的积分器（一阶高通），每个拟合周期
+/// 只做一次 O(1) 更新，不再平移 36 个矩。泄漏掉的分量不保存：`u + k·v`
+/// 收敛到相对物理圆心的位置，局部帧的原点本身就是那个圆心。
 ///
 /// `V` 的常数偏置是纯规范（给所有 `V_n` 加 `c` 只把每个 `κ` 的点集平移
-/// `κc`，`P`、`P'`、`P''`、`k`、半径都不变），所以这里只把最新样本的 `V`
-/// 归零，不保存任何偏置；拟合直接在“最新样本为原点”的坐标系里求值。
+/// `κc`，`P`、`P'`、`P''`、`k`、半径都不变），所以 `V` 不单独保存偏置。
 #[derive(Clone, Debug)]
 pub struct Tracker {
     cfg: FitConfig,
@@ -849,13 +729,10 @@ pub struct Tracker {
     k: S,
     /// `set_initial` 给的初始 `k`，网格扫描围绕它展开。
     k_initial: S,
-    /// 当前样本在局部参考系中的位置 `U`。
+    /// 泄漏积分器的 `U` 状态（内部单位）。
     u: V2,
-    /// 当前样本的 `V`（已按最新样本归零，不含任何偏置）。
+    /// 泄漏积分器的 `V` 状态（内部单位）。
     v: V2,
-    /// 搬原点累积的帧偏移：`stored_U + off` 追平 `U` 的绝对位置，且
-    /// `c + off` 是物理圆心（`k` 恒定时精确；见 [`Tracker::recenter_latest`]）。
-    off: V2,
     t_last: S,
     /// 已经累积的路径长度 `Σ|Δp|`（内部单位）。它与 `k` 无关，用作“数据
     /// 实际覆盖了多长弧”的度量；拿 `|ω|dt` 会在 `k` 错时严重低估。
@@ -890,7 +767,6 @@ impl Tracker {
             k_initial: k,
             u: V2::ZERO,
             v: V2::ZERO,
-            off: V2::ZERO,
             t_last: 0.0,
             path: 0.0,
             w2: 0.0,
@@ -919,15 +795,20 @@ impl Tracker {
         self.unit_len
     }
 
-    #[inline]
-    pub fn off(&self) -> V2 {
-        self.off
+    /// 用已知的启动圆心给泄漏积分器一个初值：`u = u0`、`v = 0`。
+    ///
+    /// 启动时磁链点在原点、圆心在 `radius·n(θ0)`，所以 `u + k·v` 的初值就是
+    /// `-radius·n(θ0)/unit_len`。给对初值可以消掉 `T_hp` 尺度的启动瞬态
+    /// （否则帧原点要先从 0 爬到圆心，窗口内的移动会把圆拉成螺旋）。
+    pub fn seed_frame(&mut self, u0: V2) {
+        self.u = u0;
+        self.v = V2::ZERO;
     }
 
-    /// 当前样本在局部参考系中的位置（内部单位）。
+    /// 当前样本在局部参考系中的位置 `U + k·V`（内部单位）。
     #[inline]
     pub fn p_local(&self) -> V2 {
-        self.u
+        self.u.add(self.v.mul(self.k))
     }
 
     /// 已累积的路径长度 `Σ|Δp|`（内部单位）。
@@ -941,7 +822,7 @@ impl Tracker {
     /// * `t`：样本时刻（秒），只用于指数遗忘；
     /// * `weight`：该样本的拟合权重。
     ///
-    /// 与 [`Tracker::step_once`] 走**同一条路径**（最新样本搬到原点 + 恰好一次
+    /// 与 [`Tracker::step_once`] 走**同一条路径**（一次泄漏积分器更新 + 恰好一次
     /// 带可观性权重的 Newton），只是丢掉局部圆心；保留它作为“单样本一步”的
     /// 便捷入口，不再另有一套均值归零 / 变步数 Newton 的实现。
     pub fn update(&mut self, delta_u: V2, delta_v: V2, t: S, weight: S) -> Option<Report> {
@@ -966,59 +847,49 @@ impl Tracker {
         self.cfg.gate_sigma_rel = cfg.gate_sigma_rel;
         self.cfg.p2_eps = cfg.p2_eps;
         self.cfg.r_kappa = cfg.r_kappa;
+        self.cfg.hp_rel = cfg.hp_rel;
     }
 
-    /// 把**最新样本**搬到局部原点：`U -> U - u`、`V -> V - v`。
-    ///
-    /// `V` 的平移是纯规范（只把每个 `κ` 的点集平移 `κ·v`，`P`、`P'`、`P''`
-    /// 不变），但在 `κ = k` 处它等价于把帧平移 `k·v`。`off` 同时累加 `U` 的
-    /// 平移和被 `k` 加权后的 `V` 平移，于是 `Report.center = c + off` 仍落在
-    /// 物理圆心附近：`k` 恒定时严格相等，`k` 变化时残差为 `Σ(k_i − k)·v_i`。
-    /// 之后 `p_local() == 0`，下一个周期的增量从 0 起算。
-    fn recenter_latest(&mut self) {
-        let (ui, vi) = (self.u, self.v);
-
-        self.m.translate_u(ui);
-        self.u = self.u.sub(ui);
-
-        self.off = self.off.add(ui).add(vi.mul(self.k));
-
-        self.m.translate_v(vi);
-        self.v = self.v.sub(vi);
-    }
-
-    /// 一个降采样周期：积分增量入矩 → 最新样本搬原点 → **一次**带可观性权重
-    /// 的 Newton。返回 `(报告, 局部圆心)`。
+    /// 一个降采样周期：泄漏积分器更新 → 积分增量入矩 → **一次**带可观性权重
+    /// 的 Newton。返回 `(报告, 局部圆心)`；局部圆心是相对**最新样本**的向量。
     ///
     /// `delta_u` / `delta_v` 是快速环自上个周期以来对 `s0` 与 `i` 的积分（用户
     /// 单位），`weight` 是这段时间内 `Σ(slope_dt/Δt)²`。
     pub fn step_once(&mut self, delta_u: V2, delta_v: V2, t: S, weight: S) -> Option<(Report, V2)> {
+        let dt = (t - self.t_last).max(0.0);
+        self.t_last = t;
+
         // 1. 遗忘（按降采样时间推进；`tau <= 0` 表示不遗忘）
         let rho = if self.cfg.tau > 0.0 {
-            (-(t - self.t_last).max(0.0) / self.cfg.tau).exp()
+            (-dt / self.cfg.tau).exp()
         } else {
             1.0
         };
-        self.t_last = t;
         self.m.decay(rho);
         self.w2 *= rho * rho;
+
+        // 2. 泄漏积分器（一阶高通）：`u`、`v` 各自以 `T_hp = hp_rel·tau` 向零
+        //    泄漏。它替代“每周期平移 36 个矩”：`u + k·v` 收敛到相对物理圆心的
+        //    位置，矩里的坐标始终有界。泄漏掉的量不保存——局部帧的原点本身
+        //    会收敛到物理圆心，交班只需要相对最新样本的目标圆心。
+        let hp = if self.cfg.tau > 0.0 && self.cfg.hp_rel > 0.0 {
+            (-dt / (self.cfg.hp_rel * self.cfg.tau)).exp()
+        } else {
+            1.0
+        };
         let inv = 1.0 / self.unit_len;
         let du = delta_u.mul(inv);
         let dv = delta_v.mul(inv);
-        let du_p = du.add(dv.mul(self.k));
-        self.u = self.u.add(du);
-        self.v = self.v.add(dv);
-        self.path += du_p.norm();
+        self.path += du.add(dv.mul(self.k)).norm();
 
-        let (ui, vi) = (self.u, self.v);
+        self.u = self.u.add(du).mul(hp);
+        self.v = self.v.add(dv).mul(hp);
+
         let q = weight;
-        self.m.add(ui, vi, q);
+        self.m.add(self.u, self.v, q);
         self.w2 += q * q;
 
-        // 3. 最新样本搬到原点（U 与 V 各一次精确平移）
-        self.recenter_latest();
-
-        // 4. 恰好一次 Newton；可观性只缩放步长，不硬冻结
+        // 3. 恰好一次 Newton；可观性只缩放步长，不硬冻结
         self.steps = self.newton_weighted();
 
         self.report_pair()
@@ -1327,18 +1198,17 @@ impl Tracker {
         self.report_pair().map(|(r, _)| r)
     }
 
-    /// 报告 + **局部圆心**：后者是以最新样本为原点（内部单位）的拟合圆心，
+    /// 报告 + **局部圆心**：后者是拟合圆心相对**最新样本**的向量（内部单位），
     /// 供快速环做“目标相对圆心”。
     ///
-    /// `recenter_latest` 把最新样本的局部坐标清成 `(0, 0)`，而 `V` 不保存
-    /// 偏置，所以拟合直接在“最新样本为原点”的坐标系里进行：这里的 `c` 本身
-    /// 就是相对最新样本的圆心，不需要再加回任何 `κ·v_off`。
+    /// 泄漏积分器下最新样本在局部坐标 `p_local = U + k·V`，不在原点；所以
+    /// 返回 `c - p_local`，而不是 `c` 本身。`c` 是局部帧里的圆心（帧原点
+    /// 会收敛到物理圆心），不保存绝对位置。
     fn report_pair(&self) -> Option<(Report, V2)> {
         let kappa = self.k;
         let co = self.m.coef_at(kappa);
         let f0 = fit_from_coef(&co)?;
-        // 可观性尺度与 `newton_impl` 完全一致：存储坐标系的 `Σw|V|²`，
-        // 对 `V` 的常数偏置不变。
+        // 可观性尺度与 `newton_impl` 完全一致：`Σw|V|²` 对 `V` 的常数偏置不变。
         let scale = 4.0 * f0.radius * f0.radius * self.m.g;
         let obs = if scale > 0.0 && scale.is_finite() {
             f0.p2 / scale
@@ -1361,7 +1231,7 @@ impl Tracker {
             return None;
         }
         let r = r2.sqrt();
-        // `p_local = U + κV`（最新样本处为 0，见 `recenter_latest`）。
+        // `p_local = U + k·V`：最新样本在局部坐标系中的位置。
         let p_loc = self.u.add(self.v.mul(kappa));
         let rel = p_loc.sub(c);
         let dist = rel.norm();
@@ -1388,7 +1258,7 @@ impl Tracker {
             Report {
                 k: self.k,
                 radius: r * l,
-                center: c.add(self.off).mul(l),
+                center: c.mul(l),
                 p_rel: rel.mul(l),
                 dist: dist * l,
                 radial_err: (dist - r) * l,
@@ -1402,7 +1272,7 @@ impl Tracker {
                 steps: self.steps,
                 clamped,
             },
-            c,
+            c.sub(p_loc),
         ))
     }
 }
@@ -1511,9 +1381,9 @@ pub struct DirectFluxObserver {
 impl Default for DirectFluxObserver {
     fn default() -> Self {
         Self {
-            // 直接观测器不需要随机游走先验：步长只由可观性加权。每个拟合
-            // 周期都把最新样本搬到原点，矩里的 `|U|`、`|V|` 始终是一个周期
-            // 内增量的量级，`κ = k` 处的三/四次展开没有相消问题。
+            // 直接观测器不需要随机游走先验：步长只由可观性加权。拟合侧是
+            // 泄漏积分器（`hp_rel·tau`），帧原点缓慢跟踪绝对位置，矩里的
+            // 坐标始终有界；`κ = k` 处的三/四次展开没有相消问题。
             fit: FitConfig {
                 k_prior_rel: 0.0,
                 ..FitConfig::default()
@@ -1589,6 +1459,11 @@ impl DirectFluxObserver {
         self.tracker = Some(Tracker::new(cfg, r));
 
         let c0 = V2::new(self.theta.cos(), self.theta.sin()).mul(-radius / self.unit_len);
+        // 已知启动圆心：泄漏积分器从 `u = -圆心/unit_len` 起步，帧原点一开始
+        // 就是圆心，避免 `u`、`v` 从 0 慢慢爬到稳态而在第一个窗口里拖出螺旋。
+        if let Some(tr) = self.tracker.as_mut() {
+            tr.seed_frame(c0);
+        }
         if let Ok(mut f) = self.fast.lock() {
             *f = FastFlux {
                 c: c0,
@@ -1844,25 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn translate_matches_direct() {
-        let (mut a, mut samples) = (Moments::default(), Vec::new());
-        for k in 0..40u32 {
-            let t = k as S * 0.3;
-            let u = V2::new(t.cos() * 1.5 + 0.7, t.sin() * 1.5 - 0.4);
-            let v = V2::new(0.2 * t.cos(), -0.3 * t.sin());
-            a.add(u, v, 1.0);
-            samples.push((u, v));
-        }
-        let s = V2::new(0.83, -1.21);
-        a.translate_u(s);
-        let mut b = Moments::default();
-        for (u, v) in &samples {
-            b.add(u.sub(s), *v, 1.0);
-        }
-        assert_close(&a, &b, "translate", 1e-12);
-    }
-
-    #[test]
     fn profile_derivatives_match_finite_difference() {
         let mut a = Moments::default();
         for k in 0..60u32 {
@@ -2042,7 +1898,7 @@ mod tests {
         // 报告的损失必须是约束后 θ 上的**无罚项**残差：μz² 不能混进 P/Σw。
         let w = tight.m.w;
         let l = tight.unit_len();
-        let c = rep.center.mul(1.0 / l).sub(tight.off());
+        let c = rep.center.mul(1.0 / l);
         let r = rep.radius / l;
         let theta = [-2.0 * c.x, -2.0 * c.y, c.norm2() - r * r];
         let co = tight.m.coef_at(tight.k());
@@ -2075,8 +1931,8 @@ mod tests {
     }
 
     /// 给所有 `V_n` 加同一个常数只是把 `p_n(κ)` 平移 `κc`：`P`、`P'`、`P''`
-    /// 必须完全不变。拟合与可观性门限都建立在这一点上：`recenter_latest` 只搬
-    /// `V` 的原点、不保存偏置，正是因为偏置不影响剖面。
+    /// 必须完全不变。拟合与可观性门限都建立在这一点上：`V` 不需要单独保存
+    /// 偏置（泄漏积分器只会让这个偏置慢慢衰减，仍然只是规范）。
     #[test]
     fn v_constant_offset_is_a_gauge() {
         let c = V2::new(0.9, -1.4);
@@ -2103,29 +1959,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn translate_v_matches_direct() {
-        let (mut a, mut samples) = (Moments::default(), Vec::new());
-        for k in 0..40u32 {
-            let t = k as S * 0.3;
-            let u = V2::new(t.cos() * 1.5 + 0.7, t.sin() * 1.5 - 0.4);
-            let v = V2::new(0.2 * t.cos() + 0.05 * t, -0.3 * t.sin() + 0.1);
-            a.add(u, v, 1.0);
-            samples.push((u, v));
-        }
-        let s = V2::new(0.63, -0.91);
-        a.translate_v(s);
-        let mut b = Moments::default();
-        for (u, v) in &samples {
-            b.add(*u, v.sub(s), 1.0);
-        }
-        assert_close(&a, &b, "translate_v", 1e-12);
-        assert!((a.g - b.g).abs() < 1e-9);
-    }
-
     /// `V = ∫i dt` 的常数偏移是规范：注入一个偏置后 `k` 仍须从 +25% 初值恢复到
-    /// 真值。这里不保存 `v_off`：`recenter_latest` 把最新样本的 `V` 归零，偏置只
-    /// 影响每个 `κ` 的平移，`P`、`P'`、`P''` 与 `k` 都不受影响。
+    /// 真值。`V` 的偏置只影响每个 `κ` 的平移，`P`、`P'`、`P''` 与 `k` 都不受影响。
     #[test]
     fn v_offset_does_not_break_k() {
         let k_true = 0.7;
@@ -2144,58 +1979,8 @@ mod tests {
             rep.radius,
             tr.obs()
         );
-        assert_eq!(tr.v, V2::ZERO, "最新样本的 V 必须归零");
         assert!((tr.k() - k_true).abs() < 1.0e-3, "k={}", tr.k());
         assert!((rep.radius - r_true).abs() < 1.0e-3, "R={}", rep.radius);
-    }
-
-    fn assert_close(a: &Moments, b: &Moments, what: &str, tol: S) {
-        let mut worst: S = 0.0;
-        let mut who = "";
-        let mut chk = |x: S, y: S, name: &'static str| {
-            let d = (x - y).abs() / (1.0 + x.abs().max(y.abs()));
-            if d > worst {
-                worst = d;
-                who = name;
-            }
-        };
-        chk(a.w, b.w, "w");
-        chk(a.ux, b.ux, "ux");
-        chk(a.uy, b.uy, "uy");
-        chk(a.ux2, b.ux2, "ux2");
-        chk(a.ux_uy, b.ux_uy, "ux_uy");
-        chk(a.uy2, b.uy2, "uy2");
-        chk(a.vx, b.vx, "vx");
-        chk(a.vy, b.vy, "vy");
-        chk(a.vx2, b.vx2, "vx2");
-        chk(a.vx_vy, b.vx_vy, "vx_vy");
-        chk(a.vy2, b.vy2, "vy2");
-        chk(a.ux_vx, b.ux_vx, "ux_vx");
-        chk(a.ux_vy, b.ux_vy, "ux_vy");
-        chk(a.uy_vx, b.uy_vx, "uy_vx");
-        chk(a.uy_vy, b.uy_vy, "uy_vy");
-        chk(a.a, b.a, "a");
-        chk(a.a_ux, b.a_ux, "a_ux");
-        chk(a.a_uy, b.a_uy, "a_uy");
-        chk(a.a_vx, b.a_vx, "a_vx");
-        chk(a.a_vy, b.a_vy, "a_vy");
-        chk(a.b, b.b, "b");
-        chk(a.b_ux, b.b_ux, "b_ux");
-        chk(a.b_uy, b.b_uy, "b_uy");
-        chk(a.b_vx, b.b_vx, "b_vx");
-        chk(a.b_vy, b.b_vy, "b_vy");
-        chk(a.g, b.g, "g");
-        chk(a.g_ux, b.g_ux, "g_ux");
-        chk(a.g_uy, b.g_uy, "g_uy");
-        chk(a.g_vx, b.g_vx, "g_vx");
-        chk(a.g_vy, b.g_vy, "g_vy");
-        chk(a.a2, b.a2, "a2");
-        chk(a.a_b, b.a_b, "a_b");
-        chk(a.b2, b.b2, "b2");
-        chk(a.a_g, b.a_g, "a_g");
-        chk(a.b_g, b.b_g, "b_g");
-        chk(a.g2, b.g2, "g2");
-        assert!(worst < tol, "{what}: worst field {who} err {worst}");
     }
 
     /// 合成流：`omega` 可以随时间变化；返回真实电角度。
@@ -2385,9 +2170,10 @@ mod tests {
         assert_eq!(gated.steps, 0, "gate should block the step");
     }
 
-    /// 最新样本必须位于拟合局部坐标原点（交班的前置条件）。
+    /// 泄漏积分器下最新样本**不在**局部原点：`p_local` 是它在帧里的位置，
+    /// `step_once` 返回的局部圆心必须是 `c - p_local`（相对最新样本）。
     #[test]
-    fn step_once_puts_latest_sample_at_origin() {
+    fn step_once_returns_sample_relative_center() {
         let (r, radius, dt) = (384.0, 4.04, 5.0e-5);
         let stream = synth_stream_profile(r, radius, |_| 20.0, |_| 3.0, 0.2, dt);
         let mut cfg = FitConfig::default();
@@ -2411,34 +2197,74 @@ mod tests {
                 n = 0;
             }
         }
-        let (rep, c) = last.expect("report");
+        let (rep, c_local) = last.expect("report");
+        let p = tr.p_local();
         eprintln!(
-            "origin: p_local={:?} c={:?} radius={:.4} center={:?}",
-            tr.p_local(),
-            c,
-            rep.radius,
-            rep.center
+            "center: p_local={p:?} c_local={c_local:?} radius={:.4} center={:?}",
+            rep.radius, rep.center
         );
-        assert!(tr.p_local().norm() < 1.0e-12, "latest sample not at origin");
+        // 最新样本在局部帧里确实是非零的（不再搬原点）。
+        assert!(p.norm() > 0.1, "p_local 不应被清零: {p:?}");
+        // 返回的是“圆心 - 最新样本”，不是局部帧里的圆心本身。
+        let expect = rep.center.mul(1.0 / tr.unit_len()).sub(p);
+        assert!(
+            c_local.sub(expect).norm() < 1.0e-12,
+            "c_local 不是相对最新样本的圆心"
+        );
+        assert!(
+            (c_local.norm() - rep.radius / tr.unit_len()).abs() < 1.0e-3 * rep.radius,
+            "c_local 长度应与半径一致：|c_local|={}",
+            c_local.norm()
+        );
         assert!((rep.radius - radius).abs() < 0.01);
-        // `off` 折算了 `k·v`，圆心读数必须落在物理圆心 `radius·n(0)` 上，
-        // 而不是随 `k·∫i dt` 漂走。
+        // 样本落在拟合圆上：|p - c| = radius。
+        assert!(
+            (rep.p_rel.norm() - rep.radius).abs() < 1.0e-3 * rep.radius,
+            "|p_rel|={} 与半径 {} 不一致",
+            rep.p_rel.norm(),
+            rep.radius
+        );
+        // 启动 0.2 s 远小于 T_hp=200 s，局部帧原点还几乎没漂，所以局部圆心
+        // 仍接近 `radius·n(0)`；再久就会衰减到 0（这是泄漏积分器的语义）。
         let c_ref = V2::new(radius, 0.0);
         assert!(
             rep.center.sub(c_ref).norm() < 0.02,
-            "center {:?} 偏离物理圆心 {:?}",
+            "center {:?} 偏离启动圆心 {:?}",
             rep.center,
             c_ref
         );
     }
 
-    /// `update()` 路径（现在就是 `step_once()`）：最新样本的 `V` 严格归零，
-    /// 偏移不保留，拟合直接在“最新样本为原点”的坐标系里进行。
-    ///
-    /// 旧的“加权均值归零”会留下非零的 `tr.v`：均值归零后最新样本落在
-    /// `v - V̄` 上，只有把最新样本本身归零才能让它严格为 0。
+    /// 泄漏积分器把直流漂移限制在 `rate·T_hp`（等效一阶高通的稳态）。
     #[test]
-    fn update_puts_latest_v_at_origin() {
+    fn leaky_integrator_bounds_dc_offset() {
+        let mut cfg = FitConfig::default();
+        cfg.tau = 0.01;
+        cfg.hp_rel = 20.0;
+        cfg.min_weight = 1.0;
+        let mut tr = Tracker::new(cfg, 1.0);
+        let dt = 1.0e-4;
+        let rate = 1.0; // 用户单位/秒的直流漂移
+        let t_end = 2.0; // 10 个 T_hp
+        let n = (t_end / dt) as usize;
+        for i in 1..=n {
+            tr.step_once(V2::new(rate * dt, 0.0), V2::ZERO, i as S * dt, 1.0);
+        }
+        let l = tr.unit_len();
+        let t_hp = cfg.hp_rel * cfg.tau;
+        let u_expect = rate * t_hp / l;
+        let u = tr.u.norm();
+        eprintln!("leak: u={u:.4} (expect {u_expect:.4})");
+        assert!(
+            (u - u_expect).abs() < 0.02 * u_expect,
+            "泄漏积分器稳态 {u} 应为 {u_expect}"
+        );
+    }
+
+    /// `update()` 路径（现在就是 `step_once()`）：泄漏积分器让 `V` 有界，
+    /// 不再要求最新样本的 `V` 归零；拟合仍要给出正确的半径。
+    #[test]
+    fn update_keeps_leaky_v_bounded() {
         let (r, radius, dt) = (384.0, 4.04, 5.0e-5);
         let stream = synth_stream_profile(r, radius, |_| 20.0, |_| 3.0, 0.4, dt);
         let mut cfg = FitConfig::default();
@@ -2460,16 +2286,17 @@ mod tests {
                 a = V2::ZERO;
                 b = V2::ZERO;
                 n = 0;
-                assert_eq!(tr.v, V2::ZERO, "最新样本的 V 没有归零");
             }
         }
         let rep = last.expect("report");
         eprintln!(
-            "update origin: k={:.4} radius={:.4} g={:.3e}",
+            "leaky V: k={:.4} radius={:.4} |V|={:.4} g={:.3e}",
             tr.k(),
             rep.radius,
+            tr.v.norm(),
             tr.m.g
         );
+        assert!(tr.v.norm() < 0.1, "V 应当有界，实际 {}", tr.v.norm());
         assert!((rep.radius - radius).abs() < 0.01, "radius {}", rep.radius);
     }
 }
